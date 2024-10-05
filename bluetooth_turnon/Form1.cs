@@ -10,11 +10,31 @@ using System.Windows.Forms;
 
 namespace bluetooth_turnon
 {
-    public partial class Form1 : Form
+    public partial class main : Form
     {
-        public Form1()
+        public main()
         {
             InitializeComponent();
         }
+
+        private void bunifuLabel1_Click(object sender, EventArgs e)
+        {
+
+        }
+
+        private void main_Load(object sender, EventArgs e)
+        {
+
+        }
+
+        private void on_off_CheckedChanged(object sender, Bunifu.UI.WinForms.BunifuToggleSwitch.CheckedChangedEventArgs e)
+        {
+           
+
+        }
+
+
+
+
     }
 }
