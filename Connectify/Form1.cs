@@ -1,10 +1,4 @@
 using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -12,9 +6,15 @@ namespace bluetooth_turnon
 {
     public partial class main : Form
     {
+        // BluetoothManager instance — created here, disposed on FormClosing.
+        // Placeholder until Bluetooth logic is wired up.
+        private BluetoothManager _bluetoothManager;
+
         public main()
         {
             InitializeComponent();
+            _bluetoothManager = new BluetoothManager();
+            this.FormClosing += main_FormClosing;
         }
 
         private void bunifuLabel1_Click(object sender, EventArgs e)
@@ -59,6 +59,13 @@ namespace bluetooth_turnon
             devicePer3.Width = nameWidth;
             devicePer4.Width = nameWidth;
 
+            // Battery labels: show N/A at startup — never show a stale "0%".
+            // Rule B-2: battery is optional/nullable per device.
+            devicePer1.Text = "N/A";
+            devicePer2.Text = "N/A";
+            devicePer3.Text = "N/A";
+            devicePer4.Text = "N/A";
+
             // Center footer label
             labelFooter.Left = 0;
             labelFooter.Width = this.ClientSize.Width;
@@ -67,8 +74,17 @@ namespace bluetooth_turnon
 
         private void on_off_CheckedChanged(object sender, Bunifu.UI.WinForms.BunifuToggleSwitch.CheckedChangedEventArgs e)
         {
-           
+            // TODO: call _bluetoothManager.SetAdapterStateAsync(on_off.Checked)
+            // Use async void carefully — this is the top-level UI entry point.
+        }
 
+        /// <summary>
+        /// Disposes the BluetoothManager (stops BLE watchers, releases adapter handles)
+        /// when the form is closing. Rule B-4: Disposal.
+        /// </summary>
+        private void main_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            _bluetoothManager?.Dispose();
         }
 
 
