@@ -75,7 +75,7 @@ namespace bluetooth_turnon
             this.on_off.Animation = 25;
             this.on_off.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(24)))), ((int)(((byte)(24)))), ((int)(((byte)(34)))));
             this.on_off.BackgroundImage = ((System.Drawing.Image)(resources.GetObject("on_off.BackgroundImage")));
-            this.on_off.Checked = true;
+            this.on_off.Checked = false;
             this.on_off.Cursor = System.Windows.Forms.Cursors.Hand;
             this.on_off.InnerCirclePadding = 4;
             this.on_off.Location = new System.Drawing.Point(143, 199);
@@ -111,7 +111,7 @@ namespace bluetooth_turnon
             toggleState3.BorderThickness = 1;
             toggleState3.BorderThicknessInner = 1;
             this.on_off.ToggleStateOn = toggleState3;
-            this.on_off.Value = true;
+            this.on_off.Value = false;
             this.on_off.CheckedChanged += new System.EventHandler<Bunifu.UI.WinForms.BunifuToggleSwitch.CheckedChangedEventArgs>(this.on_off_CheckedChanged);
             // 
             // bunifuLabel1

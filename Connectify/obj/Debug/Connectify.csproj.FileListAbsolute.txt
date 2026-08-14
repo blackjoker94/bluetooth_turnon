@@ -45,3 +45,4 @@ D:\programming\bluetooth_turnon\Connectify\obj\Debug\Connectify.csproj.CoreCompi
 D:\programming\bluetooth_turnon\Connectify\obj\Debug\Connectify.csproj.CopyComplete
 D:\programming\bluetooth_turnon\Connectify\obj\Debug\Connectify.exe
 D:\programming\bluetooth_turnon\Connectify\obj\Debug\Connectify.pdb
+D:\programming\bluetooth_turnon\Connectify\obj\Debug\Connectify.exe.config

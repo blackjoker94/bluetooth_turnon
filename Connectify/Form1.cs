@@ -1,4 +1,5 @@
 using System;
+using System.Drawing;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -6,14 +7,14 @@ namespace bluetooth_turnon
 {
     public partial class main : Form
     {
-        // BluetoothManager instance — created here, disposed on FormClosing.
-        // Placeholder until Bluetooth logic is wired up.
-        private BluetoothManager _bluetoothManager;
+        private readonly BluetoothManager _bluetoothManager;
+        private bool _isUpdatingUiFromState;
 
         public main()
         {
             InitializeComponent();
             _bluetoothManager = new BluetoothManager();
+            _bluetoothManager.AdapterStateChanged += BluetoothManager_AdapterStateChanged;
             this.FormClosing += main_FormClosing;
         }
 
@@ -22,19 +23,16 @@ namespace bluetooth_turnon
 
         }
 
-        private void main_Load(object sender, EventArgs e)
+        private async void main_Load(object sender, EventArgs e)
         {
-            // The icon and logo are now loaded directly through the Designer (Form1.resx),
-            // so we no longer need to load them manually at runtime!
-
             // Force center the title — labels live inside panelHeader, so use its width
             labelBluetooth.Left = 0;
             labelBluetooth.Width = panelHeader.Width;
-            labelBluetooth.TextAlignment = System.Drawing.ContentAlignment.MiddleCenter;
+            labelBluetooth.TextAlignment = ContentAlignment.MiddleCenter;
 
             labelStatus.Left = 0;
             labelStatus.Width = panelHeader.Width;
-            labelStatus.TextAlignment = System.Drawing.ContentAlignment.MiddleCenter;
+            labelStatus.TextAlignment = ContentAlignment.MiddleCenter;
 
             // Also center the logo PictureBox horizontally inside the panel
             pictureBoxBT.Left = (panelHeader.Width - pictureBoxBT.Width) / 2;
@@ -69,13 +67,85 @@ namespace bluetooth_turnon
             // Center footer label
             labelFooter.Left = 0;
             labelFooter.Width = this.ClientSize.Width;
-            labelFooter.TextAlignment = System.Drawing.ContentAlignment.MiddleCenter;
+            labelFooter.TextAlignment = ContentAlignment.MiddleCenter;
+
+            // Detect actual Bluetooth adapter state on form load (Rule B-2)
+            await RefreshAdapterStateAsync();
         }
 
-        private void on_off_CheckedChanged(object sender, Bunifu.UI.WinForms.BunifuToggleSwitch.CheckedChangedEventArgs e)
+        private async Task RefreshAdapterStateAsync()
         {
-            // TODO: call _bluetoothManager.SetAdapterStateAsync(on_off.Checked)
-            // Use async void carefully — this is the top-level UI entry point.
+            try
+            {
+                bool? isEnabled = await _bluetoothManager.GetAdapterStateAsync();
+                ApplyAdapterStateToUi(isEnabled);
+            }
+            catch
+            {
+                ApplyAdapterStateToUi(null);
+            }
+        }
+
+        private void ApplyAdapterStateToUi(bool? isEnabled)
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(() => ApplyAdapterStateToUi(isEnabled)));
+                return;
+            }
+
+            _isUpdatingUiFromState = true;
+            try
+            {
+                if (isEnabled == true)
+                {
+                    labelStatus.Text = "Enabled";
+                    labelStatus.ForeColor = Color.FromArgb(100, 180, 255);
+                    on_off.Enabled = true;
+                    on_off.Value = true;
+                }
+                else if (isEnabled == false)
+                {
+                    labelStatus.Text = "Disabled";
+                    labelStatus.ForeColor = Color.FromArgb(200, 80, 80);
+                    on_off.Enabled = true;
+                    on_off.Value = false;
+                }
+                else
+                {
+                    labelStatus.Text = "No Adapter";
+                    labelStatus.ForeColor = Color.FromArgb(140, 140, 150);
+                    on_off.Enabled = false;
+                    on_off.Value = false;
+                }
+            }
+            finally
+            {
+                _isUpdatingUiFromState = false;
+            }
+        }
+
+        private void BluetoothManager_AdapterStateChanged(object sender, AdapterStateChangedEventArgs e)
+        {
+            ApplyAdapterStateToUi(e.IsEnabled);
+        }
+
+        private async void on_off_CheckedChanged(object sender, Bunifu.UI.WinForms.BunifuToggleSwitch.CheckedChangedEventArgs e)
+        {
+            if (_isUpdatingUiFromState) return;
+
+            bool targetState = e.Checked;
+
+            // Temporary visual feedback
+            labelStatus.Text = targetState ? "Turning On..." : "Turning Off...";
+            labelStatus.ForeColor = Color.FromArgb(255, 200, 100);
+
+            bool success = await _bluetoothManager.SetAdapterStateAsync(targetState);
+            if (!success)
+            {
+                // Revert and refresh from actual hardware state if toggle failed
+                await RefreshAdapterStateAsync();
+            }
         }
 
         /// <summary>
@@ -84,11 +154,11 @@ namespace bluetooth_turnon
         /// </summary>
         private void main_FormClosing(object sender, FormClosingEventArgs e)
         {
-            _bluetoothManager?.Dispose();
+            if (_bluetoothManager != null)
+            {
+                _bluetoothManager.AdapterStateChanged -= BluetoothManager_AdapterStateChanged;
+                _bluetoothManager.Dispose();
+            }
         }
-
-
-
-
     }
 }
