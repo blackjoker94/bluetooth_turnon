@@ -154,9 +154,18 @@ namespace bluetooth_turnon
     /// </summary>
     public sealed class BluetoothManager : IDisposable
     {
+        private static readonly string _logPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Connectify", "app_log.txt");
+
         public static void Log(string msg)
         {
-            try { File.AppendAllText(@"app_log.txt", $"{DateTime.Now:HH:mm:ss.fff}: {msg}\r\n"); } catch { }
+            try 
+            { 
+                string dir = Path.GetDirectoryName(_logPath);
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                File.AppendAllText(_logPath, $"{DateTime.Now:HH:mm:ss.fff}: {msg}\r\n"); 
+            } catch { }
         }
 
         private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
@@ -343,13 +352,6 @@ namespace bluetooth_turnon
                 var result = await radio.SetStateAsync(targetState).AsTask(ct).ConfigureAwait(false);
                 bool success = (result == RadioAccessStatus.Allowed);
                 Log($"radio.SetStateAsync returned: {result}, success={success}");
-
-                // Delay briefly for OS state change to propagate
-                await Task.Delay(300, ct).ConfigureAwait(false);
-
-                bool? currentState = (radio.State == RadioState.On);
-                Log($"Post-toggle radio.State={radio.State}");
-                AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(currentState));
 
                 return success;
             }
@@ -910,7 +912,8 @@ namespace bluetooth_turnon
         private void DeviceWatcher_Updated(DeviceWatcher sender, DeviceInformationUpdate args)
         {
             if (!_watcherEnumerationComplete) return;
-            Log($"DeviceWatcher: Device updated (connection status may have changed): {args.Id}");
+            if (!args.Properties.ContainsKey("System.Devices.Aep.IsConnected")) return;
+            Log($"DeviceWatcher: IsConnected changed for {args.Id}");
             DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
         }
 

@@ -12,6 +12,22 @@ namespace bluetooth_turnon
         private readonly BluetoothManager _bluetoothManager;
         private bool _isUpdatingUiFromState;
         private bool _isRefreshingDevices; // guard against overlapping watcher-triggered refreshes
+        private readonly System.Threading.CancellationTokenSource _cts = new System.Threading.CancellationTokenSource();
+
+        private static readonly Dictionary<string, Image> _iconCache = new Dictionary<string, Image>();
+
+        private static Image LoadCachedIcon(string assetsDir, string fileName)
+        {
+            if (fileName == null) return null;
+            if (!_iconCache.TryGetValue(fileName, out var img))
+            {
+                string path = Path.Combine(assetsDir, fileName);
+                if (System.IO.File.Exists(path))
+                    img = Image.FromStream(new MemoryStream(System.IO.File.ReadAllBytes(path)));
+                _iconCache[fileName] = img;
+            }
+            return img;
+        }
 
         // Alternating row background colors, matching the old hardcoded style
         private static readonly Color RowColorOdd  = Color.FromArgb(18, 18, 24);
@@ -26,10 +42,7 @@ namespace bluetooth_turnon
             this.FormClosing += main_FormClosing;
         }
 
-        private void bunifuLabel1_Click(object sender, EventArgs e)
-        {
 
-        }
 
         private async void main_Load(object sender, EventArgs e)
         {
@@ -61,9 +74,8 @@ namespace bluetooth_turnon
             // Detect actual Bluetooth adapter state on form load (Rule B-2)
             await RefreshAdapterStateAsync();
 
-            // Load devices initially, then start the live watcher
+            // Load devices initially
             await RefreshDevicesAsync();
-            _bluetoothManager.StartDeviceWatcher();
         }
 
         // ── Adapter state ─────────────────────────────────────────────────────
@@ -149,9 +161,8 @@ namespace bluetooth_turnon
             }
             else if (targetState)
             {
-                // Adapter just turned on — refresh device list and restart watcher
+                // Adapter just turned on — refresh device list
                 await RefreshDevicesAsync();
-                _bluetoothManager.StartDeviceWatcher();
             }
         }
 
@@ -161,7 +172,12 @@ namespace bluetooth_turnon
         /// Called by DeviceWatcher (background thread) whenever a Bluetooth device
         /// connects or disconnects. Guards against overlapping concurrent refreshes.
         /// </summary>
-        private async void OnDeviceConnectionChanged(object sender, EventArgs e)
+        private void OnDeviceConnectionChanged(object sender, EventArgs e)
+        {
+            BeginInvoke(new Func<Task>(RefreshDevicesIfIdleAsync));
+        }
+
+        private async Task RefreshDevicesIfIdleAsync()
         {
             if (_isRefreshingDevices) return;
             await RefreshDevicesAsync();
@@ -172,7 +188,7 @@ namespace bluetooth_turnon
             _isRefreshingDevices = true;
             try
             {
-                var devices = await _bluetoothManager.GetPairedDevicesAsync();
+                var devices = await _bluetoothManager.GetPairedDevicesAsync(_cts.Token);
                 BuildDeviceCards(devices);
             }
             catch
@@ -268,11 +284,12 @@ namespace bluetooth_turnon
                 };
 
                 // Load the image dynamically from the assets folder
-                string assetsDir = Path.Combine(Application.StartupPath, @"..\..\assets");
-                string iconPath = Path.Combine(assetsDir, iconFile);
-                if (System.IO.File.Exists(iconPath))
+                string assetsDir = Path.Combine(Application.StartupPath, "assets");
+                
+                Image iconImg = LoadCachedIcon(assetsDir, iconFile);
+                if (iconImg != null)
                 {
-                    iconBox.Image = Image.FromFile(iconPath);
+                    iconBox.Image = iconImg;
                 }
 
                 iconPanel.Controls.Add(iconBox);
@@ -332,9 +349,9 @@ namespace bluetooth_turnon
 
                 if (batteryIcon != null)
                 {
-                    string battIconPath = Path.Combine(assetsDir, batteryIcon);
-                    if (System.IO.File.Exists(battIconPath))
-                        batteryBox.Image = Image.FromFile(battIconPath);
+                    Image battImg = LoadCachedIcon(assetsDir, batteryIcon);
+                    if (battImg != null)
+                        batteryBox.Image = battImg;
                 }
 
                 // Battery percentage label: 44px wide, right next to the icon
@@ -460,6 +477,7 @@ namespace bluetooth_turnon
         /// </summary>
         private void main_FormClosing(object sender, FormClosingEventArgs e)
         {
+            _cts.Cancel();
             if (_bluetoothManager != null)
             {
                 _bluetoothManager.AdapterStateChanged    -= BluetoothManager_AdapterStateChanged;

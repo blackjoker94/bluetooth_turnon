@@ -34,7 +34,6 @@ namespace bluetooth_turnon
             Bunifu.UI.WinForms.BunifuToggleSwitch.ToggleState toggleState2 = new Bunifu.UI.WinForms.BunifuToggleSwitch.ToggleState();
             Bunifu.UI.WinForms.BunifuToggleSwitch.ToggleState toggleState3 = new Bunifu.UI.WinForms.BunifuToggleSwitch.ToggleState();
             this.on_off = new Bunifu.UI.WinForms.BunifuToggleSwitch();
-            this.bunifuLabel1 = new Bunifu.UI.WinForms.BunifuLabel();
             this.labelBluetooth = new Bunifu.UI.WinForms.BunifuLabel();
             this.labelStatus = new Bunifu.UI.WinForms.BunifuLabel();
             this.labelDevicesHeader = new Bunifu.UI.WinForms.BunifuLabel();
@@ -91,27 +90,7 @@ namespace bluetooth_turnon
             this.on_off.Value = false;
             this.on_off.CheckedChanged += new System.EventHandler<Bunifu.UI.WinForms.BunifuToggleSwitch.CheckedChangedEventArgs>(this.on_off_CheckedChanged);
             // 
-            // bunifuLabel1
-            // 
-            this.bunifuLabel1.AllowParentOverrides = false;
-            this.bunifuLabel1.AutoEllipsis = false;
-            this.bunifuLabel1.Cursor = System.Windows.Forms.Cursors.Default;
-            this.bunifuLabel1.CursorType = System.Windows.Forms.Cursors.Default;
-            this.bunifuLabel1.Font = new System.Drawing.Font("Segoe UI", 1F);
-            this.bunifuLabel1.ForeColor = System.Drawing.Color.Transparent;
-            this.bunifuLabel1.Location = new System.Drawing.Point(0, 0);
-            this.bunifuLabel1.Margin = new System.Windows.Forms.Padding(4);
-            this.bunifuLabel1.Name = "bunifuLabel1";
-            this.bunifuLabel1.RightToLeft = System.Windows.Forms.RightToLeft.No;
-            this.bunifuLabel1.Size = new System.Drawing.Size(0, 0);
-            this.bunifuLabel1.TabIndex = 99;
-            this.bunifuLabel1.TextAlignment = System.Drawing.ContentAlignment.TopLeft;
-            this.bunifuLabel1.TextFormat = Bunifu.UI.WinForms.BunifuLabel.TextFormattingOptions.Default;
-            this.bunifuLabel1.Click += new System.EventHandler(this.bunifuLabel1_Click);
-            // 
             // labelBluetooth
-            // 
-            this.labelBluetooth.AllowParentOverrides = false;
             this.labelBluetooth.AutoEllipsis = false;
             this.labelBluetooth.AutoSize = false;
             this.labelBluetooth.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(24)))), ((int)(((byte)(24)))), ((int)(((byte)(34)))));
@@ -204,7 +183,9 @@ namespace bluetooth_turnon
             // panelDeviceList
             // 
             this.panelDeviceList.AutoScroll = true;
-            this.panelDeviceList.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(18)))), ((int)(((byte)(18)))), ((int)(((byte)(24)))));
+            this.panelDeviceList.Anchor = ((System.Windows.Forms.AnchorStyles)((((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Bottom) 
+            | System.Windows.Forms.AnchorStyles.Left) 
+            | System.Windows.Forms.AnchorStyles.Right)));
             this.panelDeviceList.Location = new System.Drawing.Point(0, 284);
             this.panelDeviceList.Margin = new System.Windows.Forms.Padding(0);
             this.panelDeviceList.Name = "panelDeviceList";
@@ -239,9 +220,7 @@ namespace bluetooth_turnon
             this.Controls.Add(this.labelDevicesHeader);
             this.Controls.Add(this.panelDeviceList);
             this.Controls.Add(this.labelFooter);
-            this.Controls.Add(this.bunifuLabel1);
             this.DoubleBuffered = true;
-            this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedSingle;
             this.Icon = ((System.Drawing.Icon)(resources.GetObject("$this.Icon")));
             this.Margin = new System.Windows.Forms.Padding(0);
             this.MaximizeBox = false;
@@ -259,7 +238,6 @@ namespace bluetooth_turnon
         #endregion
 
         private Bunifu.UI.WinForms.BunifuToggleSwitch on_off;
-        private Bunifu.UI.WinForms.BunifuLabel bunifuLabel1;
         private Bunifu.UI.WinForms.BunifuLabel labelBluetooth;
         private Bunifu.UI.WinForms.BunifuLabel labelStatus;
         private Bunifu.UI.WinForms.BunifuLabel labelDevicesHeader;
