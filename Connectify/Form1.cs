@@ -277,6 +277,12 @@ namespace bluetooth_turnon
 
                 iconPanel.Controls.Add(iconBox);
 
+                // ── Battery block constants ─────────────────────────────────────
+                // Reserve a 76px column on the right for: [icon 28px] [gap 4px] [label 44px]
+                const int batteryColWidth = 76;
+                const int rightPad        = 10;
+                int batteryColX = card.Width - batteryColWidth - rightPad;
+
                 // ── Device name ────────────────────────────────────────────────
                 var nameLabel = new Label
                 {
@@ -287,7 +293,9 @@ namespace bluetooth_turnon
                     TextAlign = ContentAlignment.BottomLeft,
                     BackColor = Color.Transparent,
                     Location  = new Point(74, 10),
-                    Size      = new Size(card.Width - 80, 26)
+                    // Stop well before the battery column
+                    Size      = new Size(batteryColX - 74 - 6, 26),
+                    Anchor    = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right
                 };
 
                 // ── Device type subtitle ────────────────────────────────────────
@@ -295,18 +303,60 @@ namespace bluetooth_turnon
                 var typeLabel = new Label
                 {
                     Text      = typeText,
-                    ForeColor = Color.FromArgb(80, capturedAccent.R, capturedAccent.G, capturedAccent.B),
+                    ForeColor = Color.FromArgb(120, capturedAccent.R, capturedAccent.G, capturedAccent.B),
                     Font      = new Font("Segoe UI", 8F),
                     AutoSize  = false,
                     TextAlign = ContentAlignment.TopLeft,
                     BackColor = Color.Transparent,
                     Location  = new Point(74, 38),
-                    Size      = new Size(card.Width - 80, 20)
+                    Size      = new Size(batteryColX - 74 - 6, 20),
+                    Anchor    = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right
+                };
+
+                // ── Battery icon + percentage ───────────────────────────────────
+                string batteryIcon  = GetBatteryIconFileName(device.BatteryPercent);
+                Color  batteryColor = GetBatteryColor(device.BatteryPercent);
+                string batteryText  = device.BatteryPercent.HasValue
+                    ? $"{device.BatteryPercent.Value}%"
+                    : "—";
+
+                // Battery icon: 28×28, left of the label
+                var batteryBox = new PictureBox
+                {
+                    BackColor = Color.Transparent,
+                    SizeMode  = PictureBoxSizeMode.Zoom,
+                    Size      = new Size(28, 28),
+                    Location  = new Point(batteryColX, (cardHeight - 28) / 2),
+                    Anchor    = AnchorStyles.Top | AnchorStyles.Right
+                };
+
+                if (batteryIcon != null)
+                {
+                    string battIconPath = Path.Combine(assetsDir, batteryIcon);
+                    if (System.IO.File.Exists(battIconPath))
+                        batteryBox.Image = Image.FromFile(battIconPath);
+                }
+
+                // Battery percentage label: 44px wide, right next to the icon
+                var batteryLabel = new Label
+                {
+                    Text      = batteryText,
+                    ForeColor = batteryColor,
+                    Font      = new Font("Segoe UI", 8F, FontStyle.Bold),
+                    AutoSize  = false,
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    BackColor = Color.Transparent,
+                    Location  = new Point(batteryColX + 32, (cardHeight - 20) / 2),
+                    Size      = new Size(44, 20),
+                    Anchor    = AnchorStyles.Top | AnchorStyles.Right
                 };
 
                 card.Controls.Add(iconPanel);
                 card.Controls.Add(nameLabel);
                 card.Controls.Add(typeLabel);
+                card.Controls.Add(batteryBox);
+                card.Controls.Add(batteryLabel);
+
                 panelDeviceList.Controls.Add(card);
 
                 y += cardHeight;
@@ -335,6 +385,18 @@ namespace bluetooth_turnon
             }
         }
 
+        /// <summary>
+        /// Maps a nullable battery percentage to the correct battery icon asset.
+        /// Returns null when battery is unknown so the UI can hide the icon.
+        /// </summary>
+        private static string GetBatteryIconFileName(int? battery)
+        {
+            if (!battery.HasValue) return null;          // unknown — hide icon
+            if (battery.Value >= 85)  return "full_battery_480px.png";              // 85-100 %
+            if (battery.Value >= 21)  return "Almost Charged Battery_480px.png";   // 21-84  %
+            return "empty_battery_480px.png";                                       // 0-20   %
+        }
+
         private static string GetDeviceTypeLabel(BluetoothDeviceType type)
         {
             switch (type)
@@ -353,6 +415,21 @@ namespace bluetooth_turnon
                 case BluetoothDeviceType.AudioDevice: return "Audio Device";
                 default:                              return "Bluetooth Device";
             }
+        }
+
+        /// <summary>
+        /// Returns the colour used for the battery percentage label.
+        ///   Green  : 85-100 % (full)
+        ///   Amber  : 21-84  % (normal)
+        ///   Red    : 0-20   % (critical)
+        ///   Grey   : null   (unavailable)
+        /// </summary>
+        private static Color GetBatteryColor(int? battery)
+        {
+            if (!battery.HasValue) return Color.FromArgb(100, 100, 120);   // grey — unknown
+            if (battery.Value >= 85) return Color.FromArgb(80,  200, 120); // green
+            if (battery.Value >= 21) return Color.FromArgb(255, 190,  50); // amber
+            return Color.FromArgb(220, 70, 70);                             // red
         }
 
         private static Color GetDeviceAccentColor(BluetoothDeviceType type)

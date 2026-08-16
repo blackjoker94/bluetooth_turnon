@@ -2,13 +2,16 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices.WindowsRuntime;
 using System.ServiceProcess;
 using System.Threading;
 using System.Threading.Tasks;
 using Windows.Devices.Bluetooth;
+using Windows.Devices.Bluetooth.GenericAttributeProfile;
 using Windows.Devices.Enumeration;
 using Windows.Devices.Radios;
 using Windows.Foundation;
+using Windows.Storage.Streams;
 
 namespace bluetooth_turnon
 {
@@ -384,7 +387,7 @@ namespace bluetooth_turnon
 
                 // BluetoothClient.PairedDevices is a synchronous, potentially blocking call
                 // so we run it on the thread pool to avoid freezing the UI thread (Rule A-2).
-                var results = await Task.Run(() =>
+                var results = await Task.Run(async () =>
                 {
                     var list = new List<DeviceInfo>();
                     try
@@ -410,9 +413,21 @@ namespace bluetooth_turnon
                                         ? "Unknown Device"
                                         : device.DeviceName;
                                     var deviceType = ClassifyDevice(device);
-                                    Log($"  Connected device: '{name}', Type={deviceType}");
-                                    // Battery percent is null — not queried in this iteration (Rule B-2)
-                                    list.Add(new DeviceInfo(name, batteryPercent: null, deviceType));
+
+                                    // Pass 1: PnP device property (fastest, no BLE connection needed)
+                                    // Uses the Bluetooth address to locate the HFP PnP node
+                                    string addrHex = device.DeviceAddress.ToString().Replace(":", "");
+                                    int? battery = QueryBatteryViaPnp(addrHex);
+
+                                    // Pass 2: BLE GATT Battery Service fallback (for BLE-only devices)
+                                    if (battery == null)
+                                    {
+                                        battery = await QueryBatteryViaGattAsync(
+                                            device.DeviceAddress.ToUInt64(), ct).ConfigureAwait(false);
+                                    }
+
+                                    Log($"  Connected device: '{name}', Type={deviceType}, Battery={battery?.ToString() ?? "N/A"}");
+                                    list.Add(new DeviceInfo(name, batteryPercent: battery, deviceType));
                                 }
                             }
                         }
@@ -441,6 +456,234 @@ namespace bluetooth_turnon
             {
                 Log($"GetPairedDevicesAsync outer exception: {ex.Message}");
                 return new List<DeviceInfo>();
+            }
+        }
+
+        // ── Battery Reading ───────────────────────────────────────────────────
+
+        /// <summary>
+        /// Pass 1: Reads battery from the Windows PnP device property store.
+        ///
+        /// Windows exposes Bluetooth battery on the HFP (Hands-Free Profile) PnP
+        /// device node under the property key:
+        ///   GUID = {104EA319-6EE2-4701-BD47-8DDBF425BBE5}, PID = 2, Type = Byte
+        ///
+        /// This is the same data source that Windows Settings > Bluetooth shows
+        /// as the battery badge (e.g. "90%" next to the device name).
+        ///
+        /// Uses SetupDi P/Invoke to read the property directly — no external
+        /// process spawning, no WMI overhead.
+        /// </summary>
+        private static int? QueryBatteryViaPnp(string bluetoothAddressHex)
+        {
+            try
+            {
+                string addrUpper = bluetoothAddressHex
+                    .Replace(":", "").Replace("-", "").ToUpperInvariant();
+
+                Log($"    Battery PnP: searching for address '{addrUpper}'");
+
+                // The Bluetooth HFP battery property key
+                var batteryPropertyKey = new NativeMethods.DEVPROPKEY
+                {
+                    fmtid = new Guid("104EA319-6EE2-4701-BD47-8DDBF425BBE5"),
+                    pid = 2
+                };
+
+                // Enumerate all BTHENUM devices (class GUID for Bluetooth)
+                Guid bluetoothClassGuid = new Guid("e0cbf06c-cd8b-4647-bb8a-263b43f0f974");
+                IntPtr devInfoSet = NativeMethods.SetupDiGetClassDevs(
+                    ref bluetoothClassGuid, null, IntPtr.Zero,
+                    NativeMethods.DIGCF_PRESENT | NativeMethods.DIGCF_ALLCLASSES);
+
+                if (devInfoSet == (IntPtr)(-1))
+                {
+                    // Fallback: enumerate ALL present devices if class GUID doesn't match
+                    devInfoSet = NativeMethods.SetupDiGetClassDevs(
+                        IntPtr.Zero, "BTHENUM", IntPtr.Zero,
+                        NativeMethods.DIGCF_PRESENT | NativeMethods.DIGCF_ALLCLASSES);
+                }
+
+                if (devInfoSet == (IntPtr)(-1))
+                {
+                    Log("    Battery PnP: SetupDiGetClassDevs failed");
+                    return null;
+                }
+
+                try
+                {
+                    var devInfoData = new NativeMethods.SP_DEVINFO_DATA();
+                    devInfoData.cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(devInfoData);
+
+                    for (uint i = 0; NativeMethods.SetupDiEnumDeviceInfo(devInfoSet, i, ref devInfoData); i++)
+                    {
+                        // Get the instance ID to check if it contains our BT address
+                        char[] instanceIdBuf = new char[512];
+                        uint requiredSize;
+                        if (!NativeMethods.SetupDiGetDeviceInstanceId(
+                                devInfoSet, ref devInfoData, instanceIdBuf, (uint)instanceIdBuf.Length, out requiredSize))
+                            continue;
+
+                        string instanceId = new string(instanceIdBuf, 0, (int)requiredSize - 1); // minus null terminator
+                        if (instanceId.IndexOf(addrUpper, StringComparison.OrdinalIgnoreCase) < 0)
+                            continue;
+
+                        // This device matches our BT address — try reading the battery property
+                        uint propertyType;
+                        byte[] buffer = new byte[4];
+                        uint bufferSize = (uint)buffer.Length;
+                        bool success = NativeMethods.SetupDiGetDevicePropertyW(
+                            devInfoSet, ref devInfoData,
+                            ref batteryPropertyKey,
+                            out propertyType,
+                            buffer, bufferSize, out bufferSize, 0);
+
+                        if (success && bufferSize >= 1)
+                        {
+                            byte level = buffer[0];
+                            if (level >= 0 && level <= 100)
+                            {
+                                Log($"    Battery PnP: {level}% from '{instanceId}'");
+                                return (int)level;
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    NativeMethods.SetupDiDestroyDeviceInfoList(devInfoSet);
+                }
+
+                Log($"    Battery PnP: no battery found for address '{addrUpper}'");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Log($"    QueryBatteryViaPnp exception for '{bluetoothAddressHex}': {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// P/Invoke declarations for SetupDi device property APIs.
+        /// </summary>
+        private static class NativeMethods
+        {
+            public const uint DIGCF_PRESENT    = 0x00000002;
+            public const uint DIGCF_ALLCLASSES = 0x00000004;
+
+            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+            public struct DEVPROPKEY
+            {
+                public Guid fmtid;
+                public uint pid;
+            }
+
+            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+            public struct SP_DEVINFO_DATA
+            {
+                public uint cbSize;
+                public Guid ClassGuid;
+                public uint DevInst;
+                public IntPtr Reserved;
+            }
+
+            [System.Runtime.InteropServices.DllImport("setupapi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+            public static extern IntPtr SetupDiGetClassDevs(
+                ref Guid ClassGuid, string Enumerator, IntPtr hwndParent, uint Flags);
+
+            [System.Runtime.InteropServices.DllImport("setupapi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+            public static extern IntPtr SetupDiGetClassDevs(
+                IntPtr ClassGuid, string Enumerator, IntPtr hwndParent, uint Flags);
+
+            [System.Runtime.InteropServices.DllImport("setupapi.dll", SetLastError = true)]
+            public static extern bool SetupDiEnumDeviceInfo(
+                IntPtr DeviceInfoSet, uint MemberIndex, ref SP_DEVINFO_DATA DeviceInfoData);
+
+            [System.Runtime.InteropServices.DllImport("setupapi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+            public static extern bool SetupDiGetDeviceInstanceId(
+                IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData,
+                [System.Runtime.InteropServices.Out] char[] DeviceInstanceId,
+                uint DeviceInstanceIdSize, out uint RequiredSize);
+
+            [System.Runtime.InteropServices.DllImport("setupapi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+            public static extern bool SetupDiGetDevicePropertyW(
+                IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData,
+                ref DEVPROPKEY PropertyKey, out uint PropertyType,
+                [System.Runtime.InteropServices.Out] byte[] PropertyBuffer,
+                uint PropertyBufferSize, out uint RequiredSize, uint Flags);
+
+            [System.Runtime.InteropServices.DllImport("setupapi.dll", SetLastError = true)]
+            public static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
+        }
+
+        /// <summary>
+        /// Pass 2: Reads battery via BLE GATT Battery Service (UUID 0x180F / characteristic 0x2A19).
+        /// Used as a fallback when the Windows property approach returns null.
+        /// Many BLE-only devices (fitness bands, some earbuds) expose this standard service.
+        /// Returns null if the device is unreachable, the service is absent, or any error occurs.
+        /// </summary>
+        private static async Task<int?> QueryBatteryViaGattAsync(ulong bluetoothAddress, CancellationToken ct)
+        {
+            try
+            {
+                var bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
+                    .AsTask(ct).ConfigureAwait(false);
+
+                if (bleDevice == null)
+                {
+                    Log($"    Battery GATT: BLE device not found for address {bluetoothAddress:X12}");
+                    return null;
+                }
+
+                using (bleDevice)
+                {
+                    var servicesResult = await bleDevice
+                        .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Uncached)
+                        .AsTask(ct).ConfigureAwait(false);
+
+                    if (servicesResult.Status != GattCommunicationStatus.Success
+                        || servicesResult.Services.Count == 0)
+                    {
+                        Log($"    Battery GATT: Battery service not found (status={servicesResult.Status})");
+                        return null;
+                    }
+
+                    using (var service = servicesResult.Services[0])
+                    {
+                        var charsResult = await service
+                            .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Uncached)
+                            .AsTask(ct).ConfigureAwait(false);
+
+                        if (charsResult.Status != GattCommunicationStatus.Success
+                            || charsResult.Characteristics.Count == 0)
+                        {
+                            Log($"    Battery GATT: BatteryLevel characteristic not found");
+                            return null;
+                        }
+
+                        var readResult = await charsResult.Characteristics[0]
+                            .ReadValueAsync(BluetoothCacheMode.Uncached)
+                            .AsTask(ct).ConfigureAwait(false);
+
+                        if (readResult.Status != GattCommunicationStatus.Success)
+                        {
+                            Log($"    Battery GATT: ReadValueAsync failed (status={readResult.Status})");
+                            return null;
+                        }
+
+                        // BatteryLevel is a single byte, 0-100
+                        var reader = DataReader.FromBuffer(readResult.Value);
+                        byte level = reader.ReadByte();
+                        Log($"    Battery GATT: {level}% for address {bluetoothAddress:X12}");
+                        return (int)level;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"    QueryBatteryViaGattAsync exception for {bluetoothAddress:X12}: {ex.Message}");
+                return null;
             }
         }
 
@@ -594,7 +837,7 @@ namespace bluetooth_turnon
 
             // Watch all Bluetooth Classic devices; request the IsConnected property so
             // Updated events fire when connection status changes.
-            string selector = BluetoothDevice.GetDeviceSelector();
+            string selector = Windows.Devices.Bluetooth.BluetoothDevice.GetDeviceSelector();
             _deviceWatcher = DeviceInformation.CreateWatcher(
                 selector,
                 new string[] { "System.Devices.Aep.IsConnected" },

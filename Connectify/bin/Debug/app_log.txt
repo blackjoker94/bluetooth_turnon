@@ -206,3 +206,156 @@
 16:30:49.744: DeviceWatcher: Initial enumeration complete — now live-watching for changes
 16:31:08.022: DeviceWatcher: Stopping...
 16:31:08.023: DeviceWatcher: Stopped
+19:54:06.058: GetAdapterStateAsync called
+19:54:06.138: Trying BluetoothAdapter.GetDefaultAsync()...
+19:54:06.384: BluetoothAdapter found. Calling GetRadioAsync()...
+19:54:06.466: Found Bluetooth Radio via Adapter: 'Bluetooth', State=On
+19:54:06.468: GetAdapterStateAsync returning: True (State=On)
+19:54:06.490: DeviceWatcher: Starting...
+19:54:06.538: DeviceWatcher: Started (waiting for initial enumeration to complete)
+19:54:06.557: GetPairedDevicesAsync called
+19:54:06.557: GetAdapterStateAsync called
+19:54:06.557: GetAdapterStateAsync returning: True (State=On)
+19:54:06.647: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+19:54:06.675: GetPairedDevicesAsync: BluetoothClient.PairedDevices returned 2 device(s)
+19:54:06.675:   Skipping 'Omar's M31' — paired but not connected
+19:54:06.778:     QueryBatteryViaWinRtProperty exception for F4B62D10948F: Element not found.
+
+Property key syntax error.  A property key must either be specified as a canonical property name (preferred) or be of the form {fmtid} pid.
+19:54:06.838:     Battery GATT: BLE device not found for address F4B62D10948F
+19:54:06.854:   Connected device: 'soundcore R50i', Type=Earbuds, Battery=N/A
+19:54:06.909: DeviceWatcher: Stopping...
+19:54:06.909: DeviceWatcher: Stopped
+19:54:06.909: DeviceWatcher: Starting...
+19:54:06.909: DeviceWatcher: Started (waiting for initial enumeration to complete)
+19:54:06.924: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+19:54:25.846: DeviceWatcher: Stopping...
+19:54:25.846: DeviceWatcher: Stopped
+19:57:58.770: GetAdapterStateAsync called
+19:57:58.810: Trying BluetoothAdapter.GetDefaultAsync()...
+19:57:58.888: BluetoothAdapter found. Calling GetRadioAsync()...
+19:57:58.919: Found Bluetooth Radio via Adapter: 'Bluetooth', State=On
+19:57:58.919: GetAdapterStateAsync returning: True (State=On)
+19:57:58.950: DeviceWatcher: Starting...
+19:57:59.025: DeviceWatcher: Started (waiting for initial enumeration to complete)
+19:57:59.025: GetPairedDevicesAsync called
+19:57:59.025: GetAdapterStateAsync called
+19:57:59.025: GetAdapterStateAsync returning: True (State=On)
+19:57:59.064: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+19:57:59.100: GetPairedDevicesAsync: BluetoothClient.PairedDevices returned 2 device(s)
+19:57:59.102:   Skipping 'Omar's M31' — paired but not connected
+19:57:59.129:     QueryBatteryViaWinRtProperty exception for 'soundcore R50i': Element not found.
+
+Property key syntax error.  A property key must either be specified as a canonical property name (preferred) or be of the form {fmtid} pid.
+19:57:59.176:     Battery GATT: BLE device not found for address F4B62D10948F
+19:57:59.176:   Connected device: 'soundcore R50i', Type=Earbuds, Battery=N/A
+19:57:59.192: DeviceWatcher: Stopping...
+19:57:59.192: DeviceWatcher: Stopped
+19:57:59.192: DeviceWatcher: Starting...
+19:57:59.207: DeviceWatcher: Started (waiting for initial enumeration to complete)
+19:57:59.227: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+19:58:17.856: DeviceWatcher: Stopping...
+19:58:17.856: DeviceWatcher: Stopped
+20:06:30.423: GetAdapterStateAsync called
+20:06:30.489: Trying BluetoothAdapter.GetDefaultAsync()...
+20:06:30.660: BluetoothAdapter found. Calling GetRadioAsync()...
+20:06:30.706: Found Bluetooth Radio via Adapter: 'Bluetooth', State=On
+20:06:30.706: GetAdapterStateAsync returning: True (State=On)
+20:06:30.738: DeviceWatcher: Starting...
+20:06:30.769: DeviceWatcher: Started (waiting for initial enumeration to complete)
+20:06:30.769: GetPairedDevicesAsync called
+20:06:30.769: GetAdapterStateAsync called
+20:06:30.769: GetAdapterStateAsync returning: True (State=On)
+20:06:30.785: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+20:06:30.816: GetPairedDevicesAsync: BluetoothClient.PairedDevices returned 2 device(s)
+20:06:30.816:   Skipping 'Omar's M31' — paired but not connected
+20:06:30.816:     Battery PnP: searching for address 'F4B62D10948F'
+20:06:30.831:     Battery PnP: 90% from 'BTHENUM\{0000111E-0000-1000-8000-00805F9B34FB}_LOCALMFG&0002\8&1324803&0&F4B62D10948F_C00000000'
+20:06:30.831:   Connected device: 'soundcore R50i', Type=Earbuds, Battery=90
+20:06:30.863: DeviceWatcher: Stopping...
+20:06:30.863: DeviceWatcher: Stopped
+20:06:30.878: DeviceWatcher: Starting...
+20:06:30.885: DeviceWatcher: Started (waiting for initial enumeration to complete)
+20:06:30.901: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+20:06:43.545: DeviceWatcher: Stopping...
+20:06:43.545: DeviceWatcher: Stopped
+20:08:26.315: GetAdapterStateAsync called
+20:08:26.352: Trying BluetoothAdapter.GetDefaultAsync()...
+20:08:26.463: BluetoothAdapter found. Calling GetRadioAsync()...
+20:08:26.506: Found Bluetooth Radio via Adapter: 'Bluetooth', State=On
+20:08:26.506: GetAdapterStateAsync returning: True (State=On)
+20:08:26.525: DeviceWatcher: Starting...
+20:08:26.542: DeviceWatcher: Started (waiting for initial enumeration to complete)
+20:08:26.557: GetPairedDevicesAsync called
+20:08:26.557: GetAdapterStateAsync called
+20:08:26.557: GetAdapterStateAsync returning: True (State=On)
+20:08:26.573: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+20:08:26.595: GetPairedDevicesAsync: BluetoothClient.PairedDevices returned 2 device(s)
+20:08:26.595:   Skipping 'Omar's M31' — paired but not connected
+20:08:26.616:     Battery PnP: searching for address 'F4B62D10948F'
+20:08:26.619:     Battery PnP: 90% from 'BTHENUM\{0000111E-0000-1000-8000-00805F9B34FB}_LOCALMFG&0002\8&1324803&0&F4B62D10948F_C00000000'
+20:08:26.619:   Connected device: 'soundcore R50i', Type=Earbuds, Battery=90
+20:08:26.650: DeviceWatcher: Stopping...
+20:08:26.650: DeviceWatcher: Stopped
+20:08:26.650: DeviceWatcher: Starting...
+20:08:26.666: DeviceWatcher: Started (waiting for initial enumeration to complete)
+20:08:26.678: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+20:08:52.561: SetAdapterStateAsync(enable=False) called
+20:08:52.576: Calling radio.SetStateAsync(Off)...
+20:08:52.576: BluetoothRadio_StateChanged event received. State=Off, isEnabled=False
+20:08:52.576: DeviceWatcher: Device updated (connection status may have changed): Bluetooth#Bluetooth64:80:99:ee:7a:59-bc:7a:bf:c6:2e:29
+20:08:52.576: GetPairedDevicesAsync called
+20:08:52.576: GetAdapterStateAsync called
+20:08:52.576: GetAdapterStateAsync returning: False (State=Off)
+20:08:52.592: GetPairedDevicesAsync: adapter is off or absent, returning empty list
+20:08:52.688: DeviceWatcher: Stopped
+20:08:53.365: BluetoothRadio_StateChanged event received. State=Off, isEnabled=False
+20:08:53.485: radio.SetStateAsync returned: Allowed, success=True
+20:08:53.803: Post-toggle radio.State=Off
+20:08:56.896: SetAdapterStateAsync(enable=True) called
+20:08:56.896: Calling radio.SetStateAsync(On)...
+20:08:56.896: BluetoothRadio_StateChanged event received. State=On, isEnabled=True
+20:08:56.896: DeviceWatcher: Starting...
+20:08:56.911: DeviceWatcher: Started (waiting for initial enumeration to complete)
+20:08:56.911: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+20:08:57.004: radio.SetStateAsync returned: Allowed, success=True
+20:08:57.004: DeviceWatcher: Device updated (connection status may have changed): Bluetooth#Bluetooth64:80:99:ee:7a:59-f4:b6:2d:10:94:8f
+20:08:57.019: GetPairedDevicesAsync called
+20:08:57.019: GetAdapterStateAsync called
+20:08:57.019: BluetoothRadio_StateChanged event received. State=On, isEnabled=True
+20:08:57.019: GetAdapterStateAsync returning: True (State=On)
+20:08:57.035: DeviceWatcher: Stopping...
+20:08:57.035: DeviceWatcher: Stopped
+20:08:57.035: DeviceWatcher: Starting...
+20:08:57.035: DeviceWatcher: Started (waiting for initial enumeration to complete)
+20:08:57.051: GetPairedDevicesAsync: BluetoothClient.PairedDevices returned 2 device(s)
+20:08:57.051:   Skipping 'Omar's M31' — paired but not connected
+20:08:57.051:   Skipping 'soundcore R50i' — paired but not connected
+20:08:57.098: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+20:08:57.340: Post-toggle radio.State=On
+20:08:57.340: DeviceWatcher: Stopping...
+20:08:57.340: DeviceWatcher: Stopped
+20:08:57.340: DeviceWatcher: Starting...
+20:08:57.386: DeviceWatcher: Started (waiting for initial enumeration to complete)
+20:08:57.386: GetPairedDevicesAsync called
+20:08:57.386: GetAdapterStateAsync called
+20:08:57.418: GetAdapterStateAsync returning: True (State=On)
+20:08:57.433: GetPairedDevicesAsync: BluetoothClient.PairedDevices returned 2 device(s)
+20:08:57.433:   Skipping 'Omar's M31' — paired but not connected
+20:08:57.433:   Skipping 'soundcore R50i' — paired but not connected
+20:08:57.460: DeviceWatcher: Stopping...
+20:08:57.460: DeviceWatcher: Stopped
+20:08:57.460: DeviceWatcher: Starting...
+20:08:57.475: DeviceWatcher: Started (waiting for initial enumeration to complete)
+20:08:57.515: DeviceWatcher: Initial enumeration complete — now live-watching for changes
+20:08:58.883: DeviceWatcher: Device updated (connection status may have changed): Bluetooth#Bluetooth64:80:99:ee:7a:59-f4:b6:2d:10:94:8f
+20:08:58.899: GetPairedDevicesAsync called
+20:08:58.899: GetAdapterStateAsync called
+20:08:58.899: GetAdapterStateAsync returning: True (State=On)
+20:08:58.899: GetPairedDevicesAsync: BluetoothClient.PairedDevices returned 2 device(s)
+20:08:58.899:   Skipping 'Omar's M31' — paired but not connected
+20:08:58.899:     Battery PnP: searching for address 'F4B62D10948F'
+20:08:58.899:     Battery PnP: 90% from 'BTHENUM\{0000111E-0000-1000-8000-00805F9B34FB}_LOCALMFG&0002\8&1324803&0&F4B62D10948F_C00000000'
+20:08:58.899:   Connected device: 'soundcore R50i', Type=Earbuds, Battery=90
+20:09:05.919: DeviceWatcher: Stopping...
+20:09:05.919: DeviceWatcher: Stopped
