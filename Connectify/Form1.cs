@@ -4,6 +4,7 @@ using System.Drawing;
 using System.IO;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace bluetooth_turnon
 {
@@ -13,6 +14,51 @@ namespace bluetooth_turnon
         private bool _isUpdatingUiFromState;
         private bool _isRefreshingDevices; // guard against overlapping watcher-triggered refreshes
         private readonly System.Threading.CancellationTokenSource _cts = new System.Threading.CancellationTokenSource();
+
+        private NotifyIcon _trayIcon;
+        private ContextMenuStrip _trayMenu;
+        private Timer _refreshTimer;
+
+        public bool StartMinimized { get; set; }
+
+        protected override void SetVisibleCore(bool value)
+        {
+            if (StartMinimized && !this.IsHandleCreated)
+            {
+                value = false;
+                CreateHandle();
+            }
+            base.SetVisibleCore(value);
+        }
+
+        private void SetStartup(bool enable)
+        {
+            try
+            {
+                RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true);
+                string appName = "Connectify";
+                if (enable)
+                {
+                    string path = $"\"{Application.ExecutablePath}\" -minimized";
+                    rk.SetValue(appName, path);
+                }
+                else
+                {
+                    rk.DeleteValue(appName, false);
+                }
+            }
+            catch { }
+        }
+
+        private bool IsStartupEnabled()
+        {
+            try
+            {
+                RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false);
+                return rk.GetValue("Connectify") != null;
+            }
+            catch { return false; }
+        }
 
         private static readonly Dictionary<string, Image> _iconCache = new Dictionary<string, Image>();
 
@@ -46,6 +92,42 @@ namespace bluetooth_turnon
 
         private async void main_Load(object sender, EventArgs e)
         {
+            // Setup NotifyIcon
+            _trayMenu = new ContextMenuStrip();
+            _trayMenu.Items.Add("Show", null, (s, ev) => { 
+                this.Show(); 
+                this.WindowState = FormWindowState.Normal; 
+                this.Activate(); 
+                this.BringToFront(); 
+            });
+            
+            var startupMenuItem = new ToolStripMenuItem("Start with Windows");
+            startupMenuItem.CheckOnClick = true;
+            startupMenuItem.Checked = IsStartupEnabled();
+            startupMenuItem.CheckedChanged += (s, ev) => SetStartup(startupMenuItem.Checked);
+            _trayMenu.Items.Add(startupMenuItem);
+            
+            _trayMenu.Items.Add(new ToolStripSeparator());
+            _trayMenu.Items.Add("Exit", null, (s, ev) => { Application.Exit(); });
+
+            _trayIcon = new NotifyIcon();
+            _trayIcon.Text = "Connectify";
+            _trayIcon.Icon = this.Icon;
+            _trayIcon.ContextMenuStrip = _trayMenu;
+            _trayIcon.Visible = true;
+            _trayIcon.DoubleClick += (s, ev) => { 
+                this.Show(); 
+                this.WindowState = FormWindowState.Normal; 
+                this.Activate(); 
+                this.BringToFront(); 
+            };
+
+            // Setup Refresh Timer
+            _refreshTimer = new Timer();
+            _refreshTimer.Interval = 60000; // 60 seconds
+            _refreshTimer.Tick += async (s, ev) => await RefreshDevicesIfIdleAsync();
+            _refreshTimer.Start();
+
             // Force center the title — labels live inside panelHeader, so use its width
             labelBluetooth.Left = 0;
             labelBluetooth.Width = panelHeader.Width;
@@ -316,6 +398,7 @@ namespace bluetooth_turnon
                     ForeColor = device.IsConnected ? Color.FromArgb(220, 220, 235) : Color.FromArgb(140, 140, 150),
                     Font      = new Font("Segoe UI", 10F, FontStyle.Regular),
                     AutoSize  = false,
+                    AutoEllipsis = true,
                     TextAlign = ContentAlignment.BottomLeft,
                     BackColor = Color.Transparent,
                     Location  = new Point(74, 10),
@@ -520,12 +603,32 @@ namespace bluetooth_turnon
         /// </summary>
         private void main_FormClosing(object sender, FormClosingEventArgs e)
         {
+            if (e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                this.Hide();
+                return;
+            }
+
             _cts.Cancel();
+            
+            if (_refreshTimer != null)
+            {
+                _refreshTimer.Stop();
+                _refreshTimer.Dispose();
+            }
+
             if (_bluetoothManager != null)
             {
                 _bluetoothManager.AdapterStateChanged    -= BluetoothManager_AdapterStateChanged;
                 _bluetoothManager.DeviceConnectionChanged -= OnDeviceConnectionChanged;
                 _bluetoothManager.Dispose(); // Dispose also calls StopDeviceWatcher
+            }
+
+            if (_trayIcon != null)
+            {
+                _trayIcon.Visible = false;
+                _trayIcon.Dispose();
             }
         }
     }

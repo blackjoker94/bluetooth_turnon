@@ -1,15 +1,15 @@
-﻿using System.Reflection;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 // General Information about an assembly is controlled through the following
 // set of attributes. Change these attribute values to modify the information
 // associated with an assembly.
-[assembly: AssemblyTitle("bluetooth_turnon")]
-[assembly: AssemblyDescription("")]
+[assembly: AssemblyTitle("Connectify")]
+[assembly: AssemblyDescription("Bluetooth Device Manager")]
 [assembly: AssemblyConfiguration("")]
-[assembly: AssemblyCompany("")]
-[assembly: AssemblyProduct("bluetooth_turnon")]
+[assembly: AssemblyCompany("Connectify")]
+[assembly: AssemblyProduct("Connectify")]
 [assembly: AssemblyCopyright("Copyright ©  2024")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
