@@ -53,3 +53,4 @@ D:\programming\bluetooth_turnon\Connectify\bin\Debug\assets\mouse_60px.png
 D:\programming\bluetooth_turnon\Connectify\bin\Debug\assets\Smartphone_60px.png
 D:\programming\bluetooth_turnon\Connectify\bin\Debug\assets\smart_watch_60px.png
 D:\programming\bluetooth_turnon\Connectify\bin\Debug\assets\subwoofer_60px.png
+D:\programming\bluetooth_turnon\Connectify\bin\Debug\assets\screenshot.png
