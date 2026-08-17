@@ -139,12 +139,16 @@ namespace bluetooth_turnon
         public string Name { get; }
         public int? BatteryPercent { get; }
         public BluetoothDeviceType DeviceType { get; }
+        public bool IsConnected { get; }
+        public ulong Address { get; }
 
-        public DeviceInfo(string name, int? batteryPercent, BluetoothDeviceType deviceType = BluetoothDeviceType.Unknown)
+        public DeviceInfo(string name, int? batteryPercent, BluetoothDeviceType deviceType = BluetoothDeviceType.Unknown, bool isConnected = false, ulong address = 0)
         {
             Name = name ?? throw new ArgumentNullException(nameof(name));
             BatteryPercent = batteryPercent;
             DeviceType = deviceType;
+            IsConnected = isConnected;
+            Address = address;
         }
     }
 
@@ -404,32 +408,33 @@ namespace bluetooth_turnon
                                 {
                                     ct.ThrowIfCancellationRequested();
 
-                                    // Skip devices that are paired but not currently connected
-                                    if (!device.Connected)
-                                    {
-                                        Log($"  Skipping '{device.DeviceName}' — paired but not connected");
-                                        continue;
-                                    }
+                                    bool isConnected = device.Connected;
+                                    ulong address = 0;
+                                    try { address = device.DeviceAddress.ToUInt64(); } catch { }
 
                                     string name = string.IsNullOrWhiteSpace(device.DeviceName)
                                         ? "Unknown Device"
                                         : device.DeviceName;
                                     var deviceType = ClassifyDevice(device);
+                                    
+                                    int? battery = null;
 
-                                    // Pass 1: PnP device property (fastest, no BLE connection needed)
-                                    // Uses the Bluetooth address to locate the HFP PnP node
-                                    string addrHex = device.DeviceAddress.ToString().Replace(":", "");
-                                    int? battery = QueryBatteryViaPnp(addrHex);
-
-                                    // Pass 2: BLE GATT Battery Service fallback (for BLE-only devices)
-                                    if (battery == null)
+                                    if (isConnected)
                                     {
-                                        battery = await QueryBatteryViaGattAsync(
-                                            device.DeviceAddress.ToUInt64(), ct).ConfigureAwait(false);
+                                        // Pass 1: PnP device property (fastest, no BLE connection needed)
+                                        // Uses the Bluetooth address to locate the HFP PnP node
+                                        string addrHex = device.DeviceAddress.ToString().Replace(":", "");
+                                        battery = QueryBatteryViaPnp(addrHex);
+
+                                        // Pass 2: BLE GATT Battery Service fallback (for BLE-only devices)
+                                        if (battery == null)
+                                        {
+                                            battery = await QueryBatteryViaGattAsync(address, ct).ConfigureAwait(false);
+                                        }
                                     }
 
-                                    Log($"  Connected device: '{name}', Type={deviceType}, Battery={battery?.ToString() ?? "N/A"}");
-                                    list.Add(new DeviceInfo(name, batteryPercent: battery, deviceType));
+                                    Log($"  Paired device: '{name}', Connected={isConnected}, Type={deviceType}, Battery={battery?.ToString() ?? "N/A"}");
+                                    list.Add(new DeviceInfo(name, battery, deviceType, isConnected, address));
                                 }
                             }
                         }
@@ -443,7 +448,8 @@ namespace bluetooth_turnon
                         Log($"GetPairedDevicesAsync Task.Run exception: {ex.Message}");
                         // Return whatever we collected before the error
                     }
-                    return list;
+                    // Sort: connected devices first, then alphabetically by name
+                    return list.OrderByDescending(d => d.IsConnected).ThenBy(d => d.Name).ToList();
 
                 }, ct).ConfigureAwait(false);
 
@@ -459,6 +465,71 @@ namespace bluetooth_turnon
                 Log($"GetPairedDevicesAsync outer exception: {ex.Message}");
                 return new List<DeviceInfo>();
             }
+        }
+
+        // ── Device Connection ────────────────────────────────────────────────
+
+        /// <summary>
+        /// Attempts to connect to a paired audio/handsfree device by setting its service state.
+        /// </summary>
+        public async Task<bool> ConnectDeviceAsync(ulong address, CancellationToken ct = default)
+        {
+            Log($"ConnectDeviceAsync called for {address}");
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    using (var client = new InTheHand.Net.Sockets.BluetoothClient())
+                    {
+                        var paired = client.PairedDevices;
+                        var device = paired?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
+                        if (device != null)
+                        {
+                            // Trigger connection by enabling standard audio profiles
+                            device.SetServiceState(InTheHand.Net.Bluetooth.BluetoothService.AudioSink, true);
+                            try { device.SetServiceState(InTheHand.Net.Bluetooth.BluetoothService.Handsfree, true); } catch { }
+                            Log($"  Connection requested for '{device.DeviceName}'");
+                            return true;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"ConnectDeviceAsync exception: {ex.Message}");
+                }
+                return false;
+            }, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Attempts to disconnect a paired audio/handsfree device by clearing its service state.
+        /// </summary>
+        public async Task<bool> DisconnectDeviceAsync(ulong address, CancellationToken ct = default)
+        {
+            Log($"DisconnectDeviceAsync called for {address}");
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    using (var client = new InTheHand.Net.Sockets.BluetoothClient())
+                    {
+                        var paired = client.PairedDevices;
+                        var device = paired?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
+                        if (device != null)
+                        {
+                            device.SetServiceState(InTheHand.Net.Bluetooth.BluetoothService.AudioSink, false);
+                            try { device.SetServiceState(InTheHand.Net.Bluetooth.BluetoothService.Handsfree, false); } catch { }
+                            Log($"  Disconnection requested for '{device.DeviceName}'");
+                            return true;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"DisconnectDeviceAsync exception: {ex.Message}");
+                }
+                return false;
+            }, ct).ConfigureAwait(false);
         }
 
         // ── Battery Reading ───────────────────────────────────────────────────

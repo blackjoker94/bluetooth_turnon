@@ -242,27 +242,34 @@ namespace bluetooth_turnon
             {
                 var device = devices[i];
                 bool isOdd = (i % 2 == 0);
-                Color bgColor = isOdd ? RowColorOdd : RowColorEven;
+                Color baseBgColor = isOdd ? RowColorOdd : RowColorEven;
+                Color hoverBgColor = Color.FromArgb(baseBgColor.R + 10, baseBgColor.G + 10, baseBgColor.B + 15);
 
                 // Card panel
                 var card = new Panel
                 {
-                    BackColor = bgColor,
+                    BackColor = baseBgColor,
                     Location = new Point(0, y),
                     Size = new Size(panelDeviceList.Width, cardHeight),
-                    Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top
+                    Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top,
+                    Cursor = Cursors.Hand
                 };
 
                 // ── Type-specific icon ────────────────────────────────────
                 string iconFile = GetDeviceIconFileName(device.DeviceType);
                 Color  accentColor = GetDeviceAccentColor(device.DeviceType);
+                if (!device.IsConnected)
+                {
+                    accentColor = Color.FromArgb(70, 70, 80); // Dimmer gray for disconnected
+                }
 
                 // Outer circle (drawn on a Panel via Paint)
                 var iconPanel = new Panel
                 {
-                    BackColor = bgColor,
+                    BackColor = baseBgColor,
                     Location  = new Point(14, 12),
-                    Size      = new Size(48, 48)
+                    Size      = new Size(48, 48),
+                    Cursor    = Cursors.Hand
                 };
                 var capturedAccent = accentColor; // capture for lambda
                 iconPanel.Paint += (s, pe) =>
@@ -280,7 +287,8 @@ namespace bluetooth_turnon
                     BackColor = Color.Transparent,
                     SizeMode  = PictureBoxSizeMode.Zoom,
                     Size      = new Size(26, 26),
-                    Location  = new Point(11, 11) // Centered inside the 48x48 circle
+                    Location  = new Point(11, 11), // Centered inside the 48x48 circle
+                    Cursor    = Cursors.Hand
                 };
 
                 // Load the image dynamically from the assets folder
@@ -289,6 +297,7 @@ namespace bluetooth_turnon
                 Image iconImg = LoadCachedIcon(assetsDir, iconFile);
                 if (iconImg != null)
                 {
+                    // Basic grayscale effect could go here, but opacity/dimming via accentColor is fine
                     iconBox.Image = iconImg;
                 }
 
@@ -304,7 +313,7 @@ namespace bluetooth_turnon
                 var nameLabel = new Label
                 {
                     Text      = device.Name,
-                    ForeColor = Color.FromArgb(220, 220, 235),
+                    ForeColor = device.IsConnected ? Color.FromArgb(220, 220, 235) : Color.FromArgb(140, 140, 150),
                     Font      = new Font("Segoe UI", 10F, FontStyle.Regular),
                     AutoSize  = false,
                     TextAlign = ContentAlignment.BottomLeft,
@@ -312,7 +321,8 @@ namespace bluetooth_turnon
                     Location  = new Point(74, 10),
                     // Stop well before the battery column
                     Size      = new Size(batteryColX - 74 - 6, 26),
-                    Anchor    = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right
+                    Anchor    = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right,
+                    Cursor    = Cursors.Hand
                 };
 
                 // ── Device type subtitle ────────────────────────────────────────
@@ -320,22 +330,21 @@ namespace bluetooth_turnon
                 var typeLabel = new Label
                 {
                     Text      = typeText,
-                    ForeColor = Color.FromArgb(120, capturedAccent.R, capturedAccent.G, capturedAccent.B),
+                    ForeColor = device.IsConnected ? Color.FromArgb(120, capturedAccent.R, capturedAccent.G, capturedAccent.B) : Color.FromArgb(100, 100, 110),
                     Font      = new Font("Segoe UI", 8F),
                     AutoSize  = false,
                     TextAlign = ContentAlignment.TopLeft,
                     BackColor = Color.Transparent,
                     Location  = new Point(74, 38),
                     Size      = new Size(batteryColX - 74 - 6, 20),
-                    Anchor    = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right
+                    Anchor    = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right,
+                    Cursor    = Cursors.Hand
                 };
 
                 // ── Battery icon + percentage ───────────────────────────────────
                 string batteryIcon  = GetBatteryIconFileName(device.BatteryPercent);
                 Color  batteryColor = GetBatteryColor(device.BatteryPercent);
-                string batteryText  = device.BatteryPercent.HasValue
-                    ? $"{device.BatteryPercent.Value}%"
-                    : "—";
+                string batteryText  = device.BatteryPercent.HasValue ? $"{device.BatteryPercent.Value}%" : "";
 
                 // Battery icon: 28×28, left of the label
                 var batteryBox = new PictureBox
@@ -344,10 +353,11 @@ namespace bluetooth_turnon
                     SizeMode  = PictureBoxSizeMode.Zoom,
                     Size      = new Size(28, 28),
                     Location  = new Point(batteryColX, (cardHeight - 28) / 2),
-                    Anchor    = AnchorStyles.Top | AnchorStyles.Right
+                    Anchor    = AnchorStyles.Top | AnchorStyles.Right,
+                    Cursor    = Cursors.Hand
                 };
 
-                if (batteryIcon != null)
+                if (device.IsConnected && batteryIcon != null)
                 {
                     Image battImg = LoadCachedIcon(assetsDir, batteryIcon);
                     if (battImg != null)
@@ -357,7 +367,7 @@ namespace bluetooth_turnon
                 // Battery percentage label: 44px wide, right next to the icon
                 var batteryLabel = new Label
                 {
-                    Text      = batteryText,
+                    Text      = device.IsConnected ? batteryText : "",
                     ForeColor = batteryColor,
                     Font      = new Font("Segoe UI", 8F, FontStyle.Bold),
                     AutoSize  = false,
@@ -365,8 +375,41 @@ namespace bluetooth_turnon
                     BackColor = Color.Transparent,
                     Location  = new Point(batteryColX + 32, (cardHeight - 20) / 2),
                     Size      = new Size(44, 20),
-                    Anchor    = AnchorStyles.Top | AnchorStyles.Right
+                    Anchor    = AnchorStyles.Top | AnchorStyles.Right,
+                    Cursor    = Cursors.Hand
                 };
+
+                // ── Interactivity (Hover & Click) ──────────────────────────────
+                EventHandler onEnter = (s, e) => { card.BackColor = hoverBgColor; iconPanel.BackColor = hoverBgColor; };
+                EventHandler onLeave = (s, e) => { card.BackColor = baseBgColor; iconPanel.BackColor = baseBgColor; };
+
+                EventHandler onClick = async (s, e) => 
+                {
+                    // Visual feedback
+                    typeLabel.Text = device.IsConnected ? "Disconnecting..." : "Connecting...";
+                    typeLabel.ForeColor = Color.FromArgb(255, 190, 50); // Amber
+
+                    if (device.IsConnected)
+                    {
+                        await _bluetoothManager.DisconnectDeviceAsync(device.Address);
+                    }
+                    else
+                    {
+                        await _bluetoothManager.ConnectDeviceAsync(device.Address);
+                    }
+                    
+                    // Allow UI to show the feedback, then force a refresh
+                    await Task.Delay(1500);
+                    await RefreshDevicesIfIdleAsync();
+                };
+
+                var controls = new Control[] { card, iconPanel, iconBox, nameLabel, typeLabel, batteryBox, batteryLabel };
+                foreach (var ctrl in controls)
+                {
+                    ctrl.MouseEnter += onEnter;
+                    ctrl.MouseLeave += onLeave;
+                    ctrl.Click += onClick;
+                }
 
                 card.Controls.Add(iconPanel);
                 card.Controls.Add(nameLabel);
