@@ -1,15 +1,13 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Threading;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace bluetooth_turnon
 {
     static class Program
     {
-        private static Mutex _mutex = null;
+        private const string MutexName = "Connectify_SingleInstanceMutex";
+        private const string EventName = "Connectify_ShowInstanceEvent";
 
         /// <summary>
         /// The main entry point for the application.
@@ -17,27 +15,85 @@ namespace bluetooth_turnon
         [STAThread]
         static void Main(string[] args)
         {
-            const string appName = "Connectify_SingleInstanceMutex";
-            bool createdNew;
+            bool createdNew = false;
+            Mutex mutex = null;
+            EventWaitHandle showEvent = null;
+            RegisteredWaitHandle registeredWait = null;
 
-            _mutex = new Mutex(true, appName, out createdNew);
-
-            if (!createdNew)
+            try
             {
-                // App is already running! Exit this duplicate instance.
-                return;
+                mutex = new Mutex(true, MutexName, out createdNew);
+
+                if (!createdNew)
+                {
+                    // App is already running! Signal the running tray instance to restore and activate.
+                    try
+                    {
+                        using (var existingEvent = EventWaitHandle.OpenExisting(EventName))
+                        {
+                            existingEvent.Set();
+                        }
+                    }
+                    catch { }
+
+                    return;
+                }
+
+                // Primary instance: create the named event to receive restore signals from second instances
+                try
+                {
+                    showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, EventName);
+                }
+                catch { }
+
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+
+                bool startMinimized = args.Length > 0 && args[0].ToLowerInvariant() == "-minimized";
+                var form = new main();
+                form.StartMinimized = startMinimized;
+
+                if (showEvent != null)
+                {
+                    registeredWait = ThreadPool.RegisterWaitForSingleObject(
+                        showEvent,
+                        (state, timedOut) =>
+                        {
+                            var target = state as main;
+                            if (target != null && !target.IsDisposed)
+                            {
+                                target.ShowAndActivate();
+                            }
+                        },
+                        form,
+                        -1,
+                        false);
+                }
+
+                Application.Run(form);
             }
+            finally
+            {
+                if (registeredWait != null)
+                {
+                    try { registeredWait.Unregister(null); } catch { }
+                }
 
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            
-            bool startMinimized = args.Length > 0 && args[0].ToLowerInvariant() == "-minimized";
-            var form = new main();
-            form.StartMinimized = startMinimized;
-            
-            Application.Run(form);
+                if (showEvent != null)
+                {
+                    try { showEvent.Dispose(); } catch { }
+                }
 
-            GC.KeepAlive(_mutex); // prevent garbage collection of the mutex until app exits
+                if (mutex != null)
+                {
+                    if (createdNew)
+                    {
+                        try { mutex.ReleaseMutex(); } catch { }
+                    }
+
+                    try { mutex.Dispose(); } catch { }
+                }
+            }
         }
     }
 }

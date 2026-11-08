@@ -134,16 +134,32 @@ namespace bluetooth_turnon
 
 
 
+        /// <summary>
+        /// Restores and activates the form if hidden or minimized in tray.
+        /// Thread-safe via SafeBeginInvoke.
+        /// </summary>
+        public void ShowAndActivate()
+        {
+            if (InvokeRequired)
+            {
+                SafeBeginInvoke(ShowAndActivate);
+                return;
+            }
+
+            Show();
+            if (WindowState == FormWindowState.Minimized)
+            {
+                WindowState = FormWindowState.Normal;
+            }
+            Activate();
+            BringToFront();
+        }
+
         private async void main_Load(object sender, EventArgs e)
         {
             // Setup NotifyIcon
             _trayMenu = new ContextMenuStrip();
-            _trayMenu.Items.Add("Show", null, (s, ev) => { 
-                this.Show(); 
-                this.WindowState = FormWindowState.Normal; 
-                this.Activate(); 
-                this.BringToFront(); 
-            });
+            _trayMenu.Items.Add("Show", null, (s, ev) => ShowAndActivate());
             
             var startupMenuItem = new ToolStripMenuItem("Start with Windows");
             startupMenuItem.CheckOnClick = true;
@@ -159,12 +175,7 @@ namespace bluetooth_turnon
             _trayIcon.Icon = this.Icon;
             _trayIcon.ContextMenuStrip = _trayMenu;
             _trayIcon.Visible = true;
-            _trayIcon.DoubleClick += (s, ev) => { 
-                this.Show(); 
-                this.WindowState = FormWindowState.Normal; 
-                this.Activate(); 
-                this.BringToFront(); 
-            };
+            _trayIcon.DoubleClick += (s, ev) => ShowAndActivate();
 
             // Setup Refresh Timer
             _refreshTimer = new Timer();
