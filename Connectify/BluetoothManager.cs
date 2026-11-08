@@ -174,7 +174,7 @@ namespace bluetooth_turnon
         }
 
         private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
-        private Radio _bluetoothRadio;
+        private volatile Radio _bluetoothRadio;
         private DeviceWatcher _deviceWatcher;
         private volatile bool _watcherEnumerationComplete;
         private bool _disposed;
@@ -218,18 +218,25 @@ namespace bluetooth_turnon
         }
 
         /// <summary>
-        /// Internal implementation to find and initialize the Bluetooth Radio object.
-        /// Assumes caller handles serialization where appropriate.
+        /// Finds and initializes the Bluetooth Radio object.
+        /// Acquires _semaphore using double-checked locking around _bluetoothRadio so concurrent callers
+        /// at startup initialize and subscribe BluetoothRadio_StateChanged exactly once.
         /// </summary>
-        private async Task<Radio> GetBluetoothRadioCoreAsync(CancellationToken ct = default)
+        private async Task<Radio> GetBluetoothRadioAsync(CancellationToken ct = default)
         {
             if (_bluetoothRadio != null)
             {
                 return _bluetoothRadio;
             }
 
+            await _semaphore.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                if (_bluetoothRadio != null)
+                {
+                    return _bluetoothRadio;
+                }
+
                 // Ensure bthserv service is running before attempting adapter / radio queries
                 await EnsureBthServRunningAsync().ConfigureAwait(false);
 
@@ -298,20 +305,8 @@ namespace bluetooth_turnon
             }
             catch (Exception ex)
             {
-                Log($"GetBluetoothRadioCoreAsync outer exception: {ex.Message}");
+                Log($"GetBluetoothRadioAsync outer exception: {ex.Message}");
                 return null;
-            }
-        }
-
-        /// <summary>
-        /// Finds and initializes the Bluetooth Radio object, guarded by _semaphore.
-        /// </summary>
-        private async Task<Radio> GetBluetoothRadioAsync(CancellationToken ct = default)
-        {
-            await _semaphore.WaitAsync(ct).ConfigureAwait(false);
-            try
-            {
-                return await GetBluetoothRadioCoreAsync(ct).ConfigureAwait(false);
             }
             finally
             {
@@ -334,50 +329,28 @@ namespace bluetooth_turnon
         }
 
         /// <summary>
-        /// Reads adapter state directly without acquiring _semaphore (assumes lock is already held).
-        /// </summary>
-        private async Task<bool?> GetAdapterStateCoreAsync(CancellationToken ct = default)
-        {
-            try
-            {
-                var radio = await GetBluetoothRadioCoreAsync(ct).ConfigureAwait(false);
-                if (radio != null)
-                {
-                    bool isEnabled = (radio.State == RadioState.On);
-                    Log($"GetAdapterStateCoreAsync: {isEnabled} (State={radio.State})");
-                    return isEnabled;
-                }
-
-                Log("GetAdapterStateCoreAsync: null (no radio found)");
-                return null;
-            }
-            catch (Exception ex)
-            {
-                Log($"GetAdapterStateCoreAsync exception: {ex.Message}");
-                return null;
-            }
-        }
-
-        /// <summary>
         /// Returns true if the Bluetooth adapter is on, false if off, null if no adapter.
-        /// Guarded by _semaphore.
         /// </summary>
         public async Task<bool?> GetAdapterStateAsync(CancellationToken ct = default)
         {
             Log("GetAdapterStateAsync called");
-            await _semaphore.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                return await GetAdapterStateCoreAsync(ct).ConfigureAwait(false);
+                var radio = await GetBluetoothRadioAsync(ct).ConfigureAwait(false);
+                if (radio != null)
+                {
+                    bool isEnabled = (radio.State == RadioState.On);
+                    Log($"GetAdapterStateAsync: {isEnabled} (State={radio.State})");
+                    return isEnabled;
+                }
+
+                Log("GetAdapterStateAsync: null (no radio found)");
+                return null;
             }
             catch (Exception ex)
             {
-                Log($"GetAdapterStateAsync outer exception: {ex.Message}");
+                Log($"GetAdapterStateAsync exception: {ex.Message}");
                 return null;
-            }
-            finally
-            {
-                _semaphore.Release();
             }
         }
 
@@ -388,17 +361,17 @@ namespace bluetooth_turnon
         /// </summary>
         public async Task<bool> SetAdapterStateAsync(bool enable, CancellationToken ct = default)
         {
+            Log($"SetAdapterStateAsync(enable={enable}) called");
+            var radio = await GetBluetoothRadioAsync(ct).ConfigureAwait(false);
+            if (radio == null)
+            {
+                Log("SetAdapterStateAsync: Radio is null, cannot toggle");
+                return false;
+            }
+
             await _semaphore.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                Log($"SetAdapterStateAsync(enable={enable}) called");
-                var radio = await GetBluetoothRadioCoreAsync(ct).ConfigureAwait(false);
-                if (radio == null)
-                {
-                    Log("SetAdapterStateAsync: Radio is null, cannot toggle");
-                    return false;
-                }
-
                 RadioState targetState = enable ? RadioState.On : RadioState.Off;
                 Log($"Calling radio.SetStateAsync({targetState})...");
 
@@ -431,17 +404,17 @@ namespace bluetooth_turnon
         public async Task<IReadOnlyList<DeviceInfo>> GetPairedDevicesAsync(CancellationToken ct = default)
         {
             Log("GetPairedDevicesAsync called");
+            // Guard: only query if adapter is on
+            bool? state = await GetAdapterStateAsync(ct).ConfigureAwait(false);
+            if (state != true)
+            {
+                Log("GetPairedDevicesAsync: adapter is off or absent, returning empty list");
+                return new List<DeviceInfo>();
+            }
+
             await _semaphore.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                // Guard: only query if adapter is on
-                bool? state = await GetAdapterStateCoreAsync(ct).ConfigureAwait(false);
-                if (state != true)
-                {
-                    Log("GetPairedDevicesAsync: adapter is off or absent, returning empty list");
-                    return new List<DeviceInfo>();
-                }
-
                 // BluetoothClient.PairedDevices is a synchronous, potentially blocking call
                 // so we run it on the thread pool to avoid freezing the UI thread (Rule A-2).
                 var results = await Task.Run(async () =>
