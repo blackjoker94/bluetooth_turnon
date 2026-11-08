@@ -5,6 +5,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.ServiceProcess;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Windows.Devices.Bluetooth;
@@ -1659,46 +1660,67 @@ namespace bluetooth_turnon
         }
 
         /// <summary>
+        /// Checks whether a specific word or token exists in text matching word boundaries (\b).
+        /// Prevents false positives where short substrings match unrelated models (e.g. "mp3" or "mk2").
+        /// </summary>
+        private static bool ContainsWord(string text, string word)
+        {
+            if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(word))
+                return false;
+
+            return Regex.IsMatch(text, $@"\b{Regex.Escape(word)}\b", RegexOptions.IgnoreCase);
+        }
+
+        /// <summary>
         /// Name-pattern fallback for devices whose CoD is Uncategorized or 0.
         /// Matches common brand/model keywords case-insensitively.
+        /// Uses word boundaries for short tokens ("p3", "k2", "k4", "k8", "band") to prevent false positives.
         /// </summary>
         private static BluetoothDeviceType ClassifyByName(string name)
         {
+            if (string.IsNullOrWhiteSpace(name))
+                return BluetoothDeviceType.Unknown;
+
             string n = name.ToLowerInvariant();
 
             // ── Earbuds ──────────────────────────────────────────────────────
-            if (n.Contains("airpod")  || n.Contains("galaxy bud") || n.Contains(" buds") ||
-                n.Contains("freebuds")|| n.Contains("nothing ear")|| n.Contains("liberty") ||
-                n.Contains("soundcore")|| n.Contains("jabra")     || n.Contains("r50") ||
-                n.Contains("r30")     || n.Contains("a3i")        || n.Contains("p3") ||
-                n.Contains("wf-")     || n.Contains("earbud")     || n.Contains("tws"))
+            if (n.Contains("airpod")   || n.Contains("galaxy bud") || n.Contains(" buds") ||
+                n.Contains("freebuds") || n.Contains("nothing ear")|| n.Contains("liberty") ||
+                n.Contains("soundcore")|| n.Contains("jabra")      || n.Contains("earbud") ||
+                n.Contains("wf-")      || n.Contains("tws")        ||
+                n.Contains("soundcore p3") || n.Contains("life p3") ||
+                ContainsWord(n, "p3")  || ContainsWord(n, "r50")   ||
+                ContainsWord(n, "r30") || ContainsWord(n, "a3i"))
                 return BluetoothDeviceType.Earbuds;
 
             // ── Over-ear headphones / headset ─────────────────────────────────
-            if (n.Contains("wh-")    || n.Contains("xm4")   || n.Contains("xm5") ||
-                n.Contains("qc45")   || n.Contains("qc35")  || n.Contains("qc700") ||
-                n.Contains("momentum")|| n.Contains("arctis")|| n.Contains("nova") ||
-                n.Contains("void")   || n.Contains("cloud") || n.Contains("stealth") ||
-                n.Contains("studio") || n.Contains("headphone") || n.Contains("headset"))
+            if (n.Contains("wh-")     || n.Contains("xm4")    || n.Contains("xm5") ||
+                n.Contains("qc45")    || n.Contains("qc35")   || n.Contains("qc700") ||
+                n.Contains("momentum")|| n.Contains("arctis") || n.Contains("nova") ||
+                n.Contains("void")    || n.Contains("cloud")  || n.Contains("stealth") ||
+                n.Contains("studio")  || n.Contains("headphone") || n.Contains("headset"))
                 return BluetoothDeviceType.Headphones;
 
             // ── Speakers ─────────────────────────────────────────────────────
-            if (n.Contains("jbl")    || n.Contains("charge")  || n.Contains("flip") ||
-                n.Contains("pulse")  || n.Contains("xtreme")  || n.Contains("boombox") ||
-                n.Contains("ue boom")|| n.Contains("wonderboom") || n.Contains("homepod") ||
-                n.Contains("speaker")|| n.Contains("soundbar") || n.Contains("echo"))
+            if (n.Contains("jbl")     || n.Contains("charge")  || n.Contains("flip") ||
+                n.Contains("pulse")   || n.Contains("xtreme")  || n.Contains("boombox") ||
+                n.Contains("ue boom") || n.Contains("wonderboom") || n.Contains("homepod") ||
+                n.Contains("speaker") || n.Contains("soundbar") || n.Contains("echo"))
                 return BluetoothDeviceType.Speaker;
 
             // ── Mouse ─────────────────────────────────────────────────────────
-            if (n.Contains("mouse")  || n.Contains("mx master") || n.Contains("mx any") ||
+            if (n.Contains("mouse")   || n.Contains("mx master") || n.Contains("mx any") ||
                 n.Contains("pro click")|| n.Contains("basilisk") || n.Contains("deathadder") ||
-                n.Contains("pebble") || n.Contains("anywhere"))
+                n.Contains("pebble")  || n.Contains("anywhere"))
                 return BluetoothDeviceType.Mouse;
 
             // ── Keyboard ─────────────────────────────────────────────────────
-            if (n.Contains("keyboard") || n.Contains("keychron") || n.Contains("mx keys") ||
-                n.Contains("k2")      || n.Contains("k4")        || n.Contains("k8") ||
-                n.Contains("k10")     || n.Contains("anne")      || n.Contains("ducky"))
+            if (n.Contains("keyboard")|| n.Contains("keychron") || n.Contains("mx keys") ||
+                n.Contains("anne")    || n.Contains("ducky")    ||
+                n.Contains("keychron k2") || n.Contains("keychron k4") ||
+                n.Contains("keychron k8") || n.Contains("keychron k10")||
+                ContainsWord(n, "k2") || ContainsWord(n, "k4")  ||
+                ContainsWord(n, "k8") || ContainsWord(n, "k10"))
                 return BluetoothDeviceType.Keyboard;
 
             // ── Controllers ───────────────────────────────────────────────────
@@ -1709,15 +1731,16 @@ namespace bluetooth_turnon
 
             // ── Phones ────────────────────────────────────────────────────────
             if (n.Contains("iphone")   || n.Contains("galaxy s") || n.Contains("galaxy a") ||
-                n.Contains("pixel")    || n.Contains("oneplus")   || n.Contains("m31") ||
-                n.Contains("redmi")    || n.Contains("poco")      || n.Contains("realme") ||
-                n.Contains("huawei")   || n.Contains("honor")     || n.Contains("note "))
+                n.Contains("pixel")    || n.Contains("oneplus")  ||
+                n.Contains("redmi")    || n.Contains("poco")     || n.Contains("realme") ||
+                n.Contains("huawei")   || n.Contains("honor")    || n.Contains("note ") ||
+                ContainsWord(n, "m31"))
                 return BluetoothDeviceType.Phone;
 
             // ── Smartwatch ────────────────────────────────────────────────────
             if (n.Contains("watch")    || n.Contains("galaxy watch") || n.Contains("gear") ||
-                n.Contains("band")     || n.Contains("mi band")      || n.Contains("fitbit") ||
-                n.Contains("garmin")   || n.Contains("vivosmart"))
+                n.Contains("mi band")  || n.Contains("smart band")   || n.Contains("fitbit") ||
+                n.Contains("garmin")   || n.Contains("vivosmart")    || ContainsWord(n, "band"))
                 return BluetoothDeviceType.Smartwatch;
 
             return BluetoothDeviceType.Unknown;
