@@ -33,20 +33,50 @@ namespace bluetooth_turnon
             base.SetVisibleCore(value);
         }
 
+        /// <summary>
+        /// Marshals an action to the UI thread safely.
+        /// Verifies IsHandleCreated and !IsDisposed before invoking to avoid handle exceptions.
+        /// </summary>
+        private void SafeBeginInvoke(Action action)
+        {
+            if (action == null || IsDisposed) return;
+
+            if (!IsHandleCreated) return;
+
+            try
+            {
+                if (InvokeRequired)
+                {
+                    BeginInvoke(action);
+                }
+                else
+                {
+                    action();
+                }
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
+
         private void SetStartup(bool enable)
         {
             try
             {
-                RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true);
-                string appName = "Connectify";
-                if (enable)
+                using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true))
                 {
-                    string path = $"\"{Application.ExecutablePath}\" -minimized";
-                    rk.SetValue(appName, path);
-                }
-                else
-                {
-                    rk.DeleteValue(appName, false);
+                    if (rk != null)
+                    {
+                        string appName = "Connectify";
+                        if (enable)
+                        {
+                            string path = $"\"{Application.ExecutablePath}\" -minimized";
+                            rk.SetValue(appName, path);
+                        }
+                        else
+                        {
+                            rk.DeleteValue(appName, false);
+                        }
+                    }
                 }
             }
             catch { }
@@ -56,8 +86,14 @@ namespace bluetooth_turnon
         {
             try
             {
-                RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false);
-                return rk.GetValue("Connectify") != null;
+                using (RegistryKey rk = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false))
+                {
+                    if (rk != null)
+                    {
+                        return rk.GetValue("Connectify") != null;
+                    }
+                    return false;
+                }
             }
             catch { return false; }
         }
@@ -187,7 +223,7 @@ namespace bluetooth_turnon
         {
             if (InvokeRequired)
             {
-                BeginInvoke(new Action(() => ApplyAdapterStateToUi(isEnabled)));
+                SafeBeginInvoke(() => ApplyAdapterStateToUi(isEnabled));
                 return;
             }
 
@@ -264,7 +300,14 @@ namespace bluetooth_turnon
         /// </summary>
         private void OnDeviceConnectionChanged(object sender, EventArgs e)
         {
-            BeginInvoke(new Func<Task>(RefreshDevicesIfIdleAsync));
+            SafeBeginInvoke(async () =>
+            {
+                try
+                {
+                    await RefreshDevicesIfIdleAsync();
+                }
+                catch { }
+            });
         }
 
         private async Task RefreshDevicesIfIdleAsync()
@@ -316,7 +359,7 @@ namespace bluetooth_turnon
         {
             if (InvokeRequired)
             {
-                BeginInvoke(new Action(() => BuildDeviceCards(devices)));
+                SafeBeginInvoke(() => BuildDeviceCards(devices));
                 return;
             }
 
