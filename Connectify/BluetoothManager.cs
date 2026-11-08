@@ -636,7 +636,6 @@ namespace bluetooth_turnon
                 Log($"  CoreAudio: Found {count} audio endpoint(s)");
 
                 string addrHex12 = address.ToString("X12").ToUpperInvariant();
-                string addrHexClean = address.ToString("X").ToUpperInvariant();
                 bool anyTriggered = false;
 
                 for (uint i = 0; i < count; i++)
@@ -653,7 +652,7 @@ namespace bluetooth_turnon
                         if (endpoint.GetId(out endpointId) == 0 && !string.IsNullOrEmpty(endpointId))
                         {
                             string idUpper = endpointId.ToUpperInvariant();
-                            if (idUpper.Contains(addrHex12) || (!string.IsNullOrEmpty(addrHexClean) && idUpper.Contains(addrHexClean)))
+                            if (idUpper.Contains(addrHex12))
                             {
                                 isMatch = true;
                             }
@@ -675,7 +674,7 @@ namespace bluetooth_turnon
                                         if (!string.IsNullOrEmpty(btAddrProp))
                                         {
                                             string clean = btAddrProp.Replace(":", "").Replace("-", "").ToUpperInvariant();
-                                            if (clean.Contains(addrHex12) || clean.Contains(addrHexClean))
+                                            if (clean.Contains(addrHex12))
                                             {
                                                 isMatch = true;
                                             }
@@ -745,10 +744,8 @@ namespace bluetooth_turnon
                                         if (adapterTopology.GetDeviceId(out adapterDeviceId) != 0 || string.IsNullOrEmpty(adapterDeviceId))
                                             continue;
 
-                                        // Ensure this audio endpoint is backed by a Bluetooth audio adapter (and matches address if present in path)
-                                        if (adapterDeviceId.IndexOf("BTHENUM", StringComparison.OrdinalIgnoreCase) < 0 &&
-                                            adapterDeviceId.IndexOf("BTHHFENUM", StringComparison.OrdinalIgnoreCase) < 0 &&
-                                            adapterDeviceId.IndexOf(addrHex12, StringComparison.OrdinalIgnoreCase) < 0)
+                                        // Verify that the adapter device ID belongs to Bluetooth and contains this device's MAC address
+                                        if (adapterDeviceId.IndexOf(addrHex12, StringComparison.OrdinalIgnoreCase) < 0)
                                             continue;
 
                                         IMMDevice adapterDevice = null;
