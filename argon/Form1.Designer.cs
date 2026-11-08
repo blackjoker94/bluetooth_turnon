@@ -205,7 +205,7 @@ namespace bluetooth_turnon
             this.labelFooter.RightToLeft = System.Windows.Forms.RightToLeft.No;
             this.labelFooter.Size = new System.Drawing.Size(400, 26);
             this.labelFooter.TabIndex = 200;
-            this.labelFooter.Text = "Connectify  v1.0";
+            this.labelFooter.Text = "Connectify  v2.0";
             this.labelFooter.TextAlignment = System.Drawing.ContentAlignment.MiddleCenter;
             this.labelFooter.TextFormat = Bunifu.UI.WinForms.BunifuLabel.TextFormattingOptions.Default;
             // 

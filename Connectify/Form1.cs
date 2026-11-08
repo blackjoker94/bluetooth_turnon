@@ -204,6 +204,7 @@ namespace bluetooth_turnon
             labelFooter.Left = 0;
             labelFooter.Width = this.ClientSize.Width;
             labelFooter.TextAlignment = ContentAlignment.MiddleCenter;
+            labelFooter.Text = "Connectify  v2.0";
 
             // Show empty state immediately so something is visible while BT queries run
             BuildDeviceCards(new List<DeviceInfo>());
