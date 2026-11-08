@@ -1098,18 +1098,18 @@ namespace bluetooth_turnon
                     pid = 2
                 };
 
-                // Enumerate all BTHENUM devices (class GUID for Bluetooth)
-                Guid bluetoothClassGuid = new Guid("e0cbf06c-cd8b-4647-bb8a-263b43f0f974");
+                // Primary: Enumerate all present devices on the BTHENUM bus (scopes strictly to Bluetooth PnP nodes)
                 IntPtr devInfoSet = NativeMethods.SetupDiGetClassDevs(
-                    ref bluetoothClassGuid, null, IntPtr.Zero,
+                    IntPtr.Zero, "BTHENUM", IntPtr.Zero,
                     NativeMethods.DIGCF_PRESENT | NativeMethods.DIGCF_ALLCLASSES);
 
                 if (devInfoSet == (IntPtr)(-1))
                 {
-                    // Fallback: enumerate ALL present devices if class GUID doesn't match
+                    // Fallback: enumerate by Bluetooth device setup class GUID (without DIGCF_ALLCLASSES so the GUID filter is respected)
+                    Guid bluetoothClassGuid = new Guid("e0cbf06c-cd8b-4647-bb8a-263b43f0f974");
                     devInfoSet = NativeMethods.SetupDiGetClassDevs(
-                        IntPtr.Zero, "BTHENUM", IntPtr.Zero,
-                        NativeMethods.DIGCF_PRESENT | NativeMethods.DIGCF_ALLCLASSES);
+                        ref bluetoothClassGuid, null, IntPtr.Zero,
+                        NativeMethods.DIGCF_PRESENT);
                 }
 
                 if (devInfoSet == (IntPtr)(-1))
