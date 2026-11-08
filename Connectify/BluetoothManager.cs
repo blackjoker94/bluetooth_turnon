@@ -159,18 +159,50 @@ namespace bluetooth_turnon
     /// </summary>
     public sealed class BluetoothManager : IDisposable
     {
+        private static readonly object _logLock = new object();
+        private const long MaxLogFileSizeBytes = 1024 * 1024; // 1 MB
         private static readonly string _logPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "Connectify", "app_log.txt");
 
         public static void Log(string msg)
         {
-            try 
-            { 
-                string dir = Path.GetDirectoryName(_logPath);
-                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                File.AppendAllText(_logPath, $"{DateTime.Now:HH:mm:ss.fff}: {msg}\r\n"); 
-            } catch { }
+            try
+            {
+                lock (_logLock)
+                {
+                    string dir = Path.GetDirectoryName(_logPath);
+                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    {
+                        Directory.CreateDirectory(dir);
+                    }
+
+                    if (File.Exists(_logPath))
+                    {
+                        var fileInfo = new FileInfo(_logPath);
+                        if (fileInfo.Length >= MaxLogFileSizeBytes)
+                        {
+                            try
+                            {
+                                string backupPath = Path.Combine(dir, "app_log.old.txt");
+                                if (File.Exists(backupPath))
+                                {
+                                    File.Delete(backupPath);
+                                }
+                                File.Move(_logPath, backupPath);
+                            }
+                            catch
+                            {
+                                // If move fails, truncate the existing file in-place
+                                File.WriteAllText(_logPath, string.Empty);
+                            }
+                        }
+                    }
+
+                    File.AppendAllText(_logPath, $"{DateTime.Now:HH:mm:ss.fff}: {msg}\r\n");
+                }
+            }
+            catch { }
         }
 
         private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
