@@ -577,7 +577,20 @@ namespace bluetooth_turnon
                         {
                             var rfcommResult = await winRtDevice.GetRfcommServicesAsync(BluetoothCacheMode.Uncached)
                                 .AsTask(linkedCts.Token).ConfigureAwait(false);
-                            Log($"  WinRT RFCOMM wake completed. Found {rfcommResult?.Services?.Count ?? 0} service(s), Error={rfcommResult?.Error}");
+                            try
+                            {
+                                Log($"  WinRT RFCOMM wake completed. Found {rfcommResult?.Services?.Count ?? 0} service(s), Error={rfcommResult?.Error}");
+                            }
+                            finally
+                            {
+                                if (rfcommResult?.Services != null)
+                                {
+                                    foreach (var svc in rfcommResult.Services)
+                                    {
+                                        try { svc.Dispose(); } catch { }
+                                    }
+                                }
+                            }
                         }
                     }
                     else
@@ -602,6 +615,8 @@ namespace bluetooth_turnon
         /// </summary>
         private static bool TrySendCoreAudioBtCommand(ulong address, string deviceName, bool connect)
         {
+            if (address == 0) return false;
+
             try
             {
                 Log($"  CoreAudio: Attempting {(connect ? "reconnect" : "disconnect")} via IKsControl for {address:X12} ('{deviceName}')...");
@@ -677,7 +692,7 @@ namespace bluetooth_turnon
                                         if (pv.vt == 31 && pv.pwszVal != IntPtr.Zero)
                                         {
                                             string fn = Marshal.PtrToStringUni(pv.pwszVal);
-                                            if (!string.IsNullOrEmpty(fn) && (fn.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0 || deviceName.IndexOf(fn, StringComparison.OrdinalIgnoreCase) >= 0))
+                                            if (!string.IsNullOrEmpty(fn) && fn.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0)
                                             {
                                                 isMatch = true;
                                             }
@@ -728,6 +743,12 @@ namespace bluetooth_turnon
                                     {
                                         string adapterDeviceId = null;
                                         if (adapterTopology.GetDeviceId(out adapterDeviceId) != 0 || string.IsNullOrEmpty(adapterDeviceId))
+                                            continue;
+
+                                        // Ensure this audio endpoint is backed by a Bluetooth audio adapter (and matches address if present in path)
+                                        if (adapterDeviceId.IndexOf("BTHENUM", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                            adapterDeviceId.IndexOf("BTHHFENUM", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                            adapterDeviceId.IndexOf(addrHex12, StringComparison.OrdinalIgnoreCase) < 0)
                                             continue;
 
                                         IMMDevice adapterDevice = null;
@@ -858,53 +879,60 @@ namespace bluetooth_turnon
 
                             // Step 2: Wake baseband link via WinRT uncached discovery (with 4s timeout)
                             await WakeBasebandLinkAsync(address, ct).ConfigureAwait(false);
+                            device.Refresh();
+                            if (device.Connected)
+                            {
+                                Log($"  '{device.DeviceName}' connected after baseband wake.");
+                                return true;
+                            }
 
-                            // Step 4: Add Optional Windows Core Audio (IKsControl) Reconnect for Audio Endpoints
+                            // Step 3: Try Windows Core Audio (IKsControl) Reconnect for Audio Endpoints
                             bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, device.DeviceName, connect: true);
                             Log($"  CoreAudio reconnect triggered: {coreAudioTriggered}");
 
-                            // If CoreAudio succeeded, check if connected quickly
                             if (coreAudioTriggered)
                             {
-                                await Task.Delay(200, ct).ConfigureAwait(false);
-                                device.Refresh();
-                                if (device.Connected)
+                                for (int i = 1; i <= 5; i++)
                                 {
-                                    Log($"  CoreAudio reconnected '{device.DeviceName}' immediately.");
-                                    return true;
+                                    await Task.Delay(400, ct).ConfigureAwait(false);
+                                    device.Refresh();
+                                    if (device.Connected)
+                                    {
+                                        Log($"  CoreAudio reconnected '{device.DeviceName}' on poll {i}/5.");
+                                        return true;
+                                    }
                                 }
                             }
 
-                            // Step 3: Cycle Service States (false then true) Across Supported Profiles
-                            // (AudioSink, Handsfree, Headset, HumanInterfaceDevice)
-                            foreach (var profile in TargetConnectionProfiles)
+                            // Step 4: Two-pass Service State Cycle (disable all first, wait 200ms, then enable all)
+                            var deviceType = ClassifyDevice(device);
+                            bool isHidDevice = deviceType == BluetoothDeviceType.Mouse ||
+                                               deviceType == BluetoothDeviceType.Keyboard ||
+                                               deviceType == BluetoothDeviceType.Controller;
+
+                            Guid[] profilesToCycle = isHidDevice
+                                ? new[] { InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice }
+                                : new[]
+                                {
+                                    InTheHand.Net.Bluetooth.BluetoothService.AudioSink,
+                                    InTheHand.Net.Bluetooth.BluetoothService.Handsfree,
+                                    InTheHand.Net.Bluetooth.BluetoothService.Headset
+                                };
+
+                            foreach (var profile in profilesToCycle)
                             {
                                 ct.ThrowIfCancellationRequested();
-                                try
-                                {
-                                    Log($"  Disabling service {profile} on '{device.DeviceName}'...");
-                                    device.SetServiceState(profile, false);
-                                }
-                                catch (Exception ex)
-                                {
-                                    Log($"  SetServiceState({profile}, false) note: {ex.Message}");
-                                }
+                                try { device.SetServiceState(profile, false); }
+                                catch (Exception ex) { Log($"  SetServiceState({profile}, false) note: {ex.Message}"); }
+                            }
 
-                                try
-                                {
-                                    await Task.Delay(150, ct).ConfigureAwait(false);
-                                }
-                                catch (OperationCanceledException) { throw; }
+                            await Task.Delay(200, ct).ConfigureAwait(false);
 
-                                try
-                                {
-                                    Log($"  Enabling service {profile} on '{device.DeviceName}'...");
-                                    device.SetServiceState(profile, true);
-                                }
-                                catch (Exception ex)
-                                {
-                                    Log($"  SetServiceState({profile}, true) note: {ex.Message}");
-                                }
+                            foreach (var profile in profilesToCycle)
+                            {
+                                ct.ThrowIfCancellationRequested();
+                                try { device.SetServiceState(profile, true); }
+                                catch (Exception ex) { Log($"  SetServiceState({profile}, true) note: {ex.Message}"); }
                             }
 
                             // Step 5: Verify Actual Connection Status Before Returning (poll up to 3 times, every 400ms)
@@ -1360,7 +1388,7 @@ namespace bluetooth_turnon
         }
 
         [ComImport]
-        [Guid("2A042143-8270-404A-814C-9715B87D0079")]
+        [Guid("2A07407E-6497-4A18-9787-32F79BD0D98F")]
         [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         internal interface IDeviceTopology
         {
