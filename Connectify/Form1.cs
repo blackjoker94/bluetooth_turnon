@@ -81,6 +81,12 @@ namespace bluetooth_turnon
         private static readonly Color RowColorOdd  = Color.FromArgb(18, 18, 24);
         private static readonly Color RowColorEven = Color.FromArgb(22, 22, 30);
 
+        // Static reusable fonts to prevent GDI+ handle leaks across card rebuilds
+        private static readonly Font EmptyStateFont  = new Font("Segoe UI", 10F);
+        private static readonly Font CardNameFont    = new Font("Segoe UI", 10F, FontStyle.Regular);
+        private static readonly Font CardTypeFont    = new Font("Segoe UI", 8F);
+        private static readonly Font CardBatteryFont = new Font("Segoe UI", 8F, FontStyle.Bold);
+
         public main()
         {
             InitializeComponent();
@@ -325,7 +331,7 @@ namespace bluetooth_turnon
                 {
                     Text = "No devices connected",
                     ForeColor = Color.FromArgb(100, 100, 120),
-                    Font = new Font("Segoe UI", 10F),
+                    Font = EmptyStateFont,
                     AutoSize = false,
                     TextAlign = ContentAlignment.MiddleCenter,
                     Size = new Size(panelDeviceList.Width, 80),
@@ -415,7 +421,7 @@ namespace bluetooth_turnon
                 {
                     Text      = device.Name,
                     ForeColor = device.IsConnected ? Color.FromArgb(220, 220, 235) : Color.FromArgb(140, 140, 150),
-                    Font      = new Font("Segoe UI", 10F, FontStyle.Regular),
+                    Font      = CardNameFont,
                     AutoSize  = false,
                     AutoEllipsis = true,
                     TextAlign = ContentAlignment.BottomLeft,
@@ -440,7 +446,7 @@ namespace bluetooth_turnon
                 {
                     Text      = typeText,
                     ForeColor = typeColor,
-                    Font      = new Font("Segoe UI", 8F),
+                    Font      = CardTypeFont,
                     AutoSize  = false,
                     TextAlign = ContentAlignment.TopLeft,
                     BackColor = Color.Transparent,
@@ -478,7 +484,7 @@ namespace bluetooth_turnon
                 {
                     Text      = device.IsConnected ? batteryText : "",
                     ForeColor = batteryColor,
-                    Font      = new Font("Segoe UI", 8F, FontStyle.Bold),
+                    Font      = CardBatteryFont,
                     AutoSize  = false,
                     TextAlign = ContentAlignment.MiddleLeft,
                     BackColor = Color.Transparent,
