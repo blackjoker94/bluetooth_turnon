@@ -1130,6 +1130,24 @@ namespace bluetooth_turnon
                         uint requiredSize;
                         if (!NativeMethods.SetupDiGetDeviceInstanceId(
                                 devInfoSet, ref devInfoData, instanceIdBuf, (uint)instanceIdBuf.Length, out requiredSize))
+                        {
+                            // If buffer was too small, dynamically resize to requiredSize and retry
+                            if (requiredSize > instanceIdBuf.Length)
+                            {
+                                instanceIdBuf = new char[requiredSize];
+                                if (!NativeMethods.SetupDiGetDeviceInstanceId(
+                                        devInfoSet, ref devInfoData, instanceIdBuf, (uint)instanceIdBuf.Length, out requiredSize))
+                                {
+                                    continue;
+                                }
+                            }
+                            else
+                            {
+                                continue;
+                            }
+                        }
+
+                        if (requiredSize <= 1 || requiredSize > instanceIdBuf.Length)
                             continue;
 
                         string instanceId = new string(instanceIdBuf, 0, (int)requiredSize - 1); // minus null terminator
