@@ -1750,10 +1750,18 @@ namespace bluetooth_turnon
 
         /// <summary>
         /// Starts a DeviceWatcher that raises DeviceConnectionChanged whenever a Bluetooth
-        /// device connects or disconnects. Safe to call multiple times — stops any existing watcher first.
+        /// device connects or disconnects. Safe to call multiple times — returns early if already active.
         /// </summary>
         public void StartDeviceWatcher()
         {
+            if (_deviceWatcher != null &&
+                (_deviceWatcher.Status == DeviceWatcherStatus.Started ||
+                 _deviceWatcher.Status == DeviceWatcherStatus.EnumerationCompleted))
+            {
+                Log("DeviceWatcher: Already running (Started or EnumerationCompleted), ignoring start request");
+                return;
+            }
+
             StopDeviceWatcher();
             Log("DeviceWatcher: Starting...");
 
