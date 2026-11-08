@@ -459,6 +459,15 @@ namespace bluetooth_turnon
                                 {
                                     ct.ThrowIfCancellationRequested();
 
+                                    try
+                                    {
+                                        device.Refresh();
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Log($"GetPairedDevicesAsync: device.Refresh() failed for '{device.DeviceName}': {ex.Message}");
+                                    }
+
                                     bool isConnected = device.Connected;
                                     ulong address = 0;
                                     try { address = device.DeviceAddress.ToUInt64(); } catch { }
@@ -861,19 +870,8 @@ namespace bluetooth_turnon
                             }
 
                             // Step 3: Cycle Service States (false then true) Across Supported Profiles
-                            // Fall back to / execute SetServiceState cycle for non-audio or if CoreAudio hasn't completed
-                            var installed = device.InstalledServices;
-                            IEnumerable<Guid> profilesToCycle = TargetConnectionProfiles;
-                            if (installed != null && installed.Length > 0)
-                            {
-                                var matching = TargetConnectionProfiles.Where(p => installed.Contains(p)).ToArray();
-                                if (matching.Length > 0)
-                                {
-                                    profilesToCycle = matching;
-                                }
-                            }
-
-                            foreach (var profile in profilesToCycle)
+                            // (AudioSink, Handsfree, Headset, HumanInterfaceDevice)
+                            foreach (var profile in TargetConnectionProfiles)
                             {
                                 ct.ThrowIfCancellationRequested();
                                 try
@@ -991,19 +989,8 @@ namespace bluetooth_turnon
                             bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, device.DeviceName, connect: false);
                             Log($"  CoreAudio disconnect triggered: {coreAudioTriggered}");
 
-                            // Disable services across supported profiles
-                            var installed = device.InstalledServices;
-                            IEnumerable<Guid> profilesToCycle = TargetConnectionProfiles;
-                            if (installed != null && installed.Length > 0)
-                            {
-                                var matching = TargetConnectionProfiles.Where(p => installed.Contains(p)).ToArray();
-                                if (matching.Length > 0)
-                                {
-                                    profilesToCycle = matching;
-                                }
-                            }
-
-                            foreach (var profile in profilesToCycle)
+                            // Step 2: Disable services across target profiles (AudioSink, Handsfree, Headset, HumanInterfaceDevice)
+                            foreach (var profile in TargetConnectionProfiles)
                             {
                                 try
                                 {
