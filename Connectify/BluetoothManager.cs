@@ -1023,8 +1023,22 @@ namespace bluetooth_turnon
                             bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, device.DeviceName, connect: false);
                             Log($"  CoreAudio disconnect triggered: {coreAudioTriggered}");
 
-                            // Step 2: Disable services across target profiles (AudioSink, Handsfree, Headset, HumanInterfaceDevice)
-                            foreach (var profile in TargetConnectionProfiles)
+                            // Step 2: Disable services across target profiles (categorized by device type)
+                            var deviceType = ClassifyDevice(device);
+                            bool isHidDevice = deviceType == BluetoothDeviceType.Mouse ||
+                                               deviceType == BluetoothDeviceType.Keyboard ||
+                                               deviceType == BluetoothDeviceType.Controller;
+
+                            Guid[] profilesToDisable = isHidDevice
+                                ? new[] { InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice }
+                                : new[]
+                                {
+                                    InTheHand.Net.Bluetooth.BluetoothService.AudioSink,
+                                    InTheHand.Net.Bluetooth.BluetoothService.Handsfree,
+                                    InTheHand.Net.Bluetooth.BluetoothService.Headset
+                                };
+
+                            foreach (var profile in profilesToDisable)
                             {
                                 try
                                 {
