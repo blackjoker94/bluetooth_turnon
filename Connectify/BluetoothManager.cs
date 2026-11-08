@@ -1512,58 +1512,82 @@ namespace bluetooth_turnon
         {
             try
             {
-                var bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
-                    .AsTask(ct).ConfigureAwait(false);
-
-                if (bleDevice == null)
+                using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+                using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token))
                 {
-                    Log($"    Battery GATT: BLE device not found for address {bluetoothAddress:X12}");
-                    return null;
-                }
+                    var token = linkedCts.Token;
 
-                using (bleDevice)
-                {
-                    var servicesResult = await bleDevice
-                        .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Uncached)
-                        .AsTask(ct).ConfigureAwait(false);
+                    var bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
+                        .AsTask(token).ConfigureAwait(false);
 
-                    if (servicesResult.Status != GattCommunicationStatus.Success
-                        || servicesResult.Services.Count == 0)
+                    if (bleDevice == null)
                     {
-                        Log($"    Battery GATT: Battery service not found (status={servicesResult.Status})");
+                        Log($"    Battery GATT: BLE device not found for address {bluetoothAddress:X12}");
                         return null;
                     }
 
-                    using (var service = servicesResult.Services[0])
+                    using (bleDevice)
                     {
-                        var charsResult = await service
-                            .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Uncached)
-                            .AsTask(ct).ConfigureAwait(false);
+                        var servicesResult = await bleDevice
+                            .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Uncached)
+                            .AsTask(token).ConfigureAwait(false);
 
-                        if (charsResult.Status != GattCommunicationStatus.Success
-                            || charsResult.Characteristics.Count == 0)
+                        try
                         {
-                            Log($"    Battery GATT: BatteryLevel characteristic not found");
-                            return null;
+                            if (servicesResult.Status != GattCommunicationStatus.Success
+                                || servicesResult.Services == null
+                                || servicesResult.Services.Count == 0)
+                            {
+                                Log($"    Battery GATT: Battery service not found (status={servicesResult.Status})");
+                                return null;
+                            }
+
+                            var service = servicesResult.Services[0];
+                            var charsResult = await service
+                                .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Uncached)
+                                .AsTask(token).ConfigureAwait(false);
+
+                            if (charsResult.Status != GattCommunicationStatus.Success
+                                || charsResult.Characteristics == null
+                                || charsResult.Characteristics.Count == 0)
+                            {
+                                Log("    Battery GATT: BatteryLevel characteristic not found");
+                                return null;
+                            }
+
+                            var readResult = await charsResult.Characteristics[0]
+                                .ReadValueAsync(BluetoothCacheMode.Uncached)
+                                .AsTask(token).ConfigureAwait(false);
+
+                            if (readResult.Status != GattCommunicationStatus.Success)
+                            {
+                                Log($"    Battery GATT: ReadValueAsync failed (status={readResult.Status})");
+                                return null;
+                            }
+
+                            // BatteryLevel is a single byte, 0-100
+                            var reader = DataReader.FromBuffer(readResult.Value);
+                            byte level = reader.ReadByte();
+                            Log($"    Battery GATT: {level}% for address {bluetoothAddress:X12}");
+                            return (int)level;
                         }
-
-                        var readResult = await charsResult.Characteristics[0]
-                            .ReadValueAsync(BluetoothCacheMode.Uncached)
-                            .AsTask(ct).ConfigureAwait(false);
-
-                        if (readResult.Status != GattCommunicationStatus.Success)
+                        finally
                         {
-                            Log($"    Battery GATT: ReadValueAsync failed (status={readResult.Status})");
-                            return null;
+                            if (servicesResult?.Services != null)
+                            {
+                                foreach (var svc in servicesResult.Services)
+                                {
+                                    try { svc.Dispose(); } catch { }
+                                }
+                            }
                         }
-
-                        // BatteryLevel is a single byte, 0-100
-                        var reader = DataReader.FromBuffer(readResult.Value);
-                        byte level = reader.ReadByte();
-                        Log($"    Battery GATT: {level}% for address {bluetoothAddress:X12}");
-                        return (int)level;
                     }
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                Log($"    Battery GATT: Read timed out (3s) or cancelled for {bluetoothAddress:X12}");
+                return null;
             }
             catch (Exception ex)
             {
