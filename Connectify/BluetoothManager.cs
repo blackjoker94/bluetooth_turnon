@@ -430,9 +430,9 @@ namespace bluetooth_turnon
         /// <summary>
         /// Returns only currently CONNECTED Bluetooth (Classic) devices.
         /// Devices that are paired but not actively connected are excluded.
-        /// Battery is not queried in this iteration — DeviceInfo.BatteryPercent will be null.
+        /// Battery is queried via PnP property or BLE GATT fallback.
         /// Returns an empty list if the adapter is off, no devices are connected, or any error occurs.
-        /// Guarded by _semaphore so background scans never collide with connection operations.
+        /// Does not hold _semaphore so background refreshes never block user clicks.
         /// </summary>
         public async Task<IReadOnlyList<DeviceInfo>> GetPairedDevicesAsync(CancellationToken ct = default)
         {
@@ -445,7 +445,6 @@ namespace bluetooth_turnon
                 return new List<DeviceInfo>();
             }
 
-            await _semaphore.WaitAsync(ct).ConfigureAwait(false);
             try
             {
                 // BluetoothClient.PairedDevices is a synchronous, potentially blocking call
@@ -530,10 +529,6 @@ namespace bluetooth_turnon
             {
                 Log($"GetPairedDevicesAsync outer exception: {ex.Message}");
                 return new List<DeviceInfo>();
-            }
-            finally
-            {
-                _semaphore.Release();
             }
         }
 
