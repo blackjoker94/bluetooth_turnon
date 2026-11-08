@@ -582,11 +582,11 @@ namespace bluetooth_turnon
                             success = await _bluetoothManager.DisconnectDeviceAsync(addr);
                         }
 
-                        if (!success && isConnecting)
+                        if (!success)
                         {
                             if (!typeLabel.IsDisposed)
                             {
-                                typeLabel.Text = "Connection failed";
+                                typeLabel.Text = isConnecting ? "Connection failed" : "Disconnect failed";
                                 typeLabel.ForeColor = Color.FromArgb(230, 80, 80); // Red
                             }
                             await Task.Delay(1500);
@@ -594,14 +594,14 @@ namespace bluetooth_turnon
                         else
                         {
                             // Allow UI to show feedback briefly before refreshing
-                            await Task.Delay(1000);
+                            await Task.Delay(200);
                         }
                     }
                     catch
                     {
                         if (!typeLabel.IsDisposed)
                         {
-                            typeLabel.Text = "Connection failed";
+                            typeLabel.Text = isConnecting ? "Connection failed" : "Disconnect failed";
                             typeLabel.ForeColor = Color.FromArgb(230, 80, 80); // Red
                         }
                         await Task.Delay(1500);
