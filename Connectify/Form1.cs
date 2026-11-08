@@ -13,6 +13,8 @@ namespace bluetooth_turnon
         private readonly BluetoothManager _bluetoothManager;
         private bool _isUpdatingUiFromState;
         private bool _isRefreshingDevices; // guard against overlapping watcher-triggered refreshes
+        private bool _refreshPending;
+        private readonly HashSet<ulong> _connectingAddresses = new HashSet<ulong>();
         private readonly System.Threading.CancellationTokenSource _cts = new System.Threading.CancellationTokenSource();
 
         private NotifyIcon _trayIcon;
@@ -261,21 +263,38 @@ namespace bluetooth_turnon
 
         private async Task RefreshDevicesIfIdleAsync()
         {
-            if (_isRefreshingDevices) return;
+            if (_isRefreshingDevices)
+            {
+                _refreshPending = true;
+                return;
+            }
             await RefreshDevicesAsync();
         }
 
         private async Task RefreshDevicesAsync()
         {
+            if (_isRefreshingDevices)
+            {
+                _refreshPending = true;
+                return;
+            }
+
             _isRefreshingDevices = true;
             try
             {
-                var devices = await _bluetoothManager.GetPairedDevicesAsync(_cts.Token);
-                BuildDeviceCards(devices);
-            }
-            catch
-            {
-                BuildDeviceCards(new List<DeviceInfo>());
+                do
+                {
+                    _refreshPending = false;
+                    try
+                    {
+                        var devices = await _bluetoothManager.GetPairedDevicesAsync(_cts.Token);
+                        BuildDeviceCards(devices);
+                    }
+                    catch
+                    {
+                        BuildDeviceCards(new List<DeviceInfo>());
+                    }
+                } while (_refreshPending && !_cts.IsCancellationRequested);
             }
             finally
             {
@@ -410,10 +429,17 @@ namespace bluetooth_turnon
 
                 // ── Device type subtitle ────────────────────────────────────────
                 string typeText = GetDeviceTypeLabel(device.DeviceType);
+                Color  typeColor = device.IsConnected ? Color.FromArgb(120, capturedAccent.R, capturedAccent.G, capturedAccent.B) : Color.FromArgb(100, 100, 110);
+                if (_connectingAddresses.Contains(device.Address))
+                {
+                    typeText = device.IsConnected ? "Disconnecting..." : "Connecting...";
+                    typeColor = Color.FromArgb(255, 190, 50); // Amber
+                }
+
                 var typeLabel = new Label
                 {
                     Text      = typeText,
-                    ForeColor = device.IsConnected ? Color.FromArgb(120, capturedAccent.R, capturedAccent.G, capturedAccent.B) : Color.FromArgb(100, 100, 110),
+                    ForeColor = typeColor,
                     Font      = new Font("Segoe UI", 8F),
                     AutoSize  = false,
                     TextAlign = ContentAlignment.TopLeft,
@@ -468,22 +494,63 @@ namespace bluetooth_turnon
 
                 EventHandler onClick = async (s, e) => 
                 {
-                    // Visual feedback
-                    typeLabel.Text = device.IsConnected ? "Disconnecting..." : "Connecting...";
-                    typeLabel.ForeColor = Color.FromArgb(255, 190, 50); // Amber
+                    ulong addr = device.Address;
+                    if (!_connectingAddresses.Add(addr))
+                    {
+                        // Ignore duplicate clicks while operation is already in flight
+                        return;
+                    }
 
-                    if (device.IsConnected)
+                    try
                     {
-                        await _bluetoothManager.DisconnectDeviceAsync(device.Address);
+                        bool isConnecting = !device.IsConnected;
+
+                        // Visual feedback
+                        if (!typeLabel.IsDisposed)
+                        {
+                            typeLabel.Text = isConnecting ? "Connecting..." : "Disconnecting...";
+                            typeLabel.ForeColor = Color.FromArgb(255, 190, 50); // Amber
+                        }
+
+                        bool success;
+                        if (isConnecting)
+                        {
+                            success = await _bluetoothManager.ConnectDeviceAsync(addr);
+                        }
+                        else
+                        {
+                            success = await _bluetoothManager.DisconnectDeviceAsync(addr);
+                        }
+
+                        if (!success && isConnecting)
+                        {
+                            if (!typeLabel.IsDisposed)
+                            {
+                                typeLabel.Text = "Connection failed";
+                                typeLabel.ForeColor = Color.FromArgb(230, 80, 80); // Red
+                            }
+                            await Task.Delay(1500);
+                        }
+                        else
+                        {
+                            // Allow UI to show feedback briefly before refreshing
+                            await Task.Delay(1000);
+                        }
                     }
-                    else
+                    catch
                     {
-                        await _bluetoothManager.ConnectDeviceAsync(device.Address);
+                        if (!typeLabel.IsDisposed)
+                        {
+                            typeLabel.Text = "Connection failed";
+                            typeLabel.ForeColor = Color.FromArgb(230, 80, 80); // Red
+                        }
+                        await Task.Delay(1500);
                     }
-                    
-                    // Allow UI to show the feedback, then force a refresh
-                    await Task.Delay(1500);
-                    await RefreshDevicesIfIdleAsync();
+                    finally
+                    {
+                        _connectingAddresses.Remove(addr);
+                        await RefreshDevicesIfIdleAsync();
+                    }
                 };
 
                 var controls = new Control[] { card, iconPanel, iconBox, nameLabel, typeLabel, batteryBox, batteryLabel };
