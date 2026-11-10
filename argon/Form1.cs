@@ -704,56 +704,71 @@ namespace bluetooth_turnon
             _hoverDebounceTimer?.Stop();
             _pendingDevices = null;
 
-            // Dispose existing child controls and clear
-            foreach (Control ctrl in panelDeviceList.Controls)
-                ctrl.Dispose();
-            panelDeviceList.Controls.Clear();
+            // Preserve vertical scroll position across rebuilds
+            int previousScrollY = Math.Abs(panelDeviceList.AutoScrollPosition.Y);
 
-            if (devices == null || devices.Count == 0)
+            panelDeviceList.SuspendLayout();
+            try
             {
-                var emptyLabel = new Label
+                // Reset scroll offset before clearing and positioning child controls
+                panelDeviceList.AutoScrollPosition = new Point(0, 0);
+
+                // Dispose existing child controls and clear
+                foreach (Control ctrl in panelDeviceList.Controls)
+                    ctrl.Dispose();
+                panelDeviceList.Controls.Clear();
+
+                if (devices == null || devices.Count == 0)
                 {
-                    Text = "No devices connected",
-                    ForeColor = Color.FromArgb(100, 100, 120),
-                    Font = EmptyStateFont,
-                    AutoSize = false,
-                    TextAlign = ContentAlignment.MiddleCenter,
-                    Size = new Size(panelDeviceList.Width, 80),
-                    Location = new Point(0, 20),
-                    BackColor = Color.Transparent
-                };
-                panelDeviceList.Controls.Add(emptyLabel);
-                return;
-            }
+                    var emptyLabel = new Label
+                    {
+                        Text = "No devices connected",
+                        ForeColor = Color.FromArgb(100, 100, 120),
+                        Font = EmptyStateFont,
+                        AutoSize = false,
+                        TextAlign = ContentAlignment.MiddleCenter,
+                        Size = new Size(panelDeviceList.ClientSize.Width, 80),
+                        Location = new Point(0, 20),
+                        BackColor = Color.Transparent
+                    };
+                    panelDeviceList.Controls.Add(emptyLabel);
+                    return;
+                }
 
-            int cardHeight = 72;
-            int y = 0;
-            Point currentCursorInList = panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed
-                ? panelDeviceList.PointToClient(Cursor.Position)
-                : new Point(-1, -1);
+                int cardHeight = 72;
+                int totalHeight = devices.Count * cardHeight;
+                bool needsVerticalScroll = totalHeight > panelDeviceList.ClientSize.Height;
+                int cardWidth = needsVerticalScroll
+                    ? (panelDeviceList.Width - SystemInformation.VerticalScrollBarWidth)
+                    : panelDeviceList.Width;
 
-            for (int i = 0; i < devices.Count; i++)
-            {
-                var device = devices[i];
-                bool isOdd = (i % 2 == 0);
-                Color baseBgColor = isOdd ? RowColorOdd : RowColorEven;
-                Color hoverBgColor = Color.FromArgb(baseBgColor.R + 10, baseBgColor.G + 10, baseBgColor.B + 15);
+                int y = 0;
+                Point currentCursorInList = panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed
+                    ? panelDeviceList.PointToClient(Cursor.Position)
+                    : new Point(-1, -1);
 
-                // Preserve hover state if mouse is currently over this card's bounds (Bug 9)
-                var cardRect = new Rectangle(0, y, panelDeviceList.Width, cardHeight);
-                bool isHovered = cardRect.Contains(currentCursorInList);
-                Color initialBgColor = isHovered ? hoverBgColor : baseBgColor;
-
-                // Card panel
-                var card = new Panel
+                for (int i = 0; i < devices.Count; i++)
                 {
-                    Tag = device.Address,
-                    BackColor = initialBgColor,
-                    Location = new Point(0, y),
-                    Size = new Size(panelDeviceList.Width, cardHeight),
-                    Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top,
-                    Cursor = Cursors.Hand
-                };
+                    var device = devices[i];
+                    bool isOdd = (i % 2 == 0);
+                    Color baseBgColor = isOdd ? RowColorOdd : RowColorEven;
+                    Color hoverBgColor = Color.FromArgb(baseBgColor.R + 10, baseBgColor.G + 10, baseBgColor.B + 15);
+
+                    // Preserve hover state if mouse is currently over this card's bounds (Bug 9)
+                    var cardRect = new Rectangle(0, y, cardWidth, cardHeight);
+                    bool isHovered = cardRect.Contains(new Point(currentCursorInList.X, currentCursorInList.Y + previousScrollY));
+                    Color initialBgColor = isHovered ? hoverBgColor : baseBgColor;
+
+                    // Card panel
+                    var card = new Panel
+                    {
+                        Tag = device.Address,
+                        BackColor = initialBgColor,
+                        Location = new Point(0, y),
+                        Size = new Size(cardWidth, cardHeight),
+                        Anchor = AnchorStyles.Left | AnchorStyles.Top,
+                        Cursor = Cursors.Hand
+                    };
 
                 // ── Type-specific icon ────────────────────────────────────
                 string iconFile = GetDeviceIconFileName(device.DeviceType);
@@ -1030,6 +1045,21 @@ namespace bluetooth_turnon
 
                 y += cardHeight;
             }
+
+            // Ensure horizontal scrollbar never appears
+            panelDeviceList.HorizontalScroll.Maximum = 0;
+            panelDeviceList.HorizontalScroll.Visible = false;
+            panelDeviceList.AutoScrollMinSize = new Size(0, totalHeight);
+
+            // Restore vertical scroll position
+            if (needsVerticalScroll && previousScrollY > 0)
+            {
+                panelDeviceList.AutoScrollPosition = new Point(0, previousScrollY);
+            }
+        }
+        finally
+        {
+            panelDeviceList.ResumeLayout(true);
         }
 
         // ── Device type helpers ───────────────────────────────────────────────
