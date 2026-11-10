@@ -341,6 +341,15 @@ namespace bluetooth_turnon
         private readonly object _batteryRetryLock = new object();
         private readonly ConcurrentDictionary<ulong, (int? Battery, DateTime LastCheckedUtc)> _batteryCache =
             new ConcurrentDictionary<ulong, (int? Battery, DateTime LastCheckedUtc)>();
+
+        // Holds open BluetoothLEDevice handles for actively connected BLE devices so Windows keeps the
+        // BLE ACL link alive. The OS drops the link once all process-side handles are released.
+        // Populated by ConnectBleDeviceAsync on success; removed and disposed by DisconnectBleDeviceAsync,
+        // SetAdapterStateAsync(false), and Dispose(). Read (but never disposed) by GetPairedDevicesAsync,
+        // IsDeviceConnectedAsync, and QueryBatteryViaGattAsync.
+        private readonly ConcurrentDictionary<ulong, BluetoothLEDevice> _connectedBleDevices =
+            new ConcurrentDictionary<ulong, BluetoothLEDevice>();
+
         private volatile Radio _bluetoothRadio;
         private volatile bool _radioDiscoveryAttempted;
         private DeviceWatcher _classicWatcher;
@@ -360,6 +369,35 @@ namespace bluetooth_turnon
             }
             catch (ObjectDisposedException) { }
             catch (SemaphoreFullException) { }
+        }
+
+        /// <summary>
+        /// Removes all entries from _connectedBleDevices and disposes each stored handle, causing Windows
+        /// to drop any BLE ACL links this process was keeping alive. Called on adapter-off and Dispose().
+        /// </summary>
+        private void ReleasAllConnectedBleHandles(string reason)
+        {
+            var keys = _connectedBleDevices.Keys.ToArray();
+            foreach (var addr in keys)
+            {
+                if (_connectedBleDevices.TryRemove(addr, out var dev))
+                {
+                    try { dev?.Dispose(); } catch { }
+                    Log($"  ReleasAllConnectedBleHandles ({reason}): released handle for {addr:X12}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Removes and disposes the tracked BLE handle for a single address (called on disconnect).
+        /// </summary>
+        private void ReleaseConnectedBleHandle(ulong address)
+        {
+            if (_connectedBleDevices.TryRemove(address, out var dev))
+            {
+                try { dev?.Dispose(); } catch { }
+                Log($"  ReleaseConnectedBleHandle: released handle for {address:X12}");
+            }
         }
 
         /// <summary>
@@ -628,6 +666,9 @@ namespace bluetooth_turnon
                     catch { }
                     _deviceOpCts = new CancellationTokenSource();
                 }
+
+                // Release all open BLE device handles so Windows can fully drop those ACL links.
+                ReleasAllConnectedBleHandles("adapter off");
             }
 
             var radio = _bluetoothRadio;
@@ -806,6 +847,7 @@ namespace bluetooth_turnon
                                 ct.ThrowIfCancellationRequested();
 
                                 BluetoothLEDevice bleDevice = null;
+                                bool isCachedHandle = false;
                                 try
                                 {
                                     using (var lookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
@@ -826,6 +868,16 @@ namespace bluetooth_turnon
                                     {
                                         Log($"GetPairedDevicesAsync: BLE device '{bleDevice.Name}' address was 0; skipping");
                                         continue;
+                                    }
+
+                                    // If we already have a live tracked handle for this address, prefer it and
+                                    // discard the freshly-created temporary one (safe to dispose since tracked
+                                    // handle is a separate WinRT RCW keeping the link open independently).
+                                    if (_connectedBleDevices.TryGetValue(address, out var cachedHandle))
+                                    {
+                                        try { bleDevice.Dispose(); } catch { }
+                                        bleDevice = cachedHandle;
+                                        isCachedHandle = true;
                                     }
 
                                     string name = !string.IsNullOrWhiteSpace(bleDevice.Name)
@@ -920,7 +972,12 @@ namespace bluetooth_turnon
                                 }
                                 finally
                                 {
-                                    try { bleDevice?.Dispose(); } catch { }
+                                    // Only dispose the temporary handle. Never dispose a cached handle —
+                                    // disposing it would release the OS's reference count and drop the BLE link.
+                                    if (!isCachedHandle)
+                                    {
+                                        try { bleDevice?.Dispose(); } catch { }
+                                    }
                                 }
                             }
                         }
@@ -999,6 +1056,14 @@ namespace bluetooth_turnon
                         }
 
                         // 2. Check Bluetooth LE (for pure BLE devices or dual-mode connected over BLE)
+                        // Fast path: if we have an open tracked handle, read ConnectionStatus directly — no allocation.
+                        if (_connectedBleDevices.TryGetValue(address, out var trackedDev))
+                        {
+                            bool isBleConnected = (trackedDev.ConnectionStatus == BluetoothConnectionStatus.Connected);
+                            Log($"IsDeviceConnectedAsync: BLE device {address:X12} found in _connectedBleDevices, ConnectionStatus={trackedDev.ConnectionStatus}");
+                            return (bool?)isBleConnected;
+                        }
+
                         BluetoothLEDevice bleDevice = null;
                         try
                         {
@@ -1026,6 +1091,7 @@ namespace bluetooth_turnon
                         }
                         finally
                         {
+                            // Safe to dispose: this is a temporary handle, not the tracked one.
                             try { bleDevice?.Dispose(); } catch { }
                         }
 
@@ -1536,6 +1602,54 @@ namespace bluetooth_turnon
                                     return true;
                                 }
 
+                                // Dual-mode guard: device is in PairedDevices but NOT connected over Classic.
+                                // Some devices (BLE mice, keyboards, modern headsets) register in Win32
+                                // PairedDevices yet connect exclusively over the BLE transport. Running the
+                                // Classic RFCOMM wake / CoreAudio / SetServiceState chain on them is wrong and
+                                // triggers the unnecessary 15-second Step 6 Radio Bounce. Detect this case by
+                                // checking BLE connection status first, and route straight to ConnectBleDeviceAsync.
+                                bool bleConnected = false;
+                                if (_connectedBleDevices.TryGetValue(address, out var existingBleHandle))
+                                {
+                                    bleConnected = (existingBleHandle.ConnectionStatus == BluetoothConnectionStatus.Connected);
+                                }
+                                if (!bleConnected)
+                                {
+                                    try
+                                    {
+                                        using (var bleLookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+                                        using (var bleLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, bleLookupCts.Token))
+                                        using (var tempBle = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
+                                            .AsTask(bleLinkedCts.Token).ConfigureAwait(false))
+                                        {
+                                            if (tempBle != null)
+                                                bleConnected = (tempBle.ConnectionStatus == BluetoothConnectionStatus.Connected);
+                                        }
+                                    }
+                                    catch { }
+                                }
+                                if (bleConnected)
+                                {
+                                    Log($"  ConnectDeviceAsync: '{targetDeviceName}' found connected over BLE. Routing to BLE connect path.");
+                                    return await ConnectBleDeviceAsync(address, token).ConfigureAwait(false);
+                                }
+
+                                // Also check if the device's installed Classic profiles are absent or empty —
+                                // which indicates a BLE-only device that happens to have a Win32 Classic entry.
+                                bool hasClassicProfiles = false;
+                                try
+                                {
+                                    var installed = device.InstalledServices;
+                                    hasClassicProfiles = (installed != null && installed.Count > 0);
+                                }
+                                catch { }
+
+                                if (!hasClassicProfiles)
+                                {
+                                    Log($"  ConnectDeviceAsync: '{targetDeviceName}' has no installed Classic profiles. Routing to BLE connect path.");
+                                    return await ConnectBleDeviceAsync(address, token).ConfigureAwait(false);
+                                }
+
                                 if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On)
                                 {
                                     Log($"  ConnectDeviceAsync: Adapter turned off or absent before baseband wake. Aborting.");
@@ -1919,12 +2033,44 @@ namespace bluetooth_turnon
                                 Log($"  device.Refresh() called for '{targetName}', Connected={device.Connected}");
                                 if (!device.Connected)
                                 {
+                                    // Dual-mode guard: device is in PairedDevices but Classic says not connected.
+                                    // It may still be connected over BLE (e.g. BLE mouse/keyboard/dual-mode headset).
+                                    // Check the BLE side before declaring victory and potentially leaving a live BLE link.
+                                    Log($"  '{targetName}' Classic link not connected. Checking BLE connection status...");
+                                    bool bleStillConnected = false;
+                                    if (_connectedBleDevices.TryGetValue(address, out var bleHandle))
+                                    {
+                                        bleStillConnected = (bleHandle.ConnectionStatus == BluetoothConnectionStatus.Connected);
+                                    }
+                                    if (!bleStillConnected)
+                                    {
+                                        // No tracked handle — do a live check
+                                        try
+                                        {
+                                            using (var bleLookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+                                            using (var bleLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, bleLookupCts.Token))
+                                            using (var checkDev = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
+                                                .AsTask(bleLinkedCts.Token).ConfigureAwait(false))
+                                            {
+                                                if (checkDev != null)
+                                                    bleStillConnected = (checkDev.ConnectionStatus == BluetoothConnectionStatus.Connected);
+                                            }
+                                        }
+                                        catch { }
+                                    }
+
+                                    if (bleStillConnected)
+                                    {
+                                        Log($"  '{targetName}' is connected over BLE — routing to BLE disconnect.");
+                                        return await DisconnectBleDeviceAsync(address, token).ConfigureAwait(false);
+                                    }
+
                                     _batteryCache.TryRemove(address, out _);
                                     lock (_batteryRetryLock)
                                     {
                                         _activeBatteryRetries.Remove(address);
                                     }
-                                    Log($"  '{targetName}' is already disconnected.");
+                                    Log($"  '{targetName}' is already disconnected (Classic and BLE).");
                                     return true;
                                 }
 
@@ -2121,11 +2267,14 @@ namespace bluetooth_turnon
 
         /// <summary>
         /// Connects to a paired Bluetooth LE device by requesting uncached GATT services to trigger link establishment.
+        /// On success, stores the open BluetoothLEDevice handle in _connectedBleDevices so Windows keeps the BLE ACL
+        /// link alive. The handle is released when the device disconnects or the adapter is turned off.
         /// </summary>
         private async Task<bool> ConnectBleDeviceAsync(ulong address, CancellationToken token)
         {
             Log($"  ConnectBleDeviceAsync called for {address:X12}");
             BluetoothLEDevice bleDevice = null;
+            bool success = false;
             try
             {
                 using (var lookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(4)))
@@ -2146,27 +2295,29 @@ namespace bluetooth_turnon
 
                 if (bleDevice.ConnectionStatus == BluetoothConnectionStatus.Connected)
                 {
-                    Log($"  ConnectBleDeviceAsync: '{bleName}' is already connected.");
+                    Log($"  ConnectBleDeviceAsync: '{bleName}' is already connected. Storing handle.");
+                    // Store the handle to keep the link alive (replace any stale entry).
+                    var old = _connectedBleDevices.AddOrUpdate(address, bleDevice, (_, prev) =>
+                    {
+                        if (!ReferenceEquals(prev, bleDevice)) { try { prev.Dispose(); } catch { } }
+                        return bleDevice;
+                    });
+                    success = true;
                     return true;
                 }
 
-                // Querying uncached GATT services prompts Windows to initiate an active connection to the paired BLE device
+                // Querying uncached GATT services prompts Windows to initiate an active connection to the paired BLE device.
+                // We deliberately do NOT dispose the GATT service handles here — keeping them open extends the
+                // OS reference count and helps maintain the connection during the polling loop below.
                 Log($"  ConnectBleDeviceAsync: Requesting uncached GATT services to trigger connection for '{bleName}'...");
+                GattDeviceServicesResult gattResult = null;
                 try
                 {
                     using (var gattCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
                     using (var linkedGattCts = CancellationTokenSource.CreateLinkedTokenSource(token, gattCts.Token))
                     {
-                        var gattResult = await bleDevice.GetGattServicesAsync(BluetoothCacheMode.Uncached)
+                        gattResult = await bleDevice.GetGattServicesAsync(BluetoothCacheMode.Uncached)
                             .AsTask(linkedGattCts.Token).ConfigureAwait(false);
-
-                        if (gattResult?.Services != null)
-                        {
-                            foreach (var svc in gattResult.Services)
-                            {
-                                try { svc.Dispose(); } catch { }
-                            }
-                        }
                         Log($"  ConnectBleDeviceAsync: GATT query completed with status {gattResult?.Status}.");
                     }
                 }
@@ -2186,10 +2337,23 @@ namespace bluetooth_turnon
                     Log($"  ConnectBleDeviceAsync: Verify attempt {attempt}/5: ConnectionStatus={bleDevice.ConnectionStatus}");
                     if (bleDevice.ConnectionStatus == BluetoothConnectionStatus.Connected)
                     {
-                        Log($"  ConnectBleDeviceAsync: '{bleName}' connected successfully on attempt {attempt}/5.");
+                        Log($"  ConnectBleDeviceAsync: '{bleName}' connected successfully on attempt {attempt}/5. Storing handle.");
+                        // Store the open handle — do NOT dispose bleDevice here.
+                        var old = _connectedBleDevices.AddOrUpdate(address, bleDevice, (_, prev) =>
+                        {
+                            if (!ReferenceEquals(prev, bleDevice)) { try { prev.Dispose(); } catch { } }
+                            return bleDevice;
+                        });
+                        success = true;
                         return true;
                     }
                     await Task.Delay(800, token).ConfigureAwait(false);
+                }
+
+                // Dispose GATT service handles since connection failed.
+                if (gattResult?.Services != null)
+                {
+                    foreach (var svc in gattResult.Services) { try { svc.Dispose(); } catch { } }
                 }
 
                 Log($"  ConnectBleDeviceAsync failed for '{bleName}' ({address:X12}).");
@@ -2206,16 +2370,27 @@ namespace bluetooth_turnon
             }
             finally
             {
-                try { bleDevice?.Dispose(); } catch { }
+                // Only dispose the device handle if the connection failed.
+                // On success, bleDevice is now owned by _connectedBleDevices.
+                if (!success)
+                {
+                    try { bleDevice?.Dispose(); } catch { }
+                }
             }
         }
 
         /// <summary>
-        /// Disconnects a paired Bluetooth LE device by sending an IOCTL baseband teardown and releasing GATT references.
+        /// Disconnects a paired Bluetooth LE device by releasing any tracked BLE handle, sending an IOCTL
+        /// baseband teardown, and verifying the connection drops via polling.
         /// </summary>
         private async Task<bool> DisconnectBleDeviceAsync(ulong address, CancellationToken token)
         {
             Log($"  DisconnectBleDeviceAsync called for {address:X12}");
+
+            // Step 0: Release the tracked BLE handle FIRST so our process stops keeping the ACL link alive.
+            // This is intentionally done before IOCTL so the OS can drop the link on its own too.
+            ReleaseConnectedBleHandle(address);
+
             BluetoothLEDevice bleDevice = null;
             try
             {
@@ -2257,7 +2432,7 @@ namespace bluetooth_turnon
                     Log($"  DisconnectBleDeviceAsync: IOCTL disconnect note: {ex.Message}");
                 }
 
-                // Step 2: Release BLE device handle so our process doesn't keep the link alive
+                // Step 2: Release the temporary lookup handle so our process holds no references at all.
                 try
                 {
                     bleDevice.Dispose();
@@ -2976,10 +3151,12 @@ namespace bluetooth_turnon
         /// <summary>
         /// Pass 2: Reads battery via BLE GATT Battery Service (UUID 0x180F / characteristic 0x2A19).
         /// Used as a fallback when the Windows property approach returns null.
+        /// Reuses a cached BluetoothLEDevice from _connectedBleDevices when available to avoid
+        /// allocating a temporary handle that could disrupt an already-connected BLE session.
         /// Matches paired BLE devices by name via DeviceInformation before falling back to Classic address.
         /// Returns null if the device is unreachable, the service is absent, or any error occurs.
         /// </summary>
-        private static async Task<int?> QueryBatteryViaGattAsync(ulong bluetoothAddress, string deviceName, CancellationToken ct)
+        private async Task<int?> QueryBatteryViaGattAsync(ulong bluetoothAddress, string deviceName, CancellationToken ct)
         {
             try
             {
@@ -2988,10 +3165,20 @@ namespace bluetooth_turnon
                 {
                     var token = linkedCts.Token;
                     BluetoothLEDevice bleDevice = null;
+                    bool isCachedHandle = false;
                     try
                     {
+                        // 0. Fast path: reuse an existing tracked handle (keeps the BLE link alive and avoids
+                        //    disposing a shared WinRT RCW that another code path is relying on).
+                        if (bluetoothAddress != 0 && _connectedBleDevices.TryGetValue(bluetoothAddress, out var cachedDev))
+                        {
+                            bleDevice = cachedDev;
+                            isCachedHandle = true;
+                            Log($"    Battery GATT: Reusing tracked handle for {bluetoothAddress:X12} ('{bleDevice.Name}')");
+                        }
+
                         // 1. Look up by Bluetooth address first (exact match)
-                        if (bluetoothAddress != 0)
+                        if (bleDevice == null && bluetoothAddress != 0)
                         {
                             bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
                                 .AsTask(token).ConfigureAwait(false);
@@ -3133,7 +3320,11 @@ namespace bluetooth_turnon
                     }
                     finally
                     {
-                        try { bleDevice?.Dispose(); } catch { }
+                        // Never dispose a cached handle — it is owned by _connectedBleDevices.
+                        if (!isCachedHandle)
+                        {
+                            try { bleDevice?.Dispose(); } catch { }
+                        }
                     }
                 }
             }
@@ -3565,6 +3756,9 @@ namespace bluetooth_turnon
                 _bluetoothRadio = null;
             }
             _radioDiscoveryAttempted = false;
+
+            // Release all open BLE handles so Windows can drop those ACL links cleanly.
+            ReleasAllConnectedBleHandles("dispose");
 
             _batteryCache.Clear();
             lock (_batteryRetryLock)
