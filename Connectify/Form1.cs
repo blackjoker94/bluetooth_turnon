@@ -562,10 +562,9 @@ namespace bluetooth_turnon
                         return;
                     }
 
+                    bool isConnecting = !device.IsConnected;
                     try
                     {
-                        bool isConnecting = !device.IsConnected;
-
                         // Visual feedback
                         if (!typeLabel.IsDisposed)
                         {
