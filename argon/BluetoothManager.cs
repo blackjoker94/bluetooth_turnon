@@ -391,20 +391,21 @@ namespace bluetooth_turnon
         /// Finds and initializes the Bluetooth Radio object.
         /// Acquires _radioInitSemaphore using double-checked locking around _bluetoothRadio so concurrent callers
         /// at startup initialize and subscribe BluetoothRadio_StateChanged exactly once.
-        /// Subsequent calls once _bluetoothRadio is non-null are completely lock-free.
+        /// Subsequent calls once _bluetoothRadio is non-null and valid are completely lock-free.
         /// If discovery was previously attempted and found no radio, returns null without re-acquiring the semaphore
-        /// unless forceRefresh is true.
+        /// unless forceRefresh is true or the cached radio is in Unknown state.
         /// </summary>
         private async Task<Radio> GetBluetoothRadioAsync(CancellationToken ct = default, bool forceRefresh = false)
         {
             if (_disposed) return null;
 
-            if (_bluetoothRadio != null)
+            var existingRadio = _bluetoothRadio;
+            if (!forceRefresh && existingRadio != null && existingRadio.State != RadioState.Unknown)
             {
-                return _bluetoothRadio;
+                return existingRadio;
             }
 
-            if (_radioDiscoveryAttempted && !forceRefresh)
+            if (_radioDiscoveryAttempted && !forceRefresh && (existingRadio == null || existingRadio.State == RadioState.Unknown))
             {
                 return null;
             }
@@ -412,14 +413,21 @@ namespace bluetooth_turnon
             await _radioInitSemaphore.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                if (_bluetoothRadio != null)
+                existingRadio = _bluetoothRadio;
+                if (!forceRefresh && existingRadio != null && existingRadio.State != RadioState.Unknown)
                 {
-                    return _bluetoothRadio;
+                    return existingRadio;
                 }
 
-                if (_radioDiscoveryAttempted && !forceRefresh)
+                if (_radioDiscoveryAttempted && !forceRefresh && (existingRadio == null || existingRadio.State == RadioState.Unknown))
                 {
                     return null;
+                }
+
+                if (existingRadio != null)
+                {
+                    try { existingRadio.StateChanged -= BluetoothRadio_StateChanged; } catch { }
+                    _bluetoothRadio = null;
                 }
 
                 _radioDiscoveryAttempted = true;
@@ -436,7 +444,7 @@ namespace bluetooth_turnon
                     {
                         Log("BluetoothAdapter found. Calling GetRadioAsync()...");
                         var radio = await adapter.GetRadioAsync().AsTask(ct).ConfigureAwait(false);
-                        if (radio != null)
+                        if (radio != null && radio.State != RadioState.Unknown)
                         {
                             _bluetoothRadio = radio;
                             _bluetoothRadio.StateChanged += BluetoothRadio_StateChanged;
@@ -445,7 +453,7 @@ namespace bluetooth_turnon
                         }
                         else
                         {
-                            Log("adapter.GetRadioAsync() returned null");
+                            Log(radio == null ? "adapter.GetRadioAsync() returned null" : $"adapter.GetRadioAsync() returned radio with State={radio.State}");
                         }
                     }
                     else
@@ -472,7 +480,7 @@ namespace bluetooth_turnon
                         foreach (var radio in radios)
                         {
                             Log($"Radio: Name='{radio.Name}', Kind={radio.Kind}, State={radio.State}");
-                            if (radio.Kind == RadioKind.Bluetooth)
+                            if (radio.Kind == RadioKind.Bluetooth && radio.State != RadioState.Unknown)
                             {
                                 _bluetoothRadio = radio;
                                 _bluetoothRadio.StateChanged += BluetoothRadio_StateChanged;
@@ -505,8 +513,19 @@ namespace bluetooth_turnon
         {
             try
             {
+                Log($"BluetoothRadio_StateChanged event received. State={sender.State}");
+                if (sender.State == RadioState.Unknown)
+                {
+                    Log("BluetoothRadio_StateChanged: Radio state is Unknown (adapter unplugged or reset). Invalidating cached radio.");
+                    try { sender.StateChanged -= BluetoothRadio_StateChanged; } catch { }
+                    _bluetoothRadio = null;
+                    _radioDiscoveryAttempted = false;
+                    AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(null, "No Adapter"));
+                    return;
+                }
+
                 bool isEnabled = (sender.State == RadioState.On);
-                Log($"BluetoothRadio_StateChanged event received. State={sender.State}, isEnabled={isEnabled}");
+                Log($"BluetoothRadio_StateChanged: isEnabled={isEnabled}");
                 AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(isEnabled));
             }
             catch (Exception ex)
@@ -518,6 +537,7 @@ namespace bluetooth_turnon
         /// <summary>
         /// Returns true if the Bluetooth adapter is on, false if off, null if no adapter.
         /// Reads _bluetoothRadio.State directly without acquiring any locks after initial startup.
+        /// If cached radio is missing or in Unknown state, attempts a forced rediscovery.
         /// </summary>
         public async Task<bool?> GetAdapterStateAsync(CancellationToken ct = default)
         {
@@ -525,12 +545,12 @@ namespace bluetooth_turnon
             try
             {
                 var radio = _bluetoothRadio;
-                if (radio == null)
+                if (radio == null || radio.State == RadioState.Unknown)
                 {
-                    radio = await GetBluetoothRadioAsync(ct).ConfigureAwait(false);
+                    radio = await GetBluetoothRadioAsync(ct, forceRefresh: true).ConfigureAwait(false);
                 }
 
-                if (radio != null)
+                if (radio != null && radio.State != RadioState.Unknown)
                 {
                     bool isEnabled = (radio.State == RadioState.On);
                     Log($"GetAdapterStateAsync: {isEnabled} (State={radio.State})");
@@ -569,10 +589,15 @@ namespace bluetooth_turnon
                 catch { }
             }
 
-            var radio = _bluetoothRadio ?? await GetBluetoothRadioAsync(ct, forceRefresh: true).ConfigureAwait(false);
-            if (radio == null)
+            var radio = _bluetoothRadio;
+            if (radio == null || radio.State == RadioState.Unknown)
             {
-                Log("SetAdapterStateAsync: Radio is null, cannot toggle");
+                radio = await GetBluetoothRadioAsync(ct, forceRefresh: true).ConfigureAwait(false);
+            }
+
+            if (radio == null || radio.State == RadioState.Unknown)
+            {
+                Log("SetAdapterStateAsync: Radio is null or Unknown, cannot toggle");
                 return false;
             }
 
@@ -615,7 +640,7 @@ namespace bluetooth_turnon
             // Fast lock-free path: if radio is already cached, read state directly without
             // awaiting or acquiring any initialization semaphore (Bug 12 fix).
             var radio = _bluetoothRadio;
-            bool? state = (radio != null)
+            bool? state = (radio != null && radio.State != RadioState.Unknown)
                 ? (radio.State == RadioState.On)
                 : await GetAdapterStateAsync(ct).ConfigureAwait(false);
 
@@ -729,7 +754,7 @@ namespace bluetooth_turnon
             try
             {
                 var radio = _bluetoothRadio;
-                bool? adapterState = (radio != null)
+                bool? adapterState = (radio != null && radio.State != RadioState.Unknown)
                     ? (radio.State == RadioState.On)
                     : await GetAdapterStateAsync(ct).ConfigureAwait(false);
                 if (adapterState != true) return null;
@@ -1202,10 +1227,10 @@ namespace bluetooth_turnon
             Log($"ConnectDeviceAsync called for {address:X12}");
             if (_disposed) return false;
 
-            // Guard: Do not attempt to connect if Bluetooth radio is currently off
-            if (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.On)
+            // Guard: Do not attempt to connect if Bluetooth radio is currently off or absent
+            if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On)
             {
-                Log($"  ConnectDeviceAsync: Bluetooth adapter is OFF. Aborting connection for {address:X12}.");
+                Log($"  ConnectDeviceAsync: Bluetooth adapter is OFF or absent. Aborting connection for {address:X12}.");
                 return false;
             }
 
@@ -1241,9 +1266,9 @@ namespace bluetooth_turnon
                                     return true;
                                 }
 
-                                if (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.On)
+                                if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On)
                                 {
-                                    Log($"  ConnectDeviceAsync: Adapter turned off before baseband wake. Aborting.");
+                                    Log($"  ConnectDeviceAsync: Adapter turned off or absent before baseband wake. Aborting.");
                                     return false;
                                 }
 
@@ -1256,9 +1281,9 @@ namespace bluetooth_turnon
                                     return true;
                                 }
 
-                                if (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.On)
+                                if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On)
                                 {
-                                    Log($"  ConnectDeviceAsync: Adapter turned off before CoreAudio reconnect. Aborting.");
+                                    Log($"  ConnectDeviceAsync: Adapter turned off or absent before CoreAudio reconnect. Aborting.");
                                     return false;
                                 }
 
@@ -1297,9 +1322,9 @@ namespace bluetooth_turnon
                                     Log($"  CoreAudio reconnect attempt note: {ex.Message}");
                                 }
 
-                                if (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.On)
+                                if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On)
                                 {
-                                    Log($"  ConnectDeviceAsync: Adapter turned off before service state cycle. Aborting.");
+                                    Log($"  ConnectDeviceAsync: Adapter turned off or absent before service state cycle. Aborting.");
                                     return false;
                                 }
 
@@ -1478,7 +1503,7 @@ namespace bluetooth_turnon
                                 // labelStatus from "Reconnecting..." to "Enabled" and updates the toggle switch.
                                 try
                                 {
-                                    bool? finalState = (_bluetoothRadio != null) ? (_bluetoothRadio.State == RadioState.On) : (bool?)null;
+                                    bool? finalState = (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.Unknown) ? (_bluetoothRadio.State == RadioState.On) : (bool?)null;
                                     AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(finalState));
                                 }
                                 catch { }
