@@ -717,7 +717,7 @@ namespace bluetooth_turnon
                                     {
                                         // Pass 1: PnP device property (fastest, no BLE connection needed)
                                         // Uses the Bluetooth address to locate the HFP/BLE PnP node across enumerators
-                                        string addrHex = device.DeviceAddress.ToString().Replace(":", "");
+                                        string addrHex = address.ToString("X12");
                                         battery = QueryBatteryViaPnp(addrHex);
 
                                         if (battery != null)
@@ -1597,6 +1597,13 @@ namespace bluetooth_turnon
             Log($"DisconnectDeviceAsync called for {address:X12}");
             if (_disposed) return false;
 
+            // Immediately purge battery cache and cancel any pending deferred battery retry for this device
+            _batteryCache.TryRemove(address, out _);
+            lock (_batteryRetryLock)
+            {
+                _activeBatteryRetries.Remove(address);
+            }
+
             using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _deviceOpCts.Token))
             {
                 var token = linkedCts.Token;
@@ -1813,6 +1820,11 @@ namespace bluetooth_turnon
                 string addrUpper = bluetoothAddressHex
                     .Replace(":", "").Replace("-", "").ToUpperInvariant();
 
+                if (addrUpper.Length > 0 && addrUpper.Length < 12)
+                {
+                    addrUpper = addrUpper.PadLeft(12, '0');
+                }
+
                 Log($"    Battery PnP: searching for address '{addrUpper}'");
 
                 // The Bluetooth HFP battery property key
@@ -1876,10 +1888,10 @@ namespace bluetooth_turnon
                                 out propertyType,
                                 buffer, bufferSize, out bufferSize, 0);
 
-                            if (success && bufferSize >= 1)
+                            if (success && propertyType == NativeMethods.DEVPROP_TYPE_BYTE && bufferSize >= 1)
                             {
                                 byte level = buffer[0];
-                                if (level >= 0 && level <= 100)
+                                if (level <= 100)
                                 {
                                     Log($"    Battery PnP: {level}% from '{instanceId}' ({enumerator})");
                                     return (int)level;
@@ -1944,10 +1956,10 @@ namespace bluetooth_turnon
                                 out propertyType,
                                 buffer, bufferSize, out bufferSize, 0);
 
-                            if (success && bufferSize >= 1)
+                            if (success && propertyType == NativeMethods.DEVPROP_TYPE_BYTE && bufferSize >= 1)
                             {
                                 byte level = buffer[0];
-                                if (level >= 0 && level <= 100)
+                                if (level <= 100)
                                 {
                                     Log($"    Battery PnP: {level}% from fallback GUID '{instanceId}'");
                                     return (int)level;
@@ -1978,6 +1990,7 @@ namespace bluetooth_turnon
         {
             public const uint DIGCF_PRESENT    = 0x00000002;
             public const uint DIGCF_ALLCLASSES = 0x00000004;
+            public const uint DEVPROP_TYPE_BYTE = 0x00000003;
 
             [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
             public struct DEVPROPKEY
@@ -2341,13 +2354,68 @@ namespace bluetooth_turnon
 
                     if (_disposed) return;
 
+                    // Guard 1: Verify retry is still registered (removed by disconnect or device removal)
+                    lock (_batteryRetryLock)
+                    {
+                        if (!_activeBatteryRetries.Contains(address))
+                        {
+                            Log($"  Deferred battery query aborted: '{deviceName}' ({address:X12}) was cancelled or disconnected.");
+                            return;
+                        }
+                    }
+
+                    // Guard 2: Verify device is actually connected before querying
+                    bool? isConnected = await IsDeviceConnectedAsync(address).ConfigureAwait(false);
+                    if (isConnected != true)
+                    {
+                        Log($"  Deferred battery query aborted: '{deviceName}' ({address:X12}) is not connected.");
+                        lock (_batteryRetryLock)
+                        {
+                            _activeBatteryRetries.Remove(address);
+                        }
+                        _batteryCache.TryRemove(address, out _);
+                        return;
+                    }
+
                     Log($"  Running deferred battery query for '{deviceName}' ({address:X12})...");
                     string addrHex = address.ToString("X12");
                     int? retriedBattery = QueryBatteryViaPnp(addrHex);
 
                     if (retriedBattery == null)
                     {
+                        // Guard 3: Double-check connection before opening over-the-air BLE connection
+                        lock (_batteryRetryLock)
+                        {
+                            if (!_activeBatteryRetries.Contains(address))
+                            {
+                                Log($"  Deferred battery query aborted before GATT: '{deviceName}' ({address:X12}) was cancelled or disconnected.");
+                                return;
+                            }
+                        }
+
+                        isConnected = await IsDeviceConnectedAsync(address).ConfigureAwait(false);
+                        if (isConnected != true)
+                        {
+                            Log($"  Deferred battery query aborted before GATT: '{deviceName}' ({address:X12}) is not connected.");
+                            lock (_batteryRetryLock)
+                            {
+                                _activeBatteryRetries.Remove(address);
+                            }
+                            _batteryCache.TryRemove(address, out _);
+                            return;
+                        }
+
                         retriedBattery = await QueryBatteryViaGattAsync(address, deviceName, CancellationToken.None).ConfigureAwait(false);
+                    }
+
+                    // Guard 4: Verify device wasn't disconnected while query was running before updating cache
+                    lock (_batteryRetryLock)
+                    {
+                        if (!_activeBatteryRetries.Contains(address))
+                        {
+                            Log($"  Deferred battery query result discarded: '{deviceName}' ({address:X12}) was disconnected during query.");
+                            return;
+                        }
                     }
 
                     if (retriedBattery != null)
@@ -2447,13 +2515,36 @@ namespace bluetooth_turnon
                             .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Cached)
                             .AsTask(token).ConfigureAwait(false);
 
+                        // Cold cache fallback: If cached query returned no services or failed (e.g. right after pairing),
+                        // query uncached from device over-the-air to populate Windows GATT cache.
+                        if (servicesResult == null ||
+                            servicesResult.Status != GattCommunicationStatus.Success ||
+                            servicesResult.Services == null ||
+                            servicesResult.Services.Count == 0)
+                        {
+                            try
+                            {
+                                if (servicesResult?.Services != null)
+                                {
+                                    foreach (var svc in servicesResult.Services) { try { svc.Dispose(); } catch { } }
+                                }
+                            }
+                            catch { }
+
+                            Log($"    Battery GATT: Cached services query returned 0 services or {servicesResult?.Status}. Trying Uncached query on '{bleDevice.Name}'...");
+                            servicesResult = await bleDevice
+                                .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Uncached)
+                                .AsTask(token).ConfigureAwait(false);
+                        }
+
                         try
                         {
-                            if (servicesResult.Status != GattCommunicationStatus.Success
+                            if (servicesResult == null
+                                || servicesResult.Status != GattCommunicationStatus.Success
                                 || servicesResult.Services == null
                                 || servicesResult.Services.Count == 0)
                             {
-                                Log($"    Battery GATT: Battery service not found on '{bleDevice.Name}' (status={servicesResult.Status})");
+                                Log($"    Battery GATT: Battery service not found on '{bleDevice.Name}' (status={servicesResult?.Status})");
                                 return null;
                             }
 
@@ -2462,11 +2553,24 @@ namespace bluetooth_turnon
                                 .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Cached)
                                 .AsTask(token).ConfigureAwait(false);
 
-                            if (charsResult.Status != GattCommunicationStatus.Success
+                            // Cold cache fallback for characteristic
+                            if (charsResult == null
+                                || charsResult.Status != GattCommunicationStatus.Success
                                 || charsResult.Characteristics == null
                                 || charsResult.Characteristics.Count == 0)
                             {
-                                Log($"    Battery GATT: BatteryLevel characteristic not found on '{bleDevice.Name}'");
+                                Log($"    Battery GATT: Cached characteristic query returned 0 characteristics. Trying Uncached query on '{bleDevice.Name}'...");
+                                charsResult = await service
+                                    .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Uncached)
+                                    .AsTask(token).ConfigureAwait(false);
+                            }
+
+                            if (charsResult == null
+                                || charsResult.Status != GattCommunicationStatus.Success
+                                || charsResult.Characteristics == null
+                                || charsResult.Characteristics.Count == 0)
+                            {
+                                Log($"    Battery GATT: BatteryLevel characteristic not found on '{bleDevice.Name}' (status={charsResult?.Status})");
                                 return null;
                             }
 
