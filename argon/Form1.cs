@@ -16,7 +16,8 @@ namespace bluetooth_turnon
         // Access is marshaled via SafeBeginInvokeAsync to prevent cross-thread race conditions.
         private bool _isRefreshingDevices;
         private bool _refreshPending;
-        private readonly Dictionary<ulong, bool> _connectingAddresses = new Dictionary<ulong, bool>();
+        private bool _forceRefreshPending;
+        private readonly Dictionary<ulong, string> _connectingAddresses = new Dictionary<ulong, string>();
         private readonly System.Threading.CancellationTokenSource _cts = new System.Threading.CancellationTokenSource();
 
         private NotifyIcon _trayIcon;
@@ -349,7 +350,7 @@ namespace bluetooth_turnon
             await RefreshAdapterStateAsync();
 
             // Load devices initially
-            await RefreshDevicesAsync();
+            await RefreshDevicesAsync(force: true);
         }
 
         // ── Adapter state ─────────────────────────────────────────────────────
@@ -427,6 +428,13 @@ namespace bluetooth_turnon
             {
                 labelStatus.Text = "Reconnecting...";
                 labelStatus.ForeColor = Color.FromArgb(255, 200, 100);
+                lock (_connectingAddresses)
+                {
+                    if (_connectingAddresses.ContainsKey(e.Address))
+                    {
+                        _connectingAddresses[e.Address] = e.StatusMessage;
+                    }
+                }
                 UpdateOperationFeedback(e.Address, e.StatusMessage, Color.FromArgb(255, 190, 50), null);
             });
         }
@@ -455,7 +463,7 @@ namespace bluetooth_turnon
             else if (targetState)
             {
                 // Adapter just turned on — refresh device list
-                await RefreshDevicesAsync();
+                await RefreshDevicesAsync(force: true);
             }
         }
 
@@ -470,7 +478,7 @@ namespace bluetooth_turnon
         {
             try
             {
-                await SafeBeginInvokeAsync(RefreshDevicesIfIdleAsync);
+                await SafeBeginInvokeAsync(() => RefreshDevicesIfIdleAsync());
             }
             catch (OperationCanceledException)
             {
@@ -486,29 +494,31 @@ namespace bluetooth_turnon
         /// Requests a device refresh if no refresh is currently running; otherwise queues a pending refresh.
         /// THREAD SAFETY: Must ONLY be called on the UI thread to guard _isRefreshingDevices / _refreshPending.
         /// </summary>
-        private async Task RefreshDevicesIfIdleAsync()
+        private async Task RefreshDevicesIfIdleAsync(bool force = false)
         {
             if (this.IsDisposed || !this.IsHandleCreated || _cts.IsCancellationRequested) return;
 
             if (_isRefreshingDevices)
             {
                 _refreshPending = true;
+                if (force) _forceRefreshPending = true;
                 return;
             }
-            await RefreshDevicesAsync();
+            await RefreshDevicesAsync(force);
         }
 
         /// <summary>
         /// Queries paired devices and rebuilds cards in a coalescing loop.
         /// THREAD SAFETY: Must ONLY be called on the UI thread to guard _isRefreshingDevices / _refreshPending.
         /// </summary>
-        private async Task RefreshDevicesAsync()
+        private async Task RefreshDevicesAsync(bool force = false)
         {
             if (this.IsDisposed || !this.IsHandleCreated || _cts.IsCancellationRequested) return;
 
             if (_isRefreshingDevices)
             {
                 _refreshPending = true;
+                if (force) _forceRefreshPending = true;
                 return;
             }
 
@@ -517,13 +527,15 @@ namespace bluetooth_turnon
             {
                 do
                 {
+                    bool currentForce = force || _forceRefreshPending;
                     _refreshPending = false;
+                    _forceRefreshPending = false;
                     try
                     {
                         var devices = await _bluetoothManager.GetPairedDevicesAsync(_cts.Token);
                         if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
                         {
-                            BuildDeviceCards(devices);
+                            BuildDeviceCards(devices, currentForce);
                         }
                     }
                     catch (OperationCanceledException)
@@ -534,7 +546,7 @@ namespace bluetooth_turnon
                     {
                         if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
                         {
-                            BuildDeviceCards(new List<DeviceInfo>());
+                            BuildDeviceCards(new List<DeviceInfo>(), currentForce);
                         }
                     }
                 } while (_refreshPending && !_cts.IsCancellationRequested && !this.IsDisposed);
@@ -542,6 +554,7 @@ namespace bluetooth_turnon
             finally
             {
                 _isRefreshingDevices = false;
+                _forceRefreshPending = false;
             }
         }
 
@@ -552,6 +565,14 @@ namespace bluetooth_turnon
         private void UpdateOperationFeedback(ulong address, string text, Color color, Label originalLabel)
         {
             if (this.IsDisposed || !this.IsHandleCreated) return;
+
+            lock (_connectingAddresses)
+            {
+                if (_connectingAddresses.ContainsKey(address))
+                {
+                    _connectingAddresses[address] = text;
+                }
+            }
 
             if (originalLabel != null && !originalLabel.IsDisposed)
             {
@@ -601,15 +622,29 @@ namespace bluetooth_turnon
             // Suppress background rebuilds while user is actively hovering over cards to prevent flickering and missed clicks (Bug 9)
             if (!force && panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed)
             {
-                Point cursorInList = panelDeviceList.PointToClient(Cursor.Position);
-                if (panelDeviceList.ClientRectangle.Contains(cursorInList))
+                // Only suppress if there are actual device cards currently displayed (not just an empty label or empty list)
+                bool hasActualCards = false;
+                foreach (Control ctrl in panelDeviceList.Controls)
                 {
-                    _pendingDevices = devices;
-                    if (_hoverDebounceTimer != null && !_hoverDebounceTimer.Enabled)
+                    if (ctrl is Panel && ctrl.Tag is ulong)
                     {
-                        _hoverDebounceTimer.Start();
+                        hasActualCards = true;
+                        break;
                     }
-                    return;
+                }
+
+                if (hasActualCards)
+                {
+                    Point cursorInList = panelDeviceList.PointToClient(Cursor.Position);
+                    if (panelDeviceList.ClientRectangle.Contains(cursorInList))
+                    {
+                        _pendingDevices = devices;
+                        if (_hoverDebounceTimer != null && !_hoverDebounceTimer.Enabled)
+                        {
+                            _hoverDebounceTimer.Start();
+                        }
+                        return;
+                    }
                 }
             }
 
@@ -742,15 +777,14 @@ namespace bluetooth_turnon
                 // ── Device type subtitle ────────────────────────────────────────
                 string typeText = GetDeviceTypeLabel(device.DeviceType);
                 Color  typeColor = device.IsConnected ? Color.FromArgb(120, capturedAccent.R, capturedAccent.G, capturedAccent.B) : Color.FromArgb(100, 100, 110);
-                bool isOpInFlight;
-                bool isConnectingOp = false;
+                string inFlightStatus = null;
                 lock (_connectingAddresses)
                 {
-                    isOpInFlight = _connectingAddresses.TryGetValue(device.Address, out isConnectingOp);
+                    _connectingAddresses.TryGetValue(device.Address, out inFlightStatus);
                 }
-                if (isOpInFlight)
+                if (!string.IsNullOrEmpty(inFlightStatus))
                 {
-                    typeText = isConnectingOp ? "Connecting..." : "Disconnecting...";
+                    typeText = inFlightStatus;
                     typeColor = Color.FromArgb(255, 190, 50); // Amber
                 }
 
@@ -848,7 +882,7 @@ namespace bluetooth_turnon
                             // Ignore duplicate clicks while operation is already in flight
                             return;
                         }
-                        _connectingAddresses[addr] = isConnecting;
+                        _connectingAddresses[addr] = isConnecting ? "Connecting..." : "Disconnecting...";
                     }
 
                     try
@@ -862,7 +896,7 @@ namespace bluetooth_turnon
                             lock (_connectingAddresses)
                             {
                                 if (_connectingAddresses.ContainsKey(addr))
-                                    _connectingAddresses[addr] = isConnecting;
+                                    _connectingAddresses[addr] = isConnecting ? "Connecting..." : "Disconnecting...";
                             }
                         }
 
@@ -917,7 +951,7 @@ namespace bluetooth_turnon
                         if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
                         {
                             await RefreshAdapterStateAsync();
-                            await RefreshDevicesIfIdleAsync();
+                            await RefreshDevicesIfIdleAsync(force: true);
                         }
                     }
                 };
