@@ -394,6 +394,7 @@ namespace bluetooth_turnon
                     labelStatus.Text = "Enabled";
                     labelStatus.ForeColor = Color.FromArgb(100, 180, 255);
                     on_off.Enabled = true;
+                    on_off.Checked = true;
                     on_off.Value = true;
                     _bluetoothManager.StartDeviceWatcher();
                 }
@@ -402,6 +403,7 @@ namespace bluetooth_turnon
                     labelStatus.Text = "Disabled";
                     labelStatus.ForeColor = Color.FromArgb(200, 80, 80);
                     on_off.Enabled = true;
+                    on_off.Checked = false;
                     on_off.Value = false;
                     _bluetoothManager.StopDeviceWatcher();
                     // Clear device list immediately when adapter is off
@@ -412,6 +414,7 @@ namespace bluetooth_turnon
                     labelStatus.Text = "No Adapter";
                     labelStatus.ForeColor = Color.FromArgb(140, 140, 150);
                     on_off.Enabled = false;
+                    on_off.Checked = false;
                     on_off.Value = false;
                     _bluetoothManager.StopDeviceWatcher();
                     BuildDeviceCards(new List<DeviceInfo>(), force: true);
@@ -451,48 +454,68 @@ namespace bluetooth_turnon
 
             bool targetState = e.Checked;
 
-            if (!targetState)
-            {
-                // User explicitly requested Bluetooth OFF:
-                // Cancel any in-flight device operations immediately so they do not keep running
-                // or attempt a radio bounce
-                try
-                {
-                    _deviceClickCts?.Cancel();
-                    _deviceClickCts?.Dispose();
-                    _deviceClickCts = new CancellationTokenSource();
-                }
-                catch { }
+            // Guard against rapid duplicate clicks while operation is in flight
+            on_off.Enabled = false;
 
-                lock (_connectingAddresses)
+            try
+            {
+                if (!targetState)
                 {
-                    _connectingAddresses.Clear();
+                    // User explicitly requested Bluetooth OFF:
+                    // Cancel any in-flight device operations immediately so they do not keep running
+                    // or attempt a radio bounce
+                    try
+                    {
+                        _deviceClickCts?.Cancel();
+                        _deviceClickCts?.Dispose();
+                        _deviceClickCts = new CancellationTokenSource();
+                    }
+                    catch { }
+
+                    lock (_connectingAddresses)
+                    {
+                        _connectingAddresses.Clear();
+                    }
+                }
+
+                // Temporary visual feedback
+                labelStatus.Text = targetState ? "Turning On..." : "Turning Off...";
+                labelStatus.ForeColor = Color.FromArgb(255, 200, 100);
+
+                bool success = await _bluetoothManager.SetAdapterStateAsync(targetState);
+                if (!success)
+                {
+                    // Revert and refresh from actual hardware state if toggle failed
+                    await RefreshAdapterStateAsync();
+                }
+                else
+                {
+                    // Explicitly apply state to UI so labelStatus is never left stuck on "Turning On..." or "Turning Off..."
+                    ApplyAdapterStateToUi(targetState);
+
+                    if (targetState)
+                    {
+                        // Adapter just turned on — refresh device list
+                        await RefreshDevicesAsync(force: true);
+                    }
+                    else
+                    {
+                        // Adapter turned off — ensure device list is cleared
+                        lock (_connectingAddresses)
+                        {
+                            _connectingAddresses.Clear();
+                        }
+                        BuildDeviceCards(new List<DeviceInfo>(), force: true);
+                    }
                 }
             }
-
-            // Temporary visual feedback
-            labelStatus.Text = targetState ? "Turning On..." : "Turning Off...";
-            labelStatus.ForeColor = Color.FromArgb(255, 200, 100);
-
-            bool success = await _bluetoothManager.SetAdapterStateAsync(targetState);
-            if (!success)
+            finally
             {
-                // Revert and refresh from actual hardware state if toggle failed
-                await RefreshAdapterStateAsync();
-            }
-            else if (targetState)
-            {
-                // Adapter just turned on — refresh device list
-                await RefreshDevicesAsync(force: true);
-            }
-            else
-            {
-                // Adapter turned off — ensure device list is cleared
-                lock (_connectingAddresses)
+                // Re-enable toggle switch unless adapter is absent
+                if (labelStatus.Text != "No Adapter" && !_isUpdatingUiFromState)
                 {
-                    _connectingAddresses.Clear();
+                    on_off.Enabled = true;
                 }
-                BuildDeviceCards(new List<DeviceInfo>(), force: true);
             }
         }
 
