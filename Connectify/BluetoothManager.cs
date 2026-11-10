@@ -580,9 +580,10 @@ namespace bluetooth_turnon
             Log($"SetAdapterStateAsync(enable={enable}) called");
             if (_disposed) return false;
 
-            if (!enable)
+            if (!enable && !IsRadioBounceInProgress)
             {
-                // When adapter is being turned OFF, cancel any in-flight connect or disconnect operations immediately
+                // When adapter is being turned OFF by the user (not during an internal radio bounce),
+                // cancel any in-flight connect or disconnect operations immediately
                 try
                 {
                     _deviceOpCts?.Cancel();
@@ -1451,7 +1452,8 @@ namespace bluetooth_turnon
                                 bool onSuccess = false;
                                 for (int onAttempt = 1; onAttempt <= 3; onAttempt++)
                                 {
-                                    onSuccess = await SetAdapterStateAsync(true, token).ConfigureAwait(false);
+                                    // Use CancellationToken.None so turning the adapter back on is never aborted if caller token is canceled
+                                    onSuccess = await SetAdapterStateAsync(true, CancellationToken.None).ConfigureAwait(false);
                                     Log($"  Radio bounce: adapter turned on attempt {onAttempt}/3 (success={onSuccess})");
                                     if (onSuccess) break;
                                     await Task.Delay(1000 * onAttempt, token).ConfigureAwait(false);
@@ -1460,12 +1462,12 @@ namespace bluetooth_turnon
                                 if (!onSuccess)
                                 {
                                     Log("  Radio bounce: standard SetAdapterStateAsync(true) failed after 3 attempts. Attempting forced radio refresh...");
-                                    var freshRadio = await GetBluetoothRadioAsync(token, forceRefresh: true).ConfigureAwait(false);
+                                    var freshRadio = await GetBluetoothRadioAsync(CancellationToken.None, forceRefresh: true).ConfigureAwait(false);
                                     if (freshRadio != null)
                                     {
                                         try
                                         {
-                                            var res = await freshRadio.SetStateAsync(RadioState.On).AsTask(token).ConfigureAwait(false);
+                                            var res = await freshRadio.SetStateAsync(RadioState.On).AsTask(CancellationToken.None).ConfigureAwait(false);
                                             onSuccess = (res == RadioAccessStatus.Allowed);
                                             Log($"  Radio bounce: direct SetStateAsync(On) returned {res}, success={onSuccess}");
                                         }
