@@ -18,7 +18,7 @@ namespace bluetooth_turnon
         private bool _isRefreshingDevices;
         private bool _refreshPending;
         private bool _forceRefreshPending;
-        private readonly Dictionary<ulong, string> _connectingAddresses = new Dictionary<ulong, string>();
+        private readonly Dictionary<ulong, (string Text, Color Color)> _connectingAddresses = new Dictionary<ulong, (string Text, Color Color)>();
         private readonly System.Threading.CancellationTokenSource _cts = new System.Threading.CancellationTokenSource();
         private readonly object _deviceClickCtsLock = new object();
         private CancellationTokenSource _deviceClickCts = new CancellationTokenSource();
@@ -401,6 +401,9 @@ namespace bluetooth_turnon
                 };
                 _refreshTimer.Start();
 
+                // Enable DoubleBuffered on child scroll panel to prevent GDI repaint flicker
+                SetDoubleBuffered(panelDeviceList);
+
                 // Setup Hover Debounce Timer (avoids flickering / card rebuilds during active hover)
                 _hoverDebounceTimer = new Timer();
                 _hoverDebounceTimer.Interval = 2000; // 2 seconds max deferral while mouse hovers over cards
@@ -557,7 +560,7 @@ namespace bluetooth_turnon
                 {
                     if (_connectingAddresses.ContainsKey(e.Address))
                     {
-                        _connectingAddresses[e.Address] = e.StatusMessage;
+                        _connectingAddresses[e.Address] = (e.StatusMessage, Color.FromArgb(255, 190, 50));
                     }
                 }
                 UpdateOperationFeedback(e.Address, e.StatusMessage, Color.FromArgb(255, 190, 50), null);
@@ -768,7 +771,7 @@ namespace bluetooth_turnon
             {
                 if (_connectingAddresses.ContainsKey(address))
                 {
-                    _connectingAddresses[address] = text;
+                    _connectingAddresses[address] = (text, color);
                 }
             }
 
@@ -926,6 +929,7 @@ namespace bluetooth_turnon
                         Anchor = AnchorStyles.Left | AnchorStyles.Top,
                         Cursor = Cursors.Hand
                     };
+                    SetDoubleBuffered(card);
 
                 // ── Type-specific icon ────────────────────────────────────
                 string iconFile = GetDeviceIconFileName(device.DeviceType);
@@ -943,6 +947,7 @@ namespace bluetooth_turnon
                     Size      = new Size(48, 48),
                     Cursor    = Cursors.Hand
                 };
+                SetDoubleBuffered(iconPanel);
                 var capturedAccent = accentColor; // capture for lambda
                 iconPanel.Paint += (s, pe) =>
                 {
@@ -1001,15 +1006,16 @@ namespace bluetooth_turnon
                 // ── Device type subtitle ────────────────────────────────────────
                 string typeText = GetDeviceTypeLabel(device.DeviceType);
                 Color  typeColor = device.IsConnected ? Color.FromArgb(120, capturedAccent.R, capturedAccent.G, capturedAccent.B) : Color.FromArgb(100, 100, 110);
-                string inFlightStatus = null;
+                (string Text, Color Color) inFlightStatus = default;
+                bool hasInFlight = false;
                 lock (_connectingAddresses)
                 {
-                    _connectingAddresses.TryGetValue(device.Address, out inFlightStatus);
+                    hasInFlight = _connectingAddresses.TryGetValue(device.Address, out inFlightStatus);
                 }
-                if (!string.IsNullOrEmpty(inFlightStatus))
+                if (hasInFlight && !string.IsNullOrEmpty(inFlightStatus.Text))
                 {
-                    typeText = inFlightStatus;
-                    typeColor = Color.FromArgb(255, 190, 50); // Amber
+                    typeText = inFlightStatus.Text;
+                    typeColor = inFlightStatus.Color;
                 }
 
                 var typeLabel = new Label
@@ -1113,7 +1119,7 @@ namespace bluetooth_turnon
                             // Ignore duplicate clicks while operation is already in flight
                             return;
                         }
-                        _connectingAddresses[addr] = isConnecting ? "Connecting..." : "Disconnecting...";
+                        _connectingAddresses[addr] = (isConnecting ? "Connecting..." : "Disconnecting...", Color.FromArgb(255, 190, 50));
                     }
 
                     try
@@ -1139,7 +1145,7 @@ namespace bluetooth_turnon
                                 lock (_connectingAddresses)
                                 {
                                     if (_connectingAddresses.ContainsKey(addr))
-                                        _connectingAddresses[addr] = isConnecting ? "Connecting..." : "Disconnecting...";
+                                        _connectingAddresses[addr] = (isConnecting ? "Connecting..." : "Disconnecting...", Color.FromArgb(255, 190, 50));
                                 }
                             }
 
@@ -1335,6 +1341,20 @@ namespace bluetooth_turnon
             }
         }
 
+        /// <summary>
+        /// Enables DoubleBuffered on a Control (such as Panel) using reflection to eliminate GDI repaint flicker.
+        /// </summary>
+        private static void SetDoubleBuffered(Control control)
+        {
+            if (control == null) return;
+            try
+            {
+                typeof(Control).GetProperty("DoubleBuffered", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                    ?.SetValue(control, true, null);
+            }
+            catch { }
+        }
+
         // ── Disposal ─────────────────────────────────────────────────────────
 
         /// <summary>
@@ -1380,6 +1400,13 @@ namespace bluetooth_turnon
             {
                 _trayIcon.Visible = false;
                 _trayIcon.Dispose();
+                _trayIcon = null;
+            }
+
+            if (_trayMenu != null)
+            {
+                _trayMenu.Dispose();
+                _trayMenu = null;
             }
 
             foreach (var cached in _iconCache.Values)
