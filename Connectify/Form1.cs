@@ -12,6 +12,7 @@ namespace bluetooth_turnon
     {
         private readonly BluetoothManager _bluetoothManager;
         private bool _isUpdatingUiFromState;
+        private bool _isTogglingAdapter;
         // THREAD SAFETY: _isRefreshingDevices and _refreshPending must ONLY be accessed on the UI thread.
         // Access is marshaled via SafeBeginInvokeAsync to prevent cross-thread race conditions.
         private bool _isRefreshingDevices;
@@ -19,6 +20,7 @@ namespace bluetooth_turnon
         private bool _forceRefreshPending;
         private readonly Dictionary<ulong, string> _connectingAddresses = new Dictionary<ulong, string>();
         private readonly System.Threading.CancellationTokenSource _cts = new System.Threading.CancellationTokenSource();
+        private readonly object _deviceClickCtsLock = new object();
         private CancellationTokenSource _deviceClickCts = new CancellationTokenSource();
 
         private NotifyIcon _trayIcon;
@@ -419,11 +421,12 @@ namespace bluetooth_turnon
             }
 
             // If a controlled radio bounce is in progress, show "Reconnecting..." in the header
-            // and preserve existing device cards to avoid flickering during the brief 500ms cycle
+            // and disable the toggle switch so the user cannot toggle mid-bounce
             if (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)
             {
                 labelStatus.Text = "Reconnecting...";
                 labelStatus.ForeColor = Color.FromArgb(255, 200, 100);
+                on_off.Enabled = false;
                 return;
             }
 
@@ -434,7 +437,10 @@ namespace bluetooth_turnon
                 {
                     labelStatus.Text = "Enabled";
                     labelStatus.ForeColor = Color.FromArgb(100, 180, 255);
-                    on_off.Enabled = true;
+                    if (!_isTogglingAdapter)
+                    {
+                        on_off.Enabled = true;
+                    }
                     on_off.Checked = true;
                     on_off.Value = true;
                     _bluetoothManager.StartDeviceWatcher();
@@ -443,7 +449,10 @@ namespace bluetooth_turnon
                 {
                     labelStatus.Text = "Disabled";
                     labelStatus.ForeColor = Color.FromArgb(200, 80, 80);
-                    on_off.Enabled = true;
+                    if (!_isTogglingAdapter)
+                    {
+                        on_off.Enabled = true;
+                    }
                     on_off.Checked = false;
                     on_off.Value = false;
                     _bluetoothManager.StopDeviceWatcher();
@@ -491,11 +500,28 @@ namespace bluetooth_turnon
 
         private async void on_off_CheckedChanged(object sender, Bunifu.UI.WinForms.BunifuToggleSwitch.CheckedChangedEventArgs e)
         {
-            if (_isUpdatingUiFromState || (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)) return;
+            if (_isUpdatingUiFromState) return;
+
+            if (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)
+            {
+                // Revert visual toggle state back to ON because radio bounce is active and will restore ON
+                _isUpdatingUiFromState = true;
+                try
+                {
+                    on_off.Checked = true;
+                    on_off.Value = true;
+                }
+                finally
+                {
+                    _isUpdatingUiFromState = false;
+                }
+                return;
+            }
 
             bool targetState = e.Checked;
 
-            // Guard against rapid duplicate clicks while operation is in flight
+            // Guard against rapid duplicate clicks and premature re-enabling by background state events
+            _isTogglingAdapter = true;
             on_off.Enabled = false;
 
             try
@@ -505,13 +531,15 @@ namespace bluetooth_turnon
                     // User explicitly requested Bluetooth OFF:
                     // Cancel any in-flight device operations immediately so they do not keep running
                     // or attempt a radio bounce
-                    try
+                    lock (_deviceClickCtsLock)
                     {
-                        _deviceClickCts?.Cancel();
-                        _deviceClickCts?.Dispose();
+                        try
+                        {
+                            _deviceClickCts.Cancel();
+                        }
+                        catch { }
                         _deviceClickCts = new CancellationTokenSource();
                     }
-                    catch { }
 
                     lock (_connectingAddresses)
                     {
@@ -556,6 +584,7 @@ namespace bluetooth_turnon
             }
             finally
             {
+                _isTogglingAdapter = false;
                 // Re-enable toggle switch unless adapter is absent
                 if (labelStatus.Text != "No Adapter" && !_isUpdatingUiFromState)
                 {
@@ -1007,7 +1036,13 @@ namespace bluetooth_turnon
                         _connectingAddresses[addr] = isConnecting ? "Connecting..." : "Disconnecting...";
                     }
 
-                    using (var clickCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, _deviceClickCts.Token))
+                    CancellationTokenSource clickCts;
+                    lock (_deviceClickCtsLock)
+                    {
+                        clickCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, _deviceClickCts.Token);
+                    }
+
+                    using (clickCts)
                     {
                         var token = clickCts.Token;
                         try
@@ -1229,7 +1264,10 @@ namespace bluetooth_turnon
             }
 
             _cts.Cancel();
-            try { _deviceClickCts?.Cancel(); _deviceClickCts?.Dispose(); } catch { }
+            lock (_deviceClickCtsLock)
+            {
+                try { _deviceClickCts?.Cancel(); _deviceClickCts?.Dispose(); } catch { }
+            }
             
             if (_refreshTimer != null)
             {

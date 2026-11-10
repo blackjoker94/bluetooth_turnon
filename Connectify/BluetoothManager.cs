@@ -328,6 +328,7 @@ namespace bluetooth_turnon
         private DeviceWatcher _deviceWatcher;
         private volatile bool _watcherEnumerationComplete;
         private bool _disposed;
+        private readonly object _deviceOpCtsLock = new object();
         private CancellationTokenSource _deviceOpCts = new CancellationTokenSource();
 
         private static void SafeRelease(SemaphoreSlim semaphore)
@@ -595,14 +596,18 @@ namespace bluetooth_turnon
             if (!enable && !IsRadioBounceInProgress)
             {
                 // When adapter is being turned OFF by the user (not during an internal radio bounce),
-                // cancel any in-flight connect or disconnect operations immediately
-                try
+                // cancel any in-flight connect or disconnect operations immediately.
+                // Replace under lock without disposing old instance to prevent ObjectDisposedException
+                // in concurrent callers using linked tokens.
+                lock (_deviceOpCtsLock)
                 {
-                    _deviceOpCts?.Cancel();
-                    _deviceOpCts?.Dispose();
+                    try
+                    {
+                        _deviceOpCts.Cancel();
+                    }
+                    catch { }
                     _deviceOpCts = new CancellationTokenSource();
                 }
-                catch { }
             }
 
             var radio = _bluetoothRadio;
@@ -1283,7 +1288,13 @@ namespace bluetooth_turnon
                 return false;
             }
 
-            using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _deviceOpCts.Token))
+            CancellationTokenSource linkedCts;
+            lock (_deviceOpCtsLock)
+            {
+                linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _deviceOpCts.Token);
+            }
+
+            using (linkedCts)
             {
                 var token = linkedCts.Token;
                 await _connectSemaphore.WaitAsync(token).ConfigureAwait(false);
@@ -1604,7 +1615,13 @@ namespace bluetooth_turnon
                 _activeBatteryRetries.Remove(address);
             }
 
-            using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _deviceOpCts.Token))
+            CancellationTokenSource linkedCts;
+            lock (_deviceOpCtsLock)
+            {
+                linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _deviceOpCts.Token);
+            }
+
+            using (linkedCts)
             {
                 var token = linkedCts.Token;
                 await _connectSemaphore.WaitAsync(token).ConfigureAwait(false);
@@ -2903,7 +2920,10 @@ namespace bluetooth_turnon
                 _activeBatteryRetries.Clear();
             }
 
-            try { _deviceOpCts?.Cancel(); _deviceOpCts?.Dispose(); } catch { }
+            lock (_deviceOpCtsLock)
+            {
+                try { _deviceOpCts?.Cancel(); _deviceOpCts?.Dispose(); } catch { }
+            }
 
             // Note on semaphores (_radioInitSemaphore, _adapterToggleSemaphore, _connectSemaphore):
             // We do NOT call .Dispose() on the semaphores here to eliminate race conditions where background
