@@ -271,88 +271,95 @@ namespace bluetooth_turnon
 
         private async void main_Load(object sender, EventArgs e)
         {
-            // Setup NotifyIcon
-            _trayMenu = new ContextMenuStrip();
-            _trayMenu.Items.Add("Show", null, (s, ev) => ShowAndActivate());
-            
-            var startupMenuItem = new ToolStripMenuItem("Start with Windows");
-            startupMenuItem.CheckOnClick = true;
-            startupMenuItem.Checked = IsStartupEnabled();
-            startupMenuItem.CheckedChanged += (s, ev) => SetStartup(startupMenuItem.Checked);
-            _trayMenu.Items.Add(startupMenuItem);
-            
-            _trayMenu.Items.Add(new ToolStripSeparator());
-            _trayMenu.Items.Add("Exit", null, (s, ev) => { Application.Exit(); });
-
-            _trayIcon = new NotifyIcon();
-            _trayIcon.Text = "Connectify";
-            _trayIcon.Icon = this.Icon;
-            _trayIcon.ContextMenuStrip = _trayMenu;
-            _trayIcon.Visible = true;
-            _trayIcon.DoubleClick += (s, ev) => ShowAndActivate();
-
-            // Setup Refresh Timer
-            _refreshTimer = new Timer();
-            _refreshTimer.Interval = 60000; // 60 seconds
-            _refreshTimer.Tick += async (s, ev) =>
+            try
             {
-                try
-                {
-                    await RefreshDevicesIfIdleAsync();
-                }
-                catch (Exception ex)
-                {
-                    BluetoothManager.Log($"Refresh timer exception: {ex.Message}");
-                }
-            };
-            _refreshTimer.Start();
+                // Setup NotifyIcon
+                _trayMenu = new ContextMenuStrip();
+                _trayMenu.Items.Add("Show", null, (s, ev) => ShowAndActivate());
+                
+                var startupMenuItem = new ToolStripMenuItem("Start with Windows");
+                startupMenuItem.CheckOnClick = true;
+                startupMenuItem.Checked = IsStartupEnabled();
+                startupMenuItem.CheckedChanged += (s, ev) => SetStartup(startupMenuItem.Checked);
+                _trayMenu.Items.Add(startupMenuItem);
+                
+                _trayMenu.Items.Add(new ToolStripSeparator());
+                _trayMenu.Items.Add("Exit", null, (s, ev) => { Application.Exit(); });
 
-            // Setup Hover Debounce Timer (avoids flickering / card rebuilds during active hover)
-            _hoverDebounceTimer = new Timer();
-            _hoverDebounceTimer.Interval = 2000; // 2 seconds max deferral while mouse hovers over cards
-            _hoverDebounceTimer.Tick += (s, ev) =>
+                _trayIcon = new NotifyIcon();
+                _trayIcon.Text = "Connectify";
+                _trayIcon.Icon = this.Icon;
+                _trayIcon.ContextMenuStrip = _trayMenu;
+                _trayIcon.Visible = true;
+                _trayIcon.DoubleClick += (s, ev) => ShowAndActivate();
+
+                // Setup Refresh Timer
+                _refreshTimer = new Timer();
+                _refreshTimer.Interval = 60000; // 60 seconds
+                _refreshTimer.Tick += async (s, ev) =>
+                {
+                    try
+                    {
+                        await RefreshDevicesIfIdleAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        BluetoothManager.Log($"Refresh timer exception: {ex.Message}");
+                    }
+                };
+                _refreshTimer.Start();
+
+                // Setup Hover Debounce Timer (avoids flickering / card rebuilds during active hover)
+                _hoverDebounceTimer = new Timer();
+                _hoverDebounceTimer.Interval = 2000; // 2 seconds max deferral while mouse hovers over cards
+                _hoverDebounceTimer.Tick += (s, ev) =>
+                {
+                    _hoverDebounceTimer.Stop();
+                    if (_pendingDevices != null)
+                    {
+                        var pending = _pendingDevices;
+                        _pendingDevices = null;
+                        BuildDeviceCards(pending, force: true);
+                    }
+                };
+
+                // Force center the title — labels live inside panelHeader, so use its width
+                labelBluetooth.Left = 0;
+                labelBluetooth.Width = panelHeader.Width;
+                labelBluetooth.TextAlignment = ContentAlignment.MiddleCenter;
+
+                labelStatus.Left = 0;
+                labelStatus.Width = panelHeader.Width;
+                labelStatus.TextAlignment = ContentAlignment.MiddleCenter;
+
+                // Also center the logo PictureBox horizontally inside the panel
+                pictureBoxBT.Left = (panelHeader.Width - pictureBoxBT.Width) / 2;
+
+                // And center the toggle switch
+                on_off.Left = (panelHeader.Width - on_off.Width) / 2;
+
+                labelDevicesHeader.Text = "PAIRED DEVICES";
+                labelDevicesHeader.Width = this.ClientSize.Width - 40;
+
+                // Center footer label
+                labelFooter.Left = 0;
+                labelFooter.Width = this.ClientSize.Width;
+                labelFooter.TextAlignment = ContentAlignment.MiddleCenter;
+                labelFooter.Text = "Connectify  v2.0";
+
+                // Show empty state immediately so something is visible while BT queries run
+                BuildDeviceCards(new List<DeviceInfo>(), force: true);
+
+                // Detect actual Bluetooth adapter state on form load (Rule B-2)
+                await RefreshAdapterStateAsync();
+
+                // Load devices initially
+                await RefreshDevicesAsync(force: true);
+            }
+            catch (Exception ex)
             {
-                _hoverDebounceTimer.Stop();
-                if (_pendingDevices != null)
-                {
-                    var pending = _pendingDevices;
-                    _pendingDevices = null;
-                    BuildDeviceCards(pending, force: true);
-                }
-            };
-
-            // Force center the title — labels live inside panelHeader, so use its width
-            labelBluetooth.Left = 0;
-            labelBluetooth.Width = panelHeader.Width;
-            labelBluetooth.TextAlignment = ContentAlignment.MiddleCenter;
-
-            labelStatus.Left = 0;
-            labelStatus.Width = panelHeader.Width;
-            labelStatus.TextAlignment = ContentAlignment.MiddleCenter;
-
-            // Also center the logo PictureBox horizontally inside the panel
-            pictureBoxBT.Left = (panelHeader.Width - pictureBoxBT.Width) / 2;
-
-            // And center the toggle switch
-            on_off.Left = (panelHeader.Width - on_off.Width) / 2;
-
-            labelDevicesHeader.Text = "PAIRED DEVICES";
-            labelDevicesHeader.Width = this.ClientSize.Width - 40;
-
-            // Center footer label
-            labelFooter.Left = 0;
-            labelFooter.Width = this.ClientSize.Width;
-            labelFooter.TextAlignment = ContentAlignment.MiddleCenter;
-            labelFooter.Text = "Connectify  v2.0";
-
-            // Show empty state immediately so something is visible while BT queries run
-            BuildDeviceCards(new List<DeviceInfo>(), force: true);
-
-            // Detect actual Bluetooth adapter state on form load (Rule B-2)
-            await RefreshAdapterStateAsync();
-
-            // Load devices initially
-            await RefreshDevicesAsync(force: true);
+                BluetoothManager.Log($"main_Load unhandled exception: {ex}");
+            }
         }
 
         // ── Adapter state ─────────────────────────────────────────────────────
@@ -509,6 +516,10 @@ namespace bluetooth_turnon
                         BuildDeviceCards(new List<DeviceInfo>(), force: true);
                     }
                 }
+            }
+            catch (Exception ex)
+            {
+                BluetoothManager.Log($"on_off_CheckedChanged exception: {ex}");
             }
             finally
             {
@@ -1031,8 +1042,15 @@ namespace bluetooth_turnon
                             }
                             if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
                             {
-                                await RefreshAdapterStateAsync();
-                                await RefreshDevicesIfIdleAsync(force: true);
+                                try
+                                {
+                                    await RefreshAdapterStateAsync();
+                                    await RefreshDevicesIfIdleAsync(force: true);
+                                }
+                                catch (Exception ex)
+                                {
+                                    BluetoothManager.Log($"onClick refresh exception: {ex.Message}");
+                                }
                             }
                         }
                     }

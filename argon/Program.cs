@@ -1,5 +1,6 @@
 using System;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace bluetooth_turnon
@@ -15,6 +16,24 @@ namespace bluetooth_turnon
         [STAThread]
         static void Main(string[] args)
         {
+            // Global unhandled exception handlers: prevent silent crashes and log details to app_log.txt
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += (s, e) =>
+            {
+                BluetoothManager.Log($"Application.ThreadException: {e.Exception}");
+            };
+
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            {
+                BluetoothManager.Log($"AppDomain.UnhandledException: {e.ExceptionObject}");
+            };
+
+            TaskScheduler.UnobservedTaskException += (s, e) =>
+            {
+                BluetoothManager.Log($"TaskScheduler.UnobservedTaskException: {e.Exception}");
+                e.SetObserved();
+            };
+
             bool createdNew = false;
             Mutex mutex = null;
             EventWaitHandle showEvent = null;
