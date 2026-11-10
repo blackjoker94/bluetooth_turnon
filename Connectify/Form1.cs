@@ -43,15 +43,23 @@ namespace bluetooth_turnon
         /// </summary>
         private void SafeBeginInvoke(Action action)
         {
-            if (action == null || IsDisposed) return;
-
-            if (!IsHandleCreated) return;
+            if (action == null || IsDisposed || Disposing || !IsHandleCreated) return;
 
             try
             {
                 if (InvokeRequired)
                 {
-                    BeginInvoke(action);
+                    BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            if (!IsDisposed && !Disposing) action();
+                        }
+                        catch (Exception ex)
+                        {
+                            BluetoothManager.Log($"SafeBeginInvoke action exception: {ex.Message}");
+                        }
+                    }));
                 }
                 else
                 {
@@ -70,16 +78,40 @@ namespace bluetooth_turnon
         /// </summary>
         private Task SafeBeginInvokeAsync(Func<Task> asyncFunc)
         {
-            if (asyncFunc == null || IsDisposed || !IsHandleCreated)
+            if (asyncFunc == null || IsDisposed || Disposing || !IsHandleCreated || _cts.IsCancellationRequested)
                 return Task.CompletedTask;
 
             var tcs = new TaskCompletionSource<bool>();
+
+            // Guard against unobserved task exceptions if the returned Task is not awaited by callers
+            tcs.Task.ContinueWith(t =>
+            {
+                if (t.IsFaulted)
+                {
+                    var _ = t.Exception;
+                }
+            }, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+
+            CancellationTokenRegistration ctsReg = default;
+            if (!_cts.IsCancellationRequested)
+            {
+                try
+                {
+                    ctsReg = _cts.Token.Register(() => tcs.TrySetCanceled());
+                }
+                catch { }
+            }
+
+            Action cleanup = () =>
+            {
+                ctsReg.Dispose();
+            };
 
             Action wrappedAction = async () =>
             {
                 try
                 {
-                    if (IsDisposed)
+                    if (IsDisposed || Disposing || !IsHandleCreated || _cts.IsCancellationRequested)
                     {
                         tcs.TrySetCanceled();
                         return;
@@ -96,6 +128,10 @@ namespace bluetooth_turnon
                     BluetoothManager.Log($"SafeBeginInvokeAsync exception: {ex.Message}");
                     tcs.TrySetException(ex);
                 }
+                finally
+                {
+                    cleanup();
+                }
             };
 
             try
@@ -111,10 +147,12 @@ namespace bluetooth_turnon
             }
             catch (ObjectDisposedException)
             {
+                cleanup();
                 tcs.TrySetCanceled();
             }
             catch (InvalidOperationException)
             {
+                cleanup();
                 tcs.TrySetCanceled();
             }
 
@@ -200,6 +238,10 @@ namespace bluetooth_turnon
             _bluetoothManager.DeviceConnectionChanged += OnDeviceConnectionChanged;
             _bluetoothManager.OperationProgressChanged += BluetoothManager_OperationProgressChanged;
             this.FormClosing += main_FormClosing;
+            this.HandleDestroyed += (s, e) =>
+            {
+                try { _cts.Cancel(); } catch { }
+            };
         }
 
 
@@ -424,9 +466,20 @@ namespace bluetooth_turnon
         /// connects or disconnects. Marshals to UI thread via SafeBeginInvokeAsync to safely
         /// access _isRefreshingDevices and _refreshPending without threading races.
         /// </summary>
-        private void OnDeviceConnectionChanged(object sender, EventArgs e)
+        private async void OnDeviceConnectionChanged(object sender, EventArgs e)
         {
-            SafeBeginInvokeAsync(RefreshDevicesIfIdleAsync);
+            try
+            {
+                await SafeBeginInvokeAsync(RefreshDevicesIfIdleAsync);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during form close / cancellation
+            }
+            catch (Exception ex)
+            {
+                BluetoothManager.Log($"OnDeviceConnectionChanged exception: {ex.Message}");
+            }
         }
 
         /// <summary>
