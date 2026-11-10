@@ -30,6 +30,7 @@ namespace bluetooth_turnon
         private IReadOnlyList<DeviceInfo> _pendingDevices;
 
         public bool StartMinimized { get; set; }
+        private bool _isLoaded;
 
         protected override void SetVisibleCore(bool value)
         {
@@ -37,6 +38,10 @@ namespace bluetooth_turnon
             {
                 value = false;
                 CreateHandle();
+                if (!_isLoaded)
+                {
+                    main_Load(this, EventArgs.Empty);
+                }
             }
             base.SetVisibleCore(value);
         }
@@ -309,6 +314,9 @@ namespace bluetooth_turnon
 
         private async void main_Load(object sender, EventArgs e)
         {
+            if (_isLoaded) return;
+            _isLoaded = true;
+
             try
             {
                 // Setup NotifyIcon
