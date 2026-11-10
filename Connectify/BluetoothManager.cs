@@ -929,19 +929,25 @@ namespace bluetooth_turnon
                                 PROPVARIANT pv;
                                 if (propStore.GetValue(ref keyBtAddr, out pv) == 0)
                                 {
-                                    if (pv.vt == 31 && pv.pwszVal != IntPtr.Zero)
+                                    try
                                     {
-                                        string btAddrProp = Marshal.PtrToStringUni(pv.pwszVal);
-                                        if (!string.IsNullOrEmpty(btAddrProp))
+                                        if (pv.vt == 31 && pv.pwszVal != IntPtr.Zero)
                                         {
-                                             string clean = btAddrProp.Replace(":", "").Replace("-", "").ToUpperInvariant();
-                                            if (clean.Contains(addrHex12))
+                                            string btAddrProp = Marshal.PtrToStringUni(pv.pwszVal);
+                                            if (!string.IsNullOrEmpty(btAddrProp))
                                             {
-                                                isMatch = true;
+                                                 string clean = btAddrProp.Replace(":", "").Replace("-", "").ToUpperInvariant();
+                                                if (clean.Contains(addrHex12))
+                                                {
+                                                    isMatch = true;
+                                                }
                                             }
                                         }
                                     }
-                                    NativeMethods.PropVariantClear(ref pv);
+                                    finally
+                                    {
+                                        NativeMethods.PropVariantClear(ref pv);
+                                    }
                                 }
 
                                 if (!isMatch && !string.IsNullOrEmpty(deviceName))
@@ -949,15 +955,21 @@ namespace bluetooth_turnon
                                     var keyFriendlyName = new PROPERTYKEY(new Guid("A45C254E-DF1C-4EFD-8020-67D146A850E0"), 14);
                                     if (propStore.GetValue(ref keyFriendlyName, out pv) == 0)
                                     {
-                                        if (pv.vt == 31 && pv.pwszVal != IntPtr.Zero)
+                                        try
                                         {
-                                            string fn = Marshal.PtrToStringUni(pv.pwszVal);
-                                            if (!string.IsNullOrEmpty(fn) && fn.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0)
+                                            if (pv.vt == 31 && pv.pwszVal != IntPtr.Zero)
                                             {
-                                                isMatch = true;
+                                                string fn = Marshal.PtrToStringUni(pv.pwszVal);
+                                                if (!string.IsNullOrEmpty(fn) && fn.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0)
+                                                {
+                                                    isMatch = true;
+                                                }
                                             }
                                         }
-                                        NativeMethods.PropVariantClear(ref pv);
+                                        finally
+                                        {
+                                            NativeMethods.PropVariantClear(ref pv);
+                                        }
                                     }
                                 }
                             }
@@ -1038,8 +1050,15 @@ namespace bluetooth_turnon
                                         if (adapterTopology.GetDeviceId(out adapterDeviceId) != 0 || string.IsNullOrEmpty(adapterDeviceId))
                                             continue;
 
-                                        // Verify that the adapter device ID belongs to Bluetooth and contains this device's MAC address
-                                        if (adapterDeviceId.IndexOf(addrHex12, StringComparison.OrdinalIgnoreCase) < 0)
+                                        // The endpoint was already matched to this target Bluetooth device.
+                                        // Loosen adapter device check: accept if it contains the MAC, "BTH", "BLUETOOTH",
+                                        // device friendly name, or if the parent endpoint was already verified as a match.
+                                        bool isBtAdapter = isMatch ||
+                                                           adapterDeviceId.IndexOf(addrHex12, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                           adapterDeviceId.IndexOf("BTH", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                           adapterDeviceId.IndexOf("BLUETOOTH", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                           (!string.IsNullOrEmpty(deviceName) && adapterDeviceId.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0);
+                                        if (!isBtAdapter)
                                             continue;
 
                                         IMMDevice adapterDevice = null;
@@ -1055,11 +1074,21 @@ namespace bluetooth_turnon
                                             if (adapterDevice.Activate(ref iidKsControl, CLSCTX_ALL, IntPtr.Zero, out ksControlObj) == 0 && ksControlObj != null)
                                             {
                                                 ksControl = ksControlObj as IKsControl;
+                                                if (ksControl == null)
+                                                {
+                                                    Marshal.ReleaseComObject(ksControlObj);
+                                                    ksControlObj = null;
+                                                }
                                             }
 
                                             if (ksControl == null && adapterPart.Activate(CLSCTX_ALL, ref iidKsControl, out ksControlObj) == 0 && ksControlObj != null)
                                             {
                                                 ksControl = ksControlObj as IKsControl;
+                                                if (ksControl == null)
+                                                {
+                                                    Marshal.ReleaseComObject(ksControlObj);
+                                                    ksControlObj = null;
+                                                }
                                             }
 
                                             if (ksControl != null)
