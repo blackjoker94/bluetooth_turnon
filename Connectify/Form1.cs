@@ -128,7 +128,7 @@ namespace bluetooth_turnon
                 catch (Exception ex)
                 {
                     BluetoothManager.Log($"SafeBeginInvokeAsync exception: {ex.Message}");
-                    tcs.TrySetException(ex);
+                    tcs.TrySetResult(false);
                 }
                 finally
                 {

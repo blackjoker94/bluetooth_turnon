@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -320,6 +321,8 @@ namespace bluetooth_turnon
         private readonly SemaphoreSlim _connectSemaphore = new SemaphoreSlim(1, 1);
         private readonly HashSet<ulong> _activeBatteryRetries = new HashSet<ulong>();
         private readonly object _batteryRetryLock = new object();
+        private readonly ConcurrentDictionary<ulong, (int? Battery, DateTime LastCheckedUtc)> _batteryCache =
+            new ConcurrentDictionary<ulong, (int? Battery, DateTime LastCheckedUtc)>();
         private volatile Radio _bluetoothRadio;
         private volatile bool _radioDiscoveryAttempted;
         private DeviceWatcher _deviceWatcher;
@@ -688,23 +691,47 @@ namespace bluetooth_turnon
                                     
                                     int? battery = null;
 
-                                    if (isConnected)
+                                    if (!isConnected)
+                                    {
+                                        // Purge battery cache and active retry for disconnected devices
+                                        _batteryCache.TryRemove(address, out _);
+                                        lock (_batteryRetryLock)
+                                        {
+                                            _activeBatteryRetries.Remove(address);
+                                        }
+                                    }
+                                    else
                                     {
                                         // Pass 1: PnP device property (fastest, no BLE connection needed)
-                                        // Uses the Bluetooth address to locate the HFP PnP node
+                                        // Uses the Bluetooth address to locate the HFP/BLE PnP node across enumerators
                                         string addrHex = device.DeviceAddress.ToString().Replace(":", "");
                                         battery = QueryBatteryViaPnp(addrHex);
 
-                                        // Pass 2: BLE GATT Battery Service fallback (for BLE-only devices)
-                                        if (battery == null)
+                                        if (battery != null)
                                         {
-                                            battery = await QueryBatteryViaGattAsync(address, name, ct).ConfigureAwait(false);
+                                            _batteryCache[address] = (battery, DateTime.UtcNow);
                                         }
-
-                                        // Fix 5A: Schedule deferred battery retry after short delay for freshly connected devices
-                                        if (battery == null)
+                                        else
                                         {
-                                            ScheduleDeferredBatteryQuery(address, name);
+                                            // Pass 2: BLE GATT Battery Service fallback (cached 5 minutes to avoid 60s BLE query storms)
+                                            bool hasRecentGattCheck = _batteryCache.TryGetValue(address, out var cachedEntry) &&
+                                                                      (DateTime.UtcNow - cachedEntry.LastCheckedUtc) < TimeSpan.FromMinutes(5);
+
+                                            if (hasRecentGattCheck)
+                                            {
+                                                battery = cachedEntry.Battery;
+                                            }
+                                            else
+                                            {
+                                                battery = await QueryBatteryViaGattAsync(address, name, ct).ConfigureAwait(false);
+                                                _batteryCache[address] = (battery, DateTime.UtcNow);
+                                            }
+
+                                            // Fix 5A: Schedule deferred battery retry after short delay for freshly connected devices
+                                            if (battery == null)
+                                            {
+                                                ScheduleDeferredBatteryQuery(address, name);
+                                            }
                                         }
                                     }
 
@@ -1576,6 +1603,11 @@ namespace bluetooth_turnon
                                 Log($"  device.Refresh() called for '{targetName}', Connected={device.Connected}");
                                 if (!device.Connected)
                                 {
+                                    _batteryCache.TryRemove(address, out _);
+                                    lock (_batteryRetryLock)
+                                    {
+                                        _activeBatteryRetries.Remove(address);
+                                    }
                                     Log($"  '{targetName}' is already disconnected.");
                                     return true;
                                 }
@@ -1634,6 +1666,11 @@ namespace bluetooth_turnon
 
                                 if (disconnected || !isConnectedNow)
                                 {
+                                    _batteryCache.TryRemove(address, out _);
+                                    lock (_batteryRetryLock)
+                                    {
+                                        _activeBatteryRetries.Remove(address);
+                                    }
                                     Log($"  '{targetName}' disconnected successfully without disabling profile drivers.");
                                     return true;
                                 }
@@ -1761,86 +1798,143 @@ namespace bluetooth_turnon
                     pid = 2
                 };
 
-                // Primary: Enumerate all present devices on the BTHENUM bus (scopes strictly to Bluetooth PnP nodes)
-                IntPtr devInfoSet = NativeMethods.SetupDiGetClassDevs(
-                    IntPtr.Zero, "BTHENUM", IntPtr.Zero,
-                    NativeMethods.DIGCF_PRESENT | NativeMethods.DIGCF_ALLCLASSES);
-
-                if (devInfoSet == (IntPtr)(-1))
+                // Search all Bluetooth enumerator buses where battery properties appear:
+                // BTHENUM (Classic Bluetooth), BTHHFENUM (Hands-Free Profile audio devices), BTHLEDEVICE (BLE devices)
+                string[] enumerators = new[] { "BTHENUM", "BTHHFENUM", "BTHLEDEVICE" };
+                foreach (var enumerator in enumerators)
                 {
-                    // Fallback: enumerate by Bluetooth device setup class GUID (without DIGCF_ALLCLASSES so the GUID filter is respected)
-                    Guid bluetoothClassGuid = new Guid("e0cbf06c-cd8b-4647-bb8a-263b43f0f974");
-                    devInfoSet = NativeMethods.SetupDiGetClassDevs(
-                        ref bluetoothClassGuid, null, IntPtr.Zero,
-                        NativeMethods.DIGCF_PRESENT);
-                }
+                    IntPtr devInfoSet = NativeMethods.SetupDiGetClassDevs(
+                        IntPtr.Zero, enumerator, IntPtr.Zero,
+                        NativeMethods.DIGCF_PRESENT | NativeMethods.DIGCF_ALLCLASSES);
 
-                if (devInfoSet == (IntPtr)(-1))
-                {
-                    Log("    Battery PnP: SetupDiGetClassDevs failed");
-                    return null;
-                }
+                    if (devInfoSet == (IntPtr)(-1)) continue;
 
-                try
-                {
-                    var devInfoData = new NativeMethods.SP_DEVINFO_DATA();
-                    devInfoData.cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(devInfoData);
-
-                    for (uint i = 0; NativeMethods.SetupDiEnumDeviceInfo(devInfoSet, i, ref devInfoData); i++)
+                    try
                     {
-                        // Get the instance ID to check if it contains our BT address
-                        char[] instanceIdBuf = new char[512];
-                        uint requiredSize;
-                        if (!NativeMethods.SetupDiGetDeviceInstanceId(
-                                devInfoSet, ref devInfoData, instanceIdBuf, (uint)instanceIdBuf.Length, out requiredSize))
+                        var devInfoData = new NativeMethods.SP_DEVINFO_DATA();
+                        devInfoData.cbSize = (uint)Marshal.SizeOf(devInfoData);
+
+                        for (uint i = 0; NativeMethods.SetupDiEnumDeviceInfo(devInfoSet, i, ref devInfoData); i++)
                         {
-                            // If buffer was too small, dynamically resize to requiredSize and retry
-                            if (requiredSize > instanceIdBuf.Length)
+                            char[] instanceIdBuf = new char[512];
+                            uint requiredSize;
+                            if (!NativeMethods.SetupDiGetDeviceInstanceId(
+                                    devInfoSet, ref devInfoData, instanceIdBuf, (uint)instanceIdBuf.Length, out requiredSize))
                             {
-                                instanceIdBuf = new char[requiredSize];
-                                if (!NativeMethods.SetupDiGetDeviceInstanceId(
-                                        devInfoSet, ref devInfoData, instanceIdBuf, (uint)instanceIdBuf.Length, out requiredSize))
+                                if (requiredSize > instanceIdBuf.Length)
+                                {
+                                    instanceIdBuf = new char[requiredSize];
+                                    if (!NativeMethods.SetupDiGetDeviceInstanceId(
+                                            devInfoSet, ref devInfoData, instanceIdBuf, (uint)instanceIdBuf.Length, out requiredSize))
+                                    {
+                                        continue;
+                                    }
+                                }
+                                else
                                 {
                                     continue;
                                 }
                             }
-                            else
-                            {
+
+                            if (requiredSize <= 1 || requiredSize > instanceIdBuf.Length)
                                 continue;
-                            }
-                        }
 
-                        if (requiredSize <= 1 || requiredSize > instanceIdBuf.Length)
-                            continue;
+                            string instanceId = new string(instanceIdBuf, 0, (int)requiredSize - 1);
+                            if (instanceId.IndexOf(addrUpper, StringComparison.OrdinalIgnoreCase) < 0)
+                                continue;
 
-                        string instanceId = new string(instanceIdBuf, 0, (int)requiredSize - 1); // minus null terminator
-                        if (instanceId.IndexOf(addrUpper, StringComparison.OrdinalIgnoreCase) < 0)
-                            continue;
+                            uint propertyType;
+                            byte[] buffer = new byte[4];
+                            uint bufferSize = (uint)buffer.Length;
+                            bool success = NativeMethods.SetupDiGetDevicePropertyW(
+                                devInfoSet, ref devInfoData,
+                                ref batteryPropertyKey,
+                                out propertyType,
+                                buffer, bufferSize, out bufferSize, 0);
 
-                        // This device matches our BT address — try reading the battery property
-                        uint propertyType;
-                        byte[] buffer = new byte[4];
-                        uint bufferSize = (uint)buffer.Length;
-                        bool success = NativeMethods.SetupDiGetDevicePropertyW(
-                            devInfoSet, ref devInfoData,
-                            ref batteryPropertyKey,
-                            out propertyType,
-                            buffer, bufferSize, out bufferSize, 0);
-
-                        if (success && bufferSize >= 1)
-                        {
-                            byte level = buffer[0];
-                            if (level >= 0 && level <= 100)
+                            if (success && bufferSize >= 1)
                             {
-                                Log($"    Battery PnP: {level}% from '{instanceId}'");
-                                return (int)level;
+                                byte level = buffer[0];
+                                if (level >= 0 && level <= 100)
+                                {
+                                    Log($"    Battery PnP: {level}% from '{instanceId}' ({enumerator})");
+                                    return (int)level;
+                                }
                             }
                         }
                     }
+                    finally
+                    {
+                        NativeMethods.SetupDiDestroyDeviceInfoList(devInfoSet);
+                    }
                 }
-                finally
+
+                // Fallback: enumerate by Bluetooth device setup class GUID
+                Guid bluetoothClassGuid = new Guid("e0cbf06c-cd8b-4647-bb8a-263b43f0f974");
+                IntPtr fallbackDevInfoSet = NativeMethods.SetupDiGetClassDevs(
+                    ref bluetoothClassGuid, null, IntPtr.Zero,
+                    NativeMethods.DIGCF_PRESENT);
+
+                if (fallbackDevInfoSet != (IntPtr)(-1))
                 {
-                    NativeMethods.SetupDiDestroyDeviceInfoList(devInfoSet);
+                    try
+                    {
+                        var devInfoData = new NativeMethods.SP_DEVINFO_DATA();
+                        devInfoData.cbSize = (uint)Marshal.SizeOf(devInfoData);
+
+                        for (uint i = 0; NativeMethods.SetupDiEnumDeviceInfo(fallbackDevInfoSet, i, ref devInfoData); i++)
+                        {
+                            char[] instanceIdBuf = new char[512];
+                            uint requiredSize;
+                            if (!NativeMethods.SetupDiGetDeviceInstanceId(
+                                    fallbackDevInfoSet, ref devInfoData, instanceIdBuf, (uint)instanceIdBuf.Length, out requiredSize))
+                            {
+                                if (requiredSize > instanceIdBuf.Length)
+                                {
+                                    instanceIdBuf = new char[requiredSize];
+                                    if (!NativeMethods.SetupDiGetDeviceInstanceId(
+                                            fallbackDevInfoSet, ref devInfoData, instanceIdBuf, (uint)instanceIdBuf.Length, out requiredSize))
+                                    {
+                                        continue;
+                                    }
+                                }
+                                else
+                                {
+                                    continue;
+                                }
+                            }
+
+                            if (requiredSize <= 1 || requiredSize > instanceIdBuf.Length)
+                                continue;
+
+                            string instanceId = new string(instanceIdBuf, 0, (int)requiredSize - 1);
+                            if (instanceId.IndexOf(addrUpper, StringComparison.OrdinalIgnoreCase) < 0)
+                                continue;
+
+                            uint propertyType;
+                            byte[] buffer = new byte[4];
+                            uint bufferSize = (uint)buffer.Length;
+                            bool success = NativeMethods.SetupDiGetDevicePropertyW(
+                                fallbackDevInfoSet, ref devInfoData,
+                                ref batteryPropertyKey,
+                                out propertyType,
+                                buffer, bufferSize, out bufferSize, 0);
+
+                            if (success && bufferSize >= 1)
+                            {
+                                byte level = buffer[0];
+                                if (level >= 0 && level <= 100)
+                                {
+                                    Log($"    Battery PnP: {level}% from fallback GUID '{instanceId}'");
+                                    return (int)level;
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        NativeMethods.SetupDiDestroyDeviceInfoList(fallbackDevInfoSet);
+                    }
                 }
 
                 Log($"    Battery PnP: no battery found for address '{addrUpper}'");
@@ -2234,11 +2328,13 @@ namespace bluetooth_turnon
 
                     if (retriedBattery != null)
                     {
+                        _batteryCache[address] = (retriedBattery, DateTime.UtcNow);
                         Log($"  Deferred battery query SUCCESS for '{deviceName}': {retriedBattery}%. Firing DeviceConnectionChanged.");
                         DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
                     }
                     else
                     {
+                        _batteryCache[address] = (null, DateTime.UtcNow);
                         Log($"  Deferred battery query: battery still unavailable for '{deviceName}'.");
                     }
                 }
@@ -2248,11 +2344,9 @@ namespace bluetooth_turnon
                 }
                 finally
                 {
-                    await Task.Delay(5000).ConfigureAwait(false);
-                    lock (_batteryRetryLock)
-                    {
-                        _activeBatteryRetries.Remove(address);
-                    }
+                    // Note: Address remains in _activeBatteryRetries while the device is connected
+                    // so unsupported devices are only queried once per connection session.
+                    // It is removed when the device disconnects in GetPairedDevicesAsync / DisconnectDeviceAsync.
                 }
             });
         }
@@ -2283,11 +2377,19 @@ namespace bluetooth_turnon
                                 var pairedBleDevices = await DeviceInformation.FindAllAsync(selector).AsTask(token).ConfigureAwait(false);
                                 if (pairedBleDevices != null)
                                 {
+                                    // Match exact name first; only fall back to substring/prefix if name is at least 4 characters
                                     var match = pairedBleDevices.FirstOrDefault(d =>
                                         !string.IsNullOrEmpty(d.Name) &&
-                                        (string.Equals(d.Name, deviceName, StringComparison.OrdinalIgnoreCase) ||
-                                         d.Name.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                         deviceName.IndexOf(d.Name, StringComparison.OrdinalIgnoreCase) >= 0));
+                                        string.Equals(d.Name, deviceName, StringComparison.OrdinalIgnoreCase));
+
+                                    if (match == null && deviceName.Length >= 4)
+                                    {
+                                        match = pairedBleDevices.FirstOrDefault(d =>
+                                            !string.IsNullOrEmpty(d.Name) &&
+                                            d.Name.Length >= 4 &&
+                                            (d.Name.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                             deviceName.IndexOf(d.Name, StringComparison.OrdinalIgnoreCase) >= 0));
+                                    }
 
                                     if (match != null)
                                     {
@@ -2315,8 +2417,10 @@ namespace bluetooth_turnon
                             return null;
                         }
 
+                        // Query services and characteristics with BluetoothCacheMode.Cached (layout is static),
+                        // and only use BluetoothCacheMode.Uncached on ReadValueAsync so query takes ~100ms instead of ~2.5s.
                         var servicesResult = await bleDevice
-                            .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Uncached)
+                            .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Cached)
                             .AsTask(token).ConfigureAwait(false);
 
                         try
@@ -2331,7 +2435,7 @@ namespace bluetooth_turnon
 
                             var service = servicesResult.Services[0];
                             var charsResult = await service
-                                .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Uncached)
+                                .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Cached)
                                 .AsTask(token).ConfigureAwait(false);
 
                             if (charsResult.Status != GattCommunicationStatus.Success
@@ -2665,6 +2769,7 @@ namespace bluetooth_turnon
             }
             _radioDiscoveryAttempted = false;
 
+            _batteryCache.Clear();
             lock (_batteryRetryLock)
             {
                 _activeBatteryRetries.Clear();
