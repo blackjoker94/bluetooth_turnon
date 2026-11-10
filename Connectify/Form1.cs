@@ -336,6 +336,7 @@ namespace bluetooth_turnon
             // And center the toggle switch
             on_off.Left = (panelHeader.Width - on_off.Width) / 2;
 
+            labelDevicesHeader.Text = "PAIRED DEVICES";
             labelDevicesHeader.Width = this.ClientSize.Width - 40;
 
             // Center footer label
@@ -720,9 +721,19 @@ namespace bluetooth_turnon
 
                 if (devices == null || devices.Count == 0)
                 {
+                    string emptyMessage = "No paired devices found";
+                    if (labelStatus.Text == "Disabled" || labelStatus.Text == "Turning Off...")
+                    {
+                        emptyMessage = "Bluetooth is turned off";
+                    }
+                    else if (labelStatus.Text == "No Adapter")
+                    {
+                        emptyMessage = "No Bluetooth adapter found";
+                    }
+
                     var emptyLabel = new Label
                     {
-                        Text = "No devices connected",
+                        Text = emptyMessage,
                         ForeColor = Color.FromArgb(100, 100, 120),
                         Font = EmptyStateFont,
                         AutoSize = false,

@@ -627,10 +627,9 @@ namespace bluetooth_turnon
         // ── Devices ──────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Returns only currently CONNECTED Bluetooth (Classic) devices.
-        /// Devices that are paired but not actively connected are excluded.
-        /// Battery is queried via PnP property or BLE GATT fallback.
-        /// Returns an empty list if the adapter is off, no devices are connected, or any error occurs.
+        /// Returns all paired Bluetooth (Classic) devices with their connection status.
+        /// Battery is queried via PnP property or BLE GATT fallback for connected devices.
+        /// Returns an empty list if the adapter is off, no devices are paired, or any error occurs.
         /// Completely lock-free so background refreshes never block user clicks or device operations.
         /// </summary>
         public async Task<IReadOnlyList<DeviceInfo>> GetPairedDevicesAsync(CancellationToken ct = default)
