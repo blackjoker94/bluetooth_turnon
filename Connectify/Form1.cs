@@ -349,6 +349,20 @@ namespace bluetooth_turnon
                 _hoverDebounceTimer.Interval = 2000; // 2 seconds max deferral while mouse hovers over cards
                 _hoverDebounceTimer.Tick += (s, ev) =>
                 {
+                    if (this.IsDisposed || !this.IsHandleCreated || panelDeviceList.IsDisposed || !panelDeviceList.IsHandleCreated)
+                    {
+                        _hoverDebounceTimer.Stop();
+                        return;
+                    }
+
+                    // If user is still hovering over the device list, do NOT destroy cards under cursor;
+                    // keep timer running to re-check until the mouse leaves the list
+                    Point cursorInList = panelDeviceList.PointToClient(Cursor.Position);
+                    if (panelDeviceList.ClientRectangle.Contains(cursorInList))
+                    {
+                        return;
+                    }
+
                     _hoverDebounceTimer.Stop();
                     if (_pendingDevices != null)
                     {
@@ -654,6 +668,7 @@ namespace bluetooth_turnon
                 do
                 {
                     bool currentForce = force || _forceRefreshPending;
+                    force = false; // Reset method parameter so subsequent coalesced passes only use _forceRefreshPending
                     _refreshPending = false;
                     _forceRefreshPending = false;
                     try
@@ -822,9 +837,10 @@ namespace bluetooth_turnon
                 int cardHeight = 72;
                 int totalHeight = devices.Count * cardHeight;
                 bool needsVerticalScroll = totalHeight > panelDeviceList.ClientSize.Height;
+                int availableWidth = panelDeviceList.ClientSize.Width + (panelDeviceList.VerticalScroll.Visible ? SystemInformation.VerticalScrollBarWidth : 0);
                 int cardWidth = needsVerticalScroll
-                    ? (panelDeviceList.Width - SystemInformation.VerticalScrollBarWidth)
-                    : panelDeviceList.Width;
+                    ? (availableWidth - SystemInformation.VerticalScrollBarWidth)
+                    : availableWidth;
 
                 int y = 0;
                 Point currentCursorInList = panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed
@@ -1002,7 +1018,8 @@ namespace bluetooth_turnon
                         card.BackColor = baseBgColor;
                         iconPanel.BackColor = baseBgColor;
 
-                        // If mouse has exited the device list and an update is pending, apply it now
+                        // If mouse has exited the device list and an update is pending, apply it asynchronously
+                        // via BeginInvoke to avoid disposing controls during their own MouseLeave message dispatch
                         if (panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed)
                         {
                             Point ptList = panelDeviceList.PointToClient(Cursor.Position);
@@ -1011,7 +1028,13 @@ namespace bluetooth_turnon
                                 var pending = _pendingDevices;
                                 _pendingDevices = null;
                                 _hoverDebounceTimer?.Stop();
-                                BuildDeviceCards(pending, force: true);
+                                this.BeginInvoke((Action)(() =>
+                                {
+                                    if (!this.IsDisposed && this.IsHandleCreated)
+                                    {
+                                        BuildDeviceCards(pending, force: true);
+                                    }
+                                }));
                             }
                         }
                     }
@@ -1143,21 +1166,25 @@ namespace bluetooth_turnon
                 y += cardHeight;
             }
 
-            // Ensure horizontal scrollbar never appears
+                panelDeviceList.AutoScrollMinSize = new Size(0, totalHeight);
+            }
+            finally
+            {
+                panelDeviceList.ResumeLayout(true);
+            }
+
+            // Must configure horizontal scrollbar AFTER ResumeLayout(true)
+            // because WinForms' internal AdjustFormScrollbars pass during ResumeLayout
+            // will override any earlier setting of HorizontalScroll.Visible.
             panelDeviceList.HorizontalScroll.Maximum = 0;
+            panelDeviceList.HorizontalScroll.Enabled = false;
             panelDeviceList.HorizontalScroll.Visible = false;
-            panelDeviceList.AutoScrollMinSize = new Size(0, totalHeight);
 
             // Restore vertical scroll position
             if (needsVerticalScroll && previousScrollY > 0)
             {
                 panelDeviceList.AutoScrollPosition = new Point(0, previousScrollY);
             }
-        }
-        finally
-        {
-            panelDeviceList.ResumeLayout(true);
-        }
 
         // ── Device type helpers ───────────────────────────────────────────────
 
