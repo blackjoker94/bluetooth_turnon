@@ -970,17 +970,17 @@ namespace bluetooth_turnon
         {
             if (address == 0) return false;
 
+            IMMDeviceEnumerator enumerator = null;
+            IMMDeviceCollection collection = null;
             try
             {
                 Log($"  CoreAudio: Attempting {(connect ? "reconnect" : "disconnect")} via IKsControl for {address:X12} ('{deviceName}')...");
-                var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+                enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
                 if (enumerator == null) return false;
 
-                IMMDeviceCollection collection = null;
                 int hr = enumerator.EnumAudioEndpoints(EDataFlow_eAll, DEVICE_STATEMASK_ALL, out collection);
                 if (hr != 0 || collection == null)
                 {
-                    Marshal.ReleaseComObject(enumerator);
                     return false;
                 }
 
@@ -998,7 +998,8 @@ namespace bluetooth_turnon
                     {
                         if (collection.Item(i, out endpoint) != 0 || endpoint == null) continue;
 
-                        bool isMatch = false;
+                        bool matchedByAddress = false;
+                        bool matchedByName = false;
 
                         // 1. Check ID string
                         string endpointId;
@@ -1007,7 +1008,7 @@ namespace bluetooth_turnon
                             string idUpper = endpointId.ToUpperInvariant();
                             if (idUpper.Contains(addrHex12))
                             {
-                                isMatch = true;
+                                matchedByAddress = true;
                             }
                         }
 
@@ -1028,10 +1029,10 @@ namespace bluetooth_turnon
                                             string btAddrProp = Marshal.PtrToStringUni(pv.pwszVal);
                                             if (!string.IsNullOrEmpty(btAddrProp))
                                             {
-                                                 string clean = btAddrProp.Replace(":", "").Replace("-", "").ToUpperInvariant();
+                                                string clean = btAddrProp.Replace(":", "").Replace("-", "").ToUpperInvariant();
                                                 if (clean.Contains(addrHex12))
                                                 {
-                                                    isMatch = true;
+                                                    matchedByAddress = true;
                                                 }
                                             }
                                         }
@@ -1042,7 +1043,7 @@ namespace bluetooth_turnon
                                     }
                                 }
 
-                                if (!isMatch && !string.IsNullOrEmpty(deviceName))
+                                if (!matchedByAddress && !string.IsNullOrWhiteSpace(deviceName))
                                 {
                                     var keyFriendlyName = new PROPERTYKEY(new Guid("A45C254E-DF1C-4EFD-8020-67D146A850E0"), 14);
                                     if (propStore.GetValue(ref keyFriendlyName, out pv) == 0)
@@ -1052,9 +1053,16 @@ namespace bluetooth_turnon
                                             if (pv.vt == 31 && pv.pwszVal != IntPtr.Zero)
                                             {
                                                 string fn = Marshal.PtrToStringUni(pv.pwszVal);
-                                                if (!string.IsNullOrEmpty(fn) && fn.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0)
+                                                if (!string.IsNullOrEmpty(fn))
                                                 {
-                                                    isMatch = true;
+                                                    if (string.Equals(fn, deviceName, StringComparison.OrdinalIgnoreCase))
+                                                    {
+                                                        matchedByName = true;
+                                                    }
+                                                    else if (deviceName.Length >= 4 && fn.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0)
+                                                    {
+                                                        matchedByName = true;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1071,9 +1079,9 @@ namespace bluetooth_turnon
                             if (propStore != null) Marshal.ReleaseComObject(propStore);
                         }
 
-                        if (!isMatch) continue;
+                        if (!matchedByAddress && !matchedByName) continue;
 
-                        Log($"  CoreAudio: Endpoint matched: '{endpointId}'");
+                        Log($"  CoreAudio: Endpoint matched: '{endpointId}' (byAddress={matchedByAddress}, byName={matchedByName})");
 
                         // Get IDeviceTopology
                         Guid iidTopology = typeof(IDeviceTopology).GUID;
@@ -1142,16 +1150,16 @@ namespace bluetooth_turnon
                                         if (adapterTopology.GetDeviceId(out adapterDeviceId) != 0 || string.IsNullOrEmpty(adapterDeviceId))
                                             continue;
 
-                                        // The endpoint was already matched to this target Bluetooth device.
-                                        // Loosen adapter device check: accept if it contains the MAC, "BTH", "BLUETOOTH",
-                                        // device friendly name, or if the parent endpoint was already verified as a match.
-                                        bool isBtAdapter = isMatch ||
+                                        // Verify that the adapter device is a Bluetooth audio adapter or matches the device's address
+                                        bool isBtAdapter = matchedByAddress ||
                                                            adapterDeviceId.IndexOf(addrHex12, StringComparison.OrdinalIgnoreCase) >= 0 ||
                                                            adapterDeviceId.IndexOf("BTH", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                           adapterDeviceId.IndexOf("BLUETOOTH", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                           (!string.IsNullOrEmpty(deviceName) && adapterDeviceId.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0);
+                                                           adapterDeviceId.IndexOf("BLUETOOTH", StringComparison.OrdinalIgnoreCase) >= 0;
                                         if (!isBtAdapter)
+                                        {
+                                            Log($"  CoreAudio: Skipping non-Bluetooth adapter '{adapterDeviceId}' for endpoint '{endpointId}'");
                                             continue;
+                                        }
 
                                         IMMDevice adapterDevice = null;
                                         if (enumerator.GetDevice(adapterDeviceId, out adapterDevice) != 0 || adapterDevice == null)
@@ -1242,9 +1250,6 @@ namespace bluetooth_turnon
                     }
                 }
 
-                if (collection != null) Marshal.ReleaseComObject(collection);
-                if (enumerator != null) Marshal.ReleaseComObject(enumerator);
-
                 Log($"  CoreAudio: Completed. anyTriggered={anyTriggered}");
                 return anyTriggered;
             }
@@ -1252,6 +1257,11 @@ namespace bluetooth_turnon
             {
                 Log($"  CoreAudio outer exception: {ex.Message}");
                 return false;
+            }
+            finally
+            {
+                if (collection != null) { try { Marshal.ReleaseComObject(collection); } catch { } }
+                if (enumerator != null) { try { Marshal.ReleaseComObject(enumerator); } catch { } }
             }
         }
 
