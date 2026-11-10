@@ -29,8 +29,26 @@ namespace bluetooth_turnon
         private Timer _hoverDebounceTimer;
         private IReadOnlyList<DeviceInfo> _pendingDevices;
 
+        private readonly int _uiThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
+        private readonly SynchronizationContext _syncContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+
         public bool StartMinimized { get; set; }
         private bool _isLoaded;
+
+        /// <summary>
+        /// Determines whether marshaling to the UI thread is required.
+        /// WinForms Control.InvokeRequired returns false on background threads when IsHandleCreated == false.
+        /// This method checks the thread ID against the main UI thread ID first, guaranteeing accurate
+        /// thread affinity detection even before the native window handle is created.
+        /// </summary>
+        private bool CheckInvokeRequired()
+        {
+            if (System.Threading.Thread.CurrentThread.ManagedThreadId != _uiThreadId)
+            {
+                return true;
+            }
+            return IsHandleCreated && InvokeRequired;
+        }
 
         protected override void SetVisibleCore(bool value)
         {
@@ -48,27 +66,44 @@ namespace bluetooth_turnon
 
         /// <summary>
         /// Marshals an action to the UI thread safely.
-        /// Verifies IsHandleCreated and !IsDisposed before invoking to avoid handle exceptions.
+        /// Uses CheckInvokeRequired and SynchronizationContext fallback when IsHandleCreated is false.
         /// </summary>
         private void SafeBeginInvoke(Action action)
         {
-            if (action == null || IsDisposed || Disposing || !IsHandleCreated) return;
+            if (action == null || IsDisposed || Disposing) return;
 
             try
             {
-                if (InvokeRequired)
+                if (CheckInvokeRequired())
                 {
-                    BeginInvoke(new Action(() =>
+                    if (IsHandleCreated)
                     {
-                        try
+                        BeginInvoke(new Action(() =>
                         {
-                            if (!IsDisposed && !Disposing) action();
-                        }
-                        catch (Exception ex)
+                            try
+                            {
+                                if (!IsDisposed && !Disposing) action();
+                            }
+                            catch (Exception ex)
+                            {
+                                BluetoothManager.Log($"SafeBeginInvoke action exception: {ex.Message}");
+                            }
+                        }));
+                    }
+                    else
+                    {
+                        _syncContext.Post(_ =>
                         {
-                            BluetoothManager.Log($"SafeBeginInvoke action exception: {ex.Message}");
-                        }
-                    }));
+                            try
+                            {
+                                if (!IsDisposed && !Disposing) action();
+                            }
+                            catch (Exception ex)
+                            {
+                                BluetoothManager.Log($"SafeBeginInvoke syncContext action exception: {ex.Message}");
+                            }
+                        }, null);
+                    }
                 }
                 else
                 {
@@ -94,7 +129,7 @@ namespace bluetooth_turnon
         /// </summary>
         private Task SafeBeginInvokeAsync(Func<Task> asyncFunc)
         {
-            if (asyncFunc == null || IsDisposed || Disposing || !IsHandleCreated || _cts.IsCancellationRequested)
+            if (asyncFunc == null || IsDisposed || Disposing || _cts.IsCancellationRequested)
                 return Task.CompletedTask;
 
             var tcs = new TaskCompletionSource<bool>();
@@ -127,7 +162,7 @@ namespace bluetooth_turnon
             {
                 try
                 {
-                    if (IsDisposed || Disposing || !IsHandleCreated || _cts.IsCancellationRequested)
+                    if (IsDisposed || Disposing || _cts.IsCancellationRequested)
                     {
                         tcs.TrySetCanceled();
                         return;
@@ -152,9 +187,16 @@ namespace bluetooth_turnon
 
             try
             {
-                if (InvokeRequired)
+                if (CheckInvokeRequired())
                 {
-                    BeginInvoke(wrappedAction);
+                    if (IsHandleCreated)
+                    {
+                        BeginInvoke(wrappedAction);
+                    }
+                    else
+                    {
+                        _syncContext.Post(_ => wrappedAction(), null);
+                    }
                 }
                 else
                 {
@@ -268,7 +310,7 @@ namespace bluetooth_turnon
         /// </summary>
         public void ShowAndActivate()
         {
-            if (InvokeRequired)
+            if (CheckInvokeRequired())
             {
                 SafeBeginInvoke(ShowAndActivate);
                 return;
@@ -443,7 +485,7 @@ namespace bluetooth_turnon
 
         private void ApplyAdapterStateToUi(bool? isEnabled)
         {
-            if (InvokeRequired)
+            if (CheckInvokeRequired())
             {
                 SafeBeginInvoke(() => ApplyAdapterStateToUi(isEnabled));
                 return;
@@ -765,9 +807,9 @@ namespace bluetooth_turnon
         /// </summary>
         private void BuildDeviceCards(IReadOnlyList<DeviceInfo> devices, bool force = false)
         {
-            if (this.IsDisposed || !this.IsHandleCreated) return;
+            if (this.IsDisposed) return;
 
-            if (InvokeRequired)
+            if (CheckInvokeRequired())
             {
                 SafeBeginInvoke(() => BuildDeviceCards(devices, force));
                 return;
