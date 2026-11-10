@@ -427,6 +427,8 @@ namespace bluetooth_turnon
                     return null;
                 }
 
+                bool wasAbsent = (existingRadio == null || existingRadio.State == RadioState.Unknown);
+
                 if (existingRadio != null)
                 {
                     try { existingRadio.StateChanged -= BluetoothRadio_StateChanged; } catch { }
@@ -452,6 +454,11 @@ namespace bluetooth_turnon
                             _bluetoothRadio = radio;
                             _bluetoothRadio.StateChanged += BluetoothRadio_StateChanged;
                             Log($"Found Bluetooth Radio via Adapter: '{radio.Name}', State={radio.State}");
+                            if (wasAbsent)
+                            {
+                                bool isEnabled = (radio.State == RadioState.On);
+                                AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(isEnabled));
+                            }
                             return _bluetoothRadio;
                         }
                         else
@@ -488,6 +495,11 @@ namespace bluetooth_turnon
                                 _bluetoothRadio = radio;
                                 _bluetoothRadio.StateChanged += BluetoothRadio_StateChanged;
                                 Log($"Found Bluetooth Radio via GetRadiosAsync: '{radio.Name}', State={radio.State}");
+                                if (wasAbsent)
+                                {
+                                    bool isEnabled = (radio.State == RadioState.On);
+                                    AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(isEnabled));
+                                }
                                 return _bluetoothRadio;
                             }
                         }

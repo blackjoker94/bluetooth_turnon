@@ -269,6 +269,35 @@ namespace bluetooth_turnon
             BringToFront();
         }
 
+        private const int WM_DEVICECHANGE = 0x0219;
+
+        /// <summary>
+        /// Listens for Windows hardware device arrival/removal messages (WM_DEVICECHANGE).
+        /// When a USB Bluetooth dongle is plugged in or removed, immediately rechecks adapter state.
+        /// </summary>
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == WM_DEVICECHANGE && !_cts.IsCancellationRequested && !IsDisposed && IsHandleCreated)
+            {
+                SafeBeginInvoke(async () =>
+                {
+                    try
+                    {
+                        await RefreshAdapterStateAsync();
+                        if (labelStatus.Text != "No Adapter")
+                        {
+                            await RefreshDevicesIfIdleAsync();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        BluetoothManager.Log($"WM_DEVICECHANGE refresh exception: {ex.Message}");
+                    }
+                });
+            }
+        }
+
         private async void main_Load(object sender, EventArgs e)
         {
             try
@@ -300,6 +329,10 @@ namespace bluetooth_turnon
                 {
                     try
                     {
+                        if (labelStatus.Text == "No Adapter")
+                        {
+                            await RefreshAdapterStateAsync();
+                        }
                         await RefreshDevicesIfIdleAsync();
                     }
                     catch (Exception ex)
