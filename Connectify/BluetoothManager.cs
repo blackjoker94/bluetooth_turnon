@@ -51,9 +51,18 @@ namespace bluetooth_turnon
                 {
                     try { asyncOp.Cancel(); } catch { }
                     // Allow WinRT 500ms to invoke Completed gracefully; fallback to ensure caller is unblocked if WinRT hangs
-                    Task.Delay(500).ContinueWith(_ => tcs.TrySetCanceled());
+                    Task.Delay(500).ContinueWith(_ =>
+                    {
+                        try { ctr.Dispose(); } catch { }
+                        tcs.TrySetCanceled();
+                    });
                 });
             }
+
+            tcs.Task.ContinueWith(_ =>
+            {
+                try { ctr.Dispose(); } catch { }
+            }, TaskContinuationOptions.ExecuteSynchronously);
 
             asyncOp.Completed = (info, status) =>
             {
@@ -119,9 +128,18 @@ namespace bluetooth_turnon
                 ctr = ct.Register(() =>
                 {
                     try { asyncAction.Cancel(); } catch { }
-                    Task.Delay(500).ContinueWith(_ => tcs.TrySetCanceled());
+                    Task.Delay(500).ContinueWith(_ =>
+                    {
+                        try { ctr.Dispose(); } catch { }
+                        tcs.TrySetCanceled();
+                    });
                 });
             }
+
+            tcs.Task.ContinueWith(_ =>
+            {
+                try { ctr.Dispose(); } catch { }
+            }, TaskContinuationOptions.ExecuteSynchronously);
 
             asyncAction.Completed = (info, status) =>
             {

@@ -67,7 +67,14 @@ namespace bluetooth_turnon
                 }
                 else
                 {
-                    action();
+                    try
+                    {
+                        if (!IsDisposed && !Disposing) action();
+                    }
+                    catch (Exception ex)
+                    {
+                        BluetoothManager.Log($"SafeBeginInvoke direct action exception: {ex.Message}");
+                    }
                 }
             }
             catch (ObjectDisposedException) { }
@@ -1059,17 +1066,20 @@ namespace bluetooth_turnon
                         _connectingAddresses[addr] = isConnecting ? "Connecting..." : "Disconnecting...";
                     }
 
-                    CancellationTokenSource clickCts;
-                    lock (_deviceClickCtsLock)
+                    try
                     {
-                        clickCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, _deviceClickCts.Token);
-                    }
-
-                    using (clickCts)
-                    {
-                        var token = clickCts.Token;
-                        try
+                        CancellationTokenSource clickCts = null;
+                        lock (_deviceClickCtsLock)
                         {
+                            if (_cts.IsCancellationRequested || this.IsDisposed || !this.IsHandleCreated)
+                                return;
+                            clickCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, _deviceClickCts.Token);
+                        }
+
+                        using (clickCts)
+                        {
+                            var token = clickCts.Token;
+
                             // Fix Bug 7: Re-query fresh device state before deciding connect vs disconnect
                             // to avoid acting on stale captured state if connection status changed.
                             bool? freshConnected = await _bluetoothManager.IsDeviceConnectedAsync(addr, token);
@@ -1112,36 +1122,36 @@ namespace bluetooth_turnon
                                 try { await Task.Delay(200, token); } catch { }
                             }
                         }
-                        catch (OperationCanceledException)
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Form is closing, Bluetooth turned off, or operation cancelled
+                    }
+                    catch (Exception ex)
+                    {
+                        BluetoothManager.Log($"Device click exception for {addr:X12}: {ex.Message}");
+                        if (!this.IsDisposed && this.IsHandleCreated)
                         {
-                            // Form is closing, Bluetooth turned off, or operation cancelled
+                            UpdateOperationFeedback(addr, isConnecting ? "Connection failed" : "Disconnect failed", Color.FromArgb(230, 80, 80), typeLabel);
+                            try { await Task.Delay(1500); } catch { }
                         }
-                        catch (Exception ex)
+                    }
+                    finally
+                    {
+                        lock (_connectingAddresses)
                         {
-                            BluetoothManager.Log($"Device click exception for {addr:X12}: {ex.Message}");
-                            if (!this.IsDisposed && this.IsHandleCreated)
-                            {
-                                UpdateOperationFeedback(addr, isConnecting ? "Connection failed" : "Disconnect failed", Color.FromArgb(230, 80, 80), typeLabel);
-                                try { await Task.Delay(1500, token); } catch { }
-                            }
+                            _connectingAddresses.Remove(addr);
                         }
-                        finally
+                        if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
                         {
-                            lock (_connectingAddresses)
+                            try
                             {
-                                _connectingAddresses.Remove(addr);
+                                await RefreshAdapterStateAsync();
+                                await RefreshDevicesIfIdleAsync(force: true);
                             }
-                            if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
+                            catch (Exception ex)
                             {
-                                try
-                                {
-                                    await RefreshAdapterStateAsync();
-                                    await RefreshDevicesIfIdleAsync(force: true);
-                                }
-                                catch (Exception ex)
-                                {
-                                    BluetoothManager.Log($"onClick refresh exception: {ex.Message}");
-                                }
+                                BluetoothManager.Log($"onClick refresh exception: {ex.Message}");
                             }
                         }
                     }
