@@ -1322,7 +1322,9 @@ namespace bluetooth_turnon
 
         /// <summary>
         /// Attempts to disconnect a paired Bluetooth device using Core Audio IKsControl disconnect,
-        /// clearing service states across supported profiles, and WinRT ACL hint teardown.
+        /// native driver IOCTL baseband teardown (IOCTL_BTH_DISCONNECT_DEVICE), and WinRT ACL hint teardown.
+        /// Preserves all Windows PnP profile drivers (AudioSink, Handsfree, Headset, HID) enabled in the registry
+        /// so devices can seamlessly auto-reconnect on next power-on.
         /// Guarded by _connectSemaphore.
         /// </summary>
         public async Task<bool> DisconnectDeviceAsync(ulong address, CancellationToken ct = default)
@@ -1359,7 +1361,7 @@ namespace bluetooth_turnon
                                 return true;
                             }
 
-                            // Core Audio disconnect (best-effort)
+                            // Step 2: Core Audio disconnect (best-effort for audio endpoints)
                             try
                             {
                                 bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, targetName, connect: false);
@@ -1370,35 +1372,20 @@ namespace bluetooth_turnon
                                 Log($"  CoreAudio disconnect note: {ex.Message}");
                             }
 
-                            // Step 2: Disable services across target profiles (categorized by device type)
-                            var deviceType = ClassifyDevice(device);
-                            bool isHidDevice = deviceType == BluetoothDeviceType.Mouse ||
-                                               deviceType == BluetoothDeviceType.Keyboard ||
-                                               deviceType == BluetoothDeviceType.Controller;
-
-                            Guid[] profilesToDisable = isHidDevice
-                                ? new[] { InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice }
-                                : new[]
-                                {
-                                    InTheHand.Net.Bluetooth.BluetoothService.AudioSink,
-                                    InTheHand.Net.Bluetooth.BluetoothService.Handsfree,
-                                    InTheHand.Net.Bluetooth.BluetoothService.Headset
-                                };
-
-                            foreach (var profile in profilesToDisable)
+                            // Step 3: Native Bluetooth Port Driver ACL Link Disconnect (IOCTL_BTH_DISCONNECT_DEVICE)
+                            // Instructs bthport.sys to cleanly teardown the baseband ACL connection without disabling
+                            // or unbinding the device's PnP profile drivers (AudioSink, Handsfree, Headset, HID) in the registry.
+                            try
                             {
-                                try
-                                {
-                                    Log($"  Disabling service {profile} on '{targetName}'...");
-                                    device.SetServiceState(profile, false);
-                                }
-                                catch (Exception ex)
-                                {
-                                    Log($"  Disconnect SetServiceState({profile}, false) note: {ex.Message}");
-                                }
+                                bool ioctlSuccess = DisconnectDeviceViaIoctl(address);
+                                Log($"  Native IOCTL_BTH_DISCONNECT_DEVICE called for {address:X12}: {ioctlSuccess}");
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"  Native IOCTL disconnect note: {ex.Message}");
                             }
 
-                            // Step 3: WinRT direct ACL drop hint (Fix 3C)
+                            // Step 4: WinRT direct ACL drop hint
                             try
                             {
                                 Log($"  Attempting WinRT BluetoothDevice ACL drop hint for {address:X12}...");
@@ -1419,7 +1406,7 @@ namespace bluetooth_turnon
                                 Log($"  WinRT ACL drop hint note: {ex.Message}");
                             }
 
-                            // Step 4: Extended Polling Window (Fix 3B: 5 x 800ms = 4s total)
+                            // Step 5: Extended Polling Window (5 x 800ms = 4s total)
                             for (int attempt = 1; attempt <= 5; attempt++)
                             {
                                 try
@@ -1449,7 +1436,7 @@ namespace bluetooth_turnon
 
                             if (disconnected || !isConnectedNow)
                             {
-                                Log($"  '{targetName}' disconnected successfully via service disable.");
+                                Log($"  '{targetName}' disconnected successfully without disabling profile drivers.");
                                 return true;
                             }
                         }
@@ -1476,6 +1463,71 @@ namespace bluetooth_turnon
             finally
             {
                 _connectSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Sends IOCTL_BTH_DISCONNECT_DEVICE directly to the local Bluetooth radio driver handle.
+        /// Instructs bthport.sys to cleanly terminate the baseband ACL connection
+        /// without unbinding or disabling the device's PnP profile drivers (AudioSink, Handsfree, Headset, HID) in the registry.
+        /// </summary>
+        private static bool DisconnectDeviceViaIoctl(ulong address)
+        {
+            if (address == 0) return false;
+
+            IntPtr hRadio = IntPtr.Zero;
+            IntPtr hFind = IntPtr.Zero;
+            try
+            {
+                var radioParams = new NativeMethods.BLUETOOTH_FIND_RADIO_PARAMS();
+                radioParams.dwSize = (uint)Marshal.SizeOf(typeof(NativeMethods.BLUETOOTH_FIND_RADIO_PARAMS));
+
+                hFind = NativeMethods.BluetoothFindFirstRadio(ref radioParams, out hRadio);
+                if (hFind == IntPtr.Zero || hRadio == IntPtr.Zero)
+                {
+                    Log("  DisconnectDeviceViaIoctl: No local Bluetooth radio handle found.");
+                    return false;
+                }
+
+                long inBuffer = (long)address;
+                int bytesReturned = 0;
+                bool success = NativeMethods.DeviceIoControl(
+                    hRadio,
+                    NativeMethods.IOCTL_BTH_DISCONNECT_DEVICE,
+                    ref inBuffer,
+                    sizeof(long),
+                    IntPtr.Zero,
+                    0,
+                    out bytesReturned,
+                    IntPtr.Zero
+                );
+
+                if (!success)
+                {
+                    int win32Err = Marshal.GetLastWin32Error();
+                    // Error 1167 = ERROR_DEVICE_NOT_CONNECTED (already disconnected)
+                    Log($"  DisconnectDeviceViaIoctl DeviceIoControl returned false. Win32 error={win32Err}");
+                    return (win32Err == 1167);
+                }
+
+                Log("  DisconnectDeviceViaIoctl DeviceIoControl succeeded.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log($"  DisconnectDeviceViaIoctl exception: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                if (hFind != IntPtr.Zero)
+                {
+                    try { NativeMethods.BluetoothFindRadioClose(hFind); } catch { }
+                }
+                if (hRadio != IntPtr.Zero)
+                {
+                    try { NativeMethods.CloseHandle(hRadio); } catch { }
+                }
             }
         }
 
@@ -1656,6 +1708,36 @@ namespace bluetooth_turnon
 
             [System.Runtime.InteropServices.DllImport("ole32.dll")]
             public static extern int PropVariantClear(ref PROPVARIANT pvar);
+
+            public const uint IOCTL_BTH_DISCONNECT_DEVICE = 0x41000C;
+
+            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+            public struct BLUETOOTH_FIND_RADIO_PARAMS
+            {
+                public uint dwSize;
+            }
+
+            [System.Runtime.InteropServices.DllImport("bthprops.cpl", SetLastError = true)]
+            public static extern IntPtr BluetoothFindFirstRadio(ref BLUETOOTH_FIND_RADIO_PARAMS pbtfrp, out IntPtr phRadio);
+
+            [System.Runtime.InteropServices.DllImport("bthprops.cpl", SetLastError = true)]
+            [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+            public static extern bool BluetoothFindRadioClose(IntPtr hFind);
+
+            [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+            [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+            public static extern bool CloseHandle(IntPtr hObject);
+
+            [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+            public static extern bool DeviceIoControl(
+                IntPtr hDevice,
+                uint dwIoControlCode,
+                ref long lpInBuffer,
+                int nInBufferSize,
+                IntPtr lpOutBuffer,
+                int nOutBufferSize,
+                out int lpBytesReturned,
+                IntPtr lpOverlapped);
         }
 
         #region Core Audio & Kernel Streaming Interop
