@@ -325,6 +325,7 @@ namespace bluetooth_turnon
         private DeviceWatcher _deviceWatcher;
         private volatile bool _watcherEnumerationComplete;
         private bool _disposed;
+        private CancellationTokenSource _deviceOpCts = new CancellationTokenSource();
 
         /// <summary>
         /// Fired whenever the Bluetooth adapter state changes (internally or externally in Windows).
@@ -541,6 +542,19 @@ namespace bluetooth_turnon
         public async Task<bool> SetAdapterStateAsync(bool enable, CancellationToken ct = default)
         {
             Log($"SetAdapterStateAsync(enable={enable}) called");
+
+            if (!enable)
+            {
+                // When adapter is being turned OFF, cancel any in-flight connect or disconnect operations immediately
+                try
+                {
+                    _deviceOpCts?.Cancel();
+                    _deviceOpCts?.Dispose();
+                    _deviceOpCts = new CancellationTokenSource();
+                }
+                catch { }
+            }
+
             var radio = _bluetoothRadio ?? await GetBluetoothRadioAsync(ct, forceRefresh: true).ConfigureAwait(false);
             if (radio == null)
             {
@@ -1172,274 +1186,312 @@ namespace bluetooth_turnon
         public async Task<bool> ConnectDeviceAsync(ulong address, CancellationToken ct = default)
         {
             Log($"ConnectDeviceAsync called for {address:X12}");
-            await _connectSemaphore.WaitAsync(ct).ConfigureAwait(false);
-            try
+
+            // Guard: Do not attempt to connect if Bluetooth radio is currently off
+            if (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.On)
             {
-                return await Task.Run(async () =>
+                Log($"  ConnectDeviceAsync: Bluetooth adapter is OFF. Aborting connection for {address:X12}.");
+                return false;
+            }
+
+            using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _deviceOpCts.Token))
+            {
+                var token = linkedCts.Token;
+                await _connectSemaphore.WaitAsync(token).ConfigureAwait(false);
+                try
                 {
-                    try
+                    return await Task.Run(async () =>
                     {
-                        string targetDeviceName;
-                        using (var client = new InTheHand.Net.Sockets.BluetoothClient())
-                        {
-                            var paired = client.PairedDevices;
-                            var device = paired?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
-                            if (device == null)
-                            {
-                                Log($"  ConnectDeviceAsync: device {address:X12} not found in PairedDevices");
-                                return false;
-                            }
-
-                            targetDeviceName = device.DeviceName;
-
-                            // Step 1: Refresh device state before acting
-                            device.Refresh();
-                            Log($"  device.Refresh() called for '{targetDeviceName}', initial Connected={device.Connected}");
-                            if (device.Connected)
-                            {
-                                Log($"  '{targetDeviceName}' is already connected.");
-                                return true;
-                            }
-
-                            // Step 2: Wake baseband link via WinRT uncached discovery (with 4s timeout)
-                            await WakeBasebandLinkAsync(address, ct).ConfigureAwait(false);
-                            device.Refresh();
-                            if (device.Connected)
-                            {
-                                Log($"  '{targetDeviceName}' connected after baseband wake.");
-                                return true;
-                            }
-
-                            // Step 3: Best-effort Windows Core Audio (IKsControl) Reconnect for Audio Endpoints
-                            try
-                            {
-                                bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, targetDeviceName, connect: true);
-                                Log($"  CoreAudio reconnect triggered: {coreAudioTriggered}");
-
-                                if (coreAudioTriggered)
-                                {
-                                    Log($"  CoreAudio command sent. Polling connection status (5 attempts x 800ms = 4.0s max)...");
-                                    for (int caAttempt = 1; caAttempt <= 5; caAttempt++)
-                                    {
-                                        await Task.Delay(800, ct).ConfigureAwait(false);
-                                        try
-                                        {
-                                            device.Refresh();
-                                            Log($"  CoreAudio reconnect verify attempt {caAttempt}/5: Connected={device.Connected}");
-                                            if (device.Connected)
-                                            {
-                                                Log($"  '{targetDeviceName}' reconnected successfully via CoreAudio on attempt {caAttempt}/5.");
-                                                return true;
-                                            }
-                                        }
-                                        catch (OperationCanceledException) { throw; }
-                                        catch (Exception ex)
-                                        {
-                                            Log($"  CoreAudio verify attempt {caAttempt} exception: {ex.Message}");
-                                        }
-                                    }
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Log($"  CoreAudio reconnect attempt note: {ex.Message}");
-                            }
-
-                            // Step 4: Primary Strategy — Two-pass Service State Cycle (disable all first, wait 200ms, then enable all)
-                            var deviceType = ClassifyDevice(device);
-                            bool isHidDevice = deviceType == BluetoothDeviceType.Mouse ||
-                                               deviceType == BluetoothDeviceType.Keyboard ||
-                                               deviceType == BluetoothDeviceType.Controller;
-
-                            Guid[] profilesToCycle = isHidDevice
-                                ? new[] { InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice }
-                                : new[]
-                                {
-                                    InTheHand.Net.Bluetooth.BluetoothService.AudioSink,
-                                    InTheHand.Net.Bluetooth.BluetoothService.Handsfree,
-                                    InTheHand.Net.Bluetooth.BluetoothService.Headset
-                                };
-
-                            foreach (var profile in profilesToCycle)
-                            {
-                                ct.ThrowIfCancellationRequested();
-                                try { device.SetServiceState(profile, false); }
-                                catch (Exception ex) { Log($"  SetServiceState({profile}, false) note: {ex.Message}"); }
-                            }
-
-                            await Task.Delay(200, ct).ConfigureAwait(false);
-
-                            foreach (var profile in profilesToCycle)
-                            {
-                                ct.ThrowIfCancellationRequested();
-                                try { device.SetServiceState(profile, true); }
-                                catch (Exception ex) { Log($"  SetServiceState({profile}, true) note: {ex.Message}"); }
-                            }
-
-                            // Step 5: Verify Actual Connection Status Before Returning
-                            // Initial delay of 1s after SetServiceState(true) before starting the poll loop,
-                            // giving Windows time to initiate the baseband connection
-                            await Task.Delay(1000, ct).ConfigureAwait(false);
-
-                            bool connected = false;
-                            for (int attempt = 1; attempt <= 8; attempt++)
-                            {
-                                try
-                                {
-                                    if (attempt > 1)
-                                    {
-                                        await Task.Delay(1000, ct).ConfigureAwait(false);
-                                    }
-
-                                    device.Refresh();
-                                    Log($"  Connection verify attempt {attempt}/8: Connected={device.Connected}");
-                                    if (device.Connected)
-                                    {
-                                        connected = true;
-                                        break;
-                                    }
-                                }
-                                catch (OperationCanceledException) { throw; }
-                                catch (Exception ex)
-                                {
-                                    Log($"  Connection verify attempt {attempt} exception: {ex.Message}");
-                                }
-                            }
-
-                            if (connected)
-                            {
-                                Log($"  '{targetDeviceName}' connected successfully via service state cycle.");
-                                return true;
-                            }
-                        }
-
-                        // Step 6: Controlled Radio Bounce
-                        Log($"  Steps 1-5 failed to connect '{targetDeviceName}'. Initiating Step 6: Controlled Radio Bounce...");
-                        IsRadioBounceInProgress = true;
-                        OperationProgressChanged?.Invoke(this, new DeviceOperationProgressEventArgs(address, "Reconnecting Bluetooth..."));
                         try
                         {
-                            bool offSuccess = await SetAdapterStateAsync(false, ct).ConfigureAwait(false);
-                            Log($"  Radio bounce: adapter turned off (success={offSuccess})");
-                            if (!offSuccess)
+                            string targetDeviceName;
+                            using (var client = new InTheHand.Net.Sockets.BluetoothClient())
                             {
-                                Log("  Radio bounce: SetAdapterStateAsync(false) failed, aborting radio bounce.");
-                                return false;
-                            }
+                                var paired = client.PairedDevices;
+                                var device = paired?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
+                                if (device == null)
+                                {
+                                    Log($"  ConnectDeviceAsync: device {address:X12} not found in PairedDevices");
+                                    return false;
+                                }
 
-                            // Wait 1000ms for USB/PCIe hardware power-down transition
-                            await Task.Delay(1000, ct).ConfigureAwait(false);
+                                targetDeviceName = device.DeviceName;
 
-                            // Retry loop to ensure adapter successfully powers back on
-                            bool onSuccess = false;
-                            for (int onAttempt = 1; onAttempt <= 3; onAttempt++)
-                            {
-                                onSuccess = await SetAdapterStateAsync(true, ct).ConfigureAwait(false);
-                                Log($"  Radio bounce: adapter turned on attempt {onAttempt}/3 (success={onSuccess})");
-                                if (onSuccess) break;
-                                await Task.Delay(1000 * onAttempt, ct).ConfigureAwait(false);
-                            }
+                                // Step 1: Refresh device state before acting
+                                device.Refresh();
+                                Log($"  device.Refresh() called for '{targetDeviceName}', initial Connected={device.Connected}");
+                                if (device.Connected)
+                                {
+                                    Log($"  '{targetDeviceName}' is already connected.");
+                                    return true;
+                                }
 
-                            if (!onSuccess)
-                            {
-                                Log("  Radio bounce: standard SetAdapterStateAsync(true) failed after 3 attempts. Attempting forced radio refresh...");
-                                var freshRadio = await GetBluetoothRadioAsync(ct, forceRefresh: true).ConfigureAwait(false);
-                                if (freshRadio != null)
+                                if (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.On)
+                                {
+                                    Log($"  ConnectDeviceAsync: Adapter turned off before baseband wake. Aborting.");
+                                    return false;
+                                }
+
+                                // Step 2: Wake baseband link via WinRT uncached discovery (with 4s timeout)
+                                await WakeBasebandLinkAsync(address, token).ConfigureAwait(false);
+                                device.Refresh();
+                                if (device.Connected)
+                                {
+                                    Log($"  '{targetDeviceName}' connected after baseband wake.");
+                                    return true;
+                                }
+
+                                if (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.On)
+                                {
+                                    Log($"  ConnectDeviceAsync: Adapter turned off before CoreAudio reconnect. Aborting.");
+                                    return false;
+                                }
+
+                                // Step 3: Best-effort Windows Core Audio (IKsControl) Reconnect for Audio Endpoints
+                                try
+                                {
+                                    bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, targetDeviceName, connect: true);
+                                    Log($"  CoreAudio reconnect triggered: {coreAudioTriggered}");
+
+                                    if (coreAudioTriggered)
+                                    {
+                                        Log($"  CoreAudio command sent. Polling connection status (5 attempts x 800ms = 4.0s max)...");
+                                        for (int caAttempt = 1; caAttempt <= 5; caAttempt++)
+                                        {
+                                            await Task.Delay(800, token).ConfigureAwait(false);
+                                            try
+                                            {
+                                                device.Refresh();
+                                                Log($"  CoreAudio reconnect verify attempt {caAttempt}/5: Connected={device.Connected}");
+                                                if (device.Connected)
+                                                {
+                                                    Log($"  '{targetDeviceName}' reconnected successfully via CoreAudio on attempt {caAttempt}/5.");
+                                                    return true;
+                                                }
+                                            }
+                                            catch (OperationCanceledException) { throw; }
+                                            catch (Exception ex)
+                                            {
+                                                Log($"  CoreAudio verify attempt {caAttempt} exception: {ex.Message}");
+                                            }
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Log($"  CoreAudio reconnect attempt note: {ex.Message}");
+                                }
+
+                                if (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.On)
+                                {
+                                    Log($"  ConnectDeviceAsync: Adapter turned off before service state cycle. Aborting.");
+                                    return false;
+                                }
+
+                                // Step 4: Primary Strategy — Two-pass Service State Cycle (disable all first, wait 200ms, then enable all)
+                                var deviceType = ClassifyDevice(device);
+                                bool isHidDevice = deviceType == BluetoothDeviceType.Mouse ||
+                                                   deviceType == BluetoothDeviceType.Keyboard ||
+                                                   deviceType == BluetoothDeviceType.Controller;
+
+                                Guid[] profilesToCycle = isHidDevice
+                                    ? new[] { InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice }
+                                    : new[]
+                                    {
+                                        InTheHand.Net.Bluetooth.BluetoothService.AudioSink,
+                                        InTheHand.Net.Bluetooth.BluetoothService.Handsfree,
+                                        InTheHand.Net.Bluetooth.BluetoothService.Headset
+                                    };
+
+                                foreach (var profile in profilesToCycle)
+                                {
+                                    token.ThrowIfCancellationRequested();
+                                    try { device.SetServiceState(profile, false); }
+                                    catch (Exception ex) { Log($"  SetServiceState({profile}, false) note: {ex.Message}"); }
+                                }
+
+                                await Task.Delay(200, token).ConfigureAwait(false);
+
+                                foreach (var profile in profilesToCycle)
+                                {
+                                    token.ThrowIfCancellationRequested();
+                                    try { device.SetServiceState(profile, true); }
+                                    catch (Exception ex) { Log($"  SetServiceState({profile}, true) note: {ex.Message}"); }
+                                }
+
+                                // Step 5: Verify Actual Connection Status Before Returning
+                                // Initial delay of 1s after SetServiceState(true) before starting the poll loop,
+                                // giving Windows time to initiate the baseband connection
+                                await Task.Delay(1000, token).ConfigureAwait(false);
+
+                                bool connected = false;
+                                for (int attempt = 1; attempt <= 8; attempt++)
                                 {
                                     try
                                     {
-                                        var res = await freshRadio.SetStateAsync(RadioState.On).AsTask(ct).ConfigureAwait(false);
-                                        onSuccess = (res == RadioAccessStatus.Allowed);
-                                        Log($"  Radio bounce: direct SetStateAsync(On) returned {res}, success={onSuccess}");
+                                        if (attempt > 1)
+                                        {
+                                            await Task.Delay(1000, token).ConfigureAwait(false);
+                                        }
+
+                                        device.Refresh();
+                                        Log($"  Connection verify attempt {attempt}/8: Connected={device.Connected}");
+                                        if (device.Connected)
+                                        {
+                                            connected = true;
+                                            break;
+                                        }
                                     }
+                                    catch (OperationCanceledException) { throw; }
                                     catch (Exception ex)
                                     {
-                                        Log($"  Radio bounce: direct SetStateAsync(On) exception: {ex.Message}");
+                                        Log($"  Connection verify attempt {attempt} exception: {ex.Message}");
                                     }
+                                }
+
+                                if (connected)
+                                {
+                                    Log($"  '{targetDeviceName}' connected successfully via service state cycle.");
+                                    return true;
                                 }
                             }
 
-                            if (!onSuccess && (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On))
+                            // Step 6: Controlled Radio Bounce
+                            // ONLY perform radio bounce if adapter is currently ON and operation was NOT canceled.
+                            // If the user turned off Bluetooth, DO NOT bounce or turn Bluetooth back on!
+                            if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On || token.IsCancellationRequested)
                             {
-                                Log("  Radio bounce: CRITICAL — could not restore Bluetooth adapter power! Aborting polling.");
+                                Log($"  ConnectDeviceAsync: Adapter is OFF or operation was cancelled. Skipping Step 6 (Radio Bounce).");
                                 return false;
                             }
 
-                            // Allow 1.5s for Windows Bluetooth stack & PnP to re-enumerate
-                            await Task.Delay(1500, ct).ConfigureAwait(false);
-
-                            // Poll device.Connected up to 8 times at 1-second intervals (8 seconds total)
-                            for (int attempt = 1; attempt <= 8; attempt++)
+                            Log($"  Steps 1-5 failed to connect '{targetDeviceName}'. Initiating Step 6: Controlled Radio Bounce...");
+                            IsRadioBounceInProgress = true;
+                            OperationProgressChanged?.Invoke(this, new DeviceOperationProgressEventArgs(address, "Reconnecting Bluetooth..."));
+                            try
                             {
-                                await Task.Delay(1000, ct).ConfigureAwait(false);
-                                try
+                                bool offSuccess = await SetAdapterStateAsync(false, token).ConfigureAwait(false);
+                                Log($"  Radio bounce: adapter turned off (success={offSuccess})");
+                                if (!offSuccess)
                                 {
-                                    using (var bounceClient = new InTheHand.Net.Sockets.BluetoothClient())
+                                    Log("  Radio bounce: SetAdapterStateAsync(false) failed, aborting radio bounce.");
+                                    return false;
+                                }
+
+                                // Wait 1000ms for USB/PCIe hardware power-down transition
+                                await Task.Delay(1000, token).ConfigureAwait(false);
+
+                                // Retry loop to ensure adapter successfully powers back on
+                                bool onSuccess = false;
+                                for (int onAttempt = 1; onAttempt <= 3; onAttempt++)
+                                {
+                                    onSuccess = await SetAdapterStateAsync(true, token).ConfigureAwait(false);
+                                    Log($"  Radio bounce: adapter turned on attempt {onAttempt}/3 (success={onSuccess})");
+                                    if (onSuccess) break;
+                                    await Task.Delay(1000 * onAttempt, token).ConfigureAwait(false);
+                                }
+
+                                if (!onSuccess)
+                                {
+                                    Log("  Radio bounce: standard SetAdapterStateAsync(true) failed after 3 attempts. Attempting forced radio refresh...");
+                                    var freshRadio = await GetBluetoothRadioAsync(token, forceRefresh: true).ConfigureAwait(false);
+                                    if (freshRadio != null)
                                     {
-                                        var bounceDevice = bounceClient.PairedDevices?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
-                                        if (bounceDevice != null)
+                                        try
                                         {
-                                            bounceDevice.Refresh();
-                                            Log($"  Radio bounce verify attempt {attempt}/8: Connected={bounceDevice.Connected}");
-                                            if (bounceDevice.Connected)
-                                            {
-                                                Log($"  '{bounceDevice.DeviceName}' connected successfully after radio bounce on attempt {attempt}/8.");
-                                                return true;
-                                            }
+                                            var res = await freshRadio.SetStateAsync(RadioState.On).AsTask(token).ConfigureAwait(false);
+                                            onSuccess = (res == RadioAccessStatus.Allowed);
+                                            Log($"  Radio bounce: direct SetStateAsync(On) returned {res}, success={onSuccess}");
                                         }
-                                        else
+                                        catch (Exception ex)
                                         {
-                                            Log($"  Radio bounce verify attempt {attempt}/8: device not found in PairedDevices");
+                                            Log($"  Radio bounce: direct SetStateAsync(On) exception: {ex.Message}");
                                         }
                                     }
                                 }
-                                catch (OperationCanceledException) { throw; }
-                                catch (Exception ex)
+
+                                if (!onSuccess && (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On))
                                 {
-                                    Log($"  Radio bounce verify attempt {attempt} exception: {ex.Message}");
+                                    Log("  Radio bounce: CRITICAL — could not restore Bluetooth adapter power! Aborting polling.");
+                                    return false;
+                                }
+
+                                // Allow 1.5s for Windows Bluetooth stack & PnP to re-enumerate
+                                await Task.Delay(1500, token).ConfigureAwait(false);
+
+                                // Poll device.Connected up to 8 times at 1-second intervals (8 seconds total)
+                                for (int attempt = 1; attempt <= 8; attempt++)
+                                {
+                                    await Task.Delay(1000, token).ConfigureAwait(false);
+                                    try
+                                    {
+                                        using (var bounceClient = new InTheHand.Net.Sockets.BluetoothClient())
+                                        {
+                                            var bounceDevice = bounceClient.PairedDevices?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
+                                            if (bounceDevice != null)
+                                            {
+                                                bounceDevice.Refresh();
+                                                Log($"  Radio bounce verify attempt {attempt}/8: Connected={bounceDevice.Connected}");
+                                                if (bounceDevice.Connected)
+                                                {
+                                                    Log($"  '{bounceDevice.DeviceName}' connected successfully after radio bounce on attempt {attempt}/8.");
+                                                    return true;
+                                                }
+                                            }
+                                            else
+                                            {
+                                                Log($"  Radio bounce verify attempt {attempt}/8: device not found in PairedDevices");
+                                            }
+                                        }
+                                    }
+                                    catch (OperationCanceledException) { throw; }
+                                    catch (Exception ex)
+                                    {
+                                        Log($"  Radio bounce verify attempt {attempt} exception: {ex.Message}");
+                                    }
                                 }
                             }
+                            catch (OperationCanceledException) { throw; }
+                            catch (Exception ex)
+                            {
+                                Log($"  Radio bounce exception: {ex.Message}");
+                            }
+                            finally
+                            {
+                                IsRadioBounceInProgress = false;
+                                // Raise AdapterStateChanged with the verified current state so Form1 restores
+                                // labelStatus from "Reconnecting..." to "Enabled" and updates the toggle switch.
+                                try
+                                {
+                                    bool? finalState = (_bluetoothRadio != null) ? (_bluetoothRadio.State == RadioState.On) : (bool?)null;
+                                    AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(finalState));
+                                }
+                                catch { }
+                            }
+
+                            Log($"  ConnectDeviceAsync failed for '{targetDeviceName}' after all 6 steps.");
+                            return false;
                         }
-                        catch (OperationCanceledException) { throw; }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
                         catch (Exception ex)
                         {
-                            Log($"  Radio bounce exception: {ex.Message}");
+                            Log($"ConnectDeviceAsync exception: {ex.Message}");
+                            return false;
                         }
-                        finally
-                        {
-                            IsRadioBounceInProgress = false;
-                            // Raise AdapterStateChanged with the verified current state so Form1 restores
-                            // labelStatus from "Reconnecting..." to "Enabled" and updates the toggle switch.
-                            try
-                            {
-                                bool? finalState = (_bluetoothRadio != null) ? (_bluetoothRadio.State == RadioState.On) : (bool?)null;
-                                AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(finalState));
-                            }
-                            catch { }
-                        }
-
-                        Log($"  ConnectDeviceAsync failed for '{targetDeviceName}' after all 6 steps.");
-                        return false;
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"ConnectDeviceAsync exception: {ex.Message}");
-                        return false;
-                    }
-                }, ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                Log($"ConnectDeviceAsync cancelled for {address:X12}");
-                return false;
-            }
-            finally
-            {
-                _connectSemaphore.Release();
+                    }, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    Log($"ConnectDeviceAsync cancelled for {address:X12}");
+                    return false;
+                }
+                finally
+                {
+                    _connectSemaphore.Release();
+                }
             }
         }
 
@@ -1453,118 +1505,123 @@ namespace bluetooth_turnon
         public async Task<bool> DisconnectDeviceAsync(ulong address, CancellationToken ct = default)
         {
             Log($"DisconnectDeviceAsync called for {address:X12}");
-            await _connectSemaphore.WaitAsync(ct).ConfigureAwait(false);
-            try
+
+            using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _deviceOpCts.Token))
             {
-                return await Task.Run(async () =>
+                var token = linkedCts.Token;
+                await _connectSemaphore.WaitAsync(token).ConfigureAwait(false);
+                try
                 {
-                    try
+                    return await Task.Run(async () =>
                     {
-                        string targetName;
-                        bool disconnected = false;
-
-                        using (var client = new InTheHand.Net.Sockets.BluetoothClient())
+                        try
                         {
-                            var paired = client.PairedDevices;
-                            var device = paired?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
-                            if (device == null)
-                            {
-                                Log($"  DisconnectDeviceAsync: device {address:X12} not found in PairedDevices");
-                                return false;
-                            }
+                            string targetName;
+                            bool disconnected = false;
 
-                            targetName = device.DeviceName;
-
-                            // Step 1: Refresh device state before acting
-                            device.Refresh();
-                            Log($"  device.Refresh() called for '{targetName}', Connected={device.Connected}");
-                            if (!device.Connected)
+                            using (var client = new InTheHand.Net.Sockets.BluetoothClient())
                             {
-                                Log($"  '{targetName}' is already disconnected.");
-                                return true;
-                            }
-
-                            // Step 2: Core Audio disconnect (best-effort for audio endpoints)
-                            try
-                            {
-                                bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, targetName, connect: false);
-                                Log($"  CoreAudio disconnect triggered: {coreAudioTriggered}");
-                            }
-                            catch (Exception ex)
-                            {
-                                Log($"  CoreAudio disconnect note: {ex.Message}");
-                            }
-
-                            // Step 3: Native Bluetooth Port Driver ACL Link Disconnect (IOCTL_BTH_DISCONNECT_DEVICE)
-                            // Instructs bthport.sys to cleanly teardown the baseband ACL connection without disabling
-                            // or unbinding the device's PnP profile drivers (AudioSink, Handsfree, Headset, HID) in the registry.
-                            try
-                            {
-                                bool ioctlSuccess = DisconnectDeviceViaIoctl(address);
-                                Log($"  Native IOCTL_BTH_DISCONNECT_DEVICE called for {address:X12}: {ioctlSuccess}");
-                            }
-                            catch (Exception ex)
-                            {
-                                Log($"  Native IOCTL disconnect note: {ex.Message}");
-                            }
-
-                            // Step 4: Extended Polling Window (5 x 800ms = 4s total)
-                            for (int attempt = 1; attempt <= 5; attempt++)
-                            {
-                                try
+                                var paired = client.PairedDevices;
+                                var device = paired?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
+                                if (device == null)
                                 {
-                                    await Task.Delay(800, ct).ConfigureAwait(false);
+                                    Log($"  DisconnectDeviceAsync: device {address:X12} not found in PairedDevices");
+                                    return false;
                                 }
-                                catch (OperationCanceledException) { throw; }
 
+                                targetName = device.DeviceName;
+
+                                // Step 1: Refresh device state before acting
+                                device.Refresh();
+                                Log($"  device.Refresh() called for '{targetName}', Connected={device.Connected}");
+                                if (!device.Connected)
+                                {
+                                    Log($"  '{targetName}' is already disconnected.");
+                                    return true;
+                                }
+
+                                // Step 2: Core Audio disconnect (best-effort for audio endpoints)
                                 try
                                 {
-                                    device.Refresh();
-                                    Log($"  Disconnection verify attempt {attempt}/5: Connected={device.Connected}");
-                                    if (!device.Connected)
-                                    {
-                                        disconnected = true;
-                                        break;
-                                    }
+                                    bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, targetName, connect: false);
+                                    Log($"  CoreAudio disconnect triggered: {coreAudioTriggered}");
                                 }
                                 catch (Exception ex)
                                 {
-                                    Log($"  Disconnection verify attempt {attempt} exception: {ex.Message}");
+                                    Log($"  CoreAudio disconnect note: {ex.Message}");
+                                }
+
+                                // Step 3: Native Bluetooth Port Driver ACL Link Disconnect (IOCTL_BTH_DISCONNECT_DEVICE)
+                                // Instructs bthport.sys to cleanly teardown the baseband ACL connection without disabling
+                                // or unbinding the device's PnP profile drivers (AudioSink, Handsfree, Headset, HID) in the registry.
+                                try
+                                {
+                                    bool ioctlSuccess = DisconnectDeviceViaIoctl(address);
+                                    Log($"  Native IOCTL_BTH_DISCONNECT_DEVICE called for {address:X12}: {ioctlSuccess}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Log($"  Native IOCTL disconnect note: {ex.Message}");
+                                }
+
+                                // Step 4: Extended Polling Window (5 x 800ms = 4s total)
+                                for (int attempt = 1; attempt <= 5; attempt++)
+                                {
+                                    try
+                                    {
+                                        await Task.Delay(800, token).ConfigureAwait(false);
+                                    }
+                                    catch (OperationCanceledException) { throw; }
+
+                                    try
+                                    {
+                                        device.Refresh();
+                                        Log($"  Disconnection verify attempt {attempt}/5: Connected={device.Connected}");
+                                        if (!device.Connected)
+                                        {
+                                            disconnected = true;
+                                            break;
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Log($"  Disconnection verify attempt {attempt} exception: {ex.Message}");
+                                    }
+                                }
+
+                                bool isConnectedNow = false;
+                                try { isConnectedNow = device.Connected; } catch { }
+
+                                if (disconnected || !isConnectedNow)
+                                {
+                                    Log($"  '{targetName}' disconnected successfully without disabling profile drivers.");
+                                    return true;
                                 }
                             }
 
-                            bool isConnectedNow = false;
-                            try { isConnectedNow = device.Connected; } catch { }
-
-                            if (disconnected || !isConnectedNow)
-                            {
-                                Log($"  '{targetName}' disconnected successfully without disabling profile drivers.");
-                                return true;
-                            }
+                            Log($"  DisconnectDeviceAsync failed for '{targetName}'.");
+                            return false;
                         }
-
-                        Log($"  DisconnectDeviceAsync failed for '{targetName}'.");
-                        return false;
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"DisconnectDeviceAsync exception: {ex.Message}");
-                        return false;
-                    }
-                }, ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                Log($"DisconnectDeviceAsync cancelled for {address:X12}");
-                return false;
-            }
-            finally
-            {
-                _connectSemaphore.Release();
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"DisconnectDeviceAsync exception: {ex.Message}");
+                            return false;
+                        }
+                    }, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    Log($"DisconnectDeviceAsync cancelled for {address:X12}");
+                    return false;
+                }
+                finally
+                {
+                    _connectSemaphore.Release();
+                }
             }
         }
 
@@ -2573,6 +2630,7 @@ namespace bluetooth_turnon
                 _activeBatteryRetries.Clear();
             }
 
+            try { _deviceOpCts?.Cancel(); _deviceOpCts?.Dispose(); } catch { }
             try { _radioInitSemaphore.Dispose(); } catch { }
             try { _adapterToggleSemaphore.Dispose(); } catch { }
             try { _connectSemaphore.Dispose(); } catch { }
