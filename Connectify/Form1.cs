@@ -12,14 +12,18 @@ namespace bluetooth_turnon
     {
         private readonly BluetoothManager _bluetoothManager;
         private bool _isUpdatingUiFromState;
-        private bool _isRefreshingDevices; // guard against overlapping watcher-triggered refreshes
+        // THREAD SAFETY: _isRefreshingDevices and _refreshPending must ONLY be accessed on the UI thread.
+        // Access is marshaled via SafeBeginInvokeAsync to prevent cross-thread race conditions.
+        private bool _isRefreshingDevices;
         private bool _refreshPending;
-        private readonly HashSet<ulong> _connectingAddresses = new HashSet<ulong>();
+        private readonly Dictionary<ulong, bool> _connectingAddresses = new Dictionary<ulong, bool>();
         private readonly System.Threading.CancellationTokenSource _cts = new System.Threading.CancellationTokenSource();
 
         private NotifyIcon _trayIcon;
         private ContextMenuStrip _trayMenu;
         private Timer _refreshTimer;
+        private Timer _hoverDebounceTimer;
+        private IReadOnlyList<DeviceInfo> _pendingDevices;
 
         public bool StartMinimized { get; set; }
 
@@ -56,6 +60,65 @@ namespace bluetooth_turnon
             }
             catch (ObjectDisposedException) { }
             catch (InvalidOperationException) { }
+        }
+
+        /// <summary>
+        /// Marshals an async function to the UI thread safely.
+        /// Returns a Task representing the completion of the operation.
+        /// Catches and logs exceptions, and guards against ObjectDisposedException/InvalidOperationException.
+        /// Prevents async void lambda exceptions from escaping to the SynchronizationContext.
+        /// </summary>
+        private Task SafeBeginInvokeAsync(Func<Task> asyncFunc)
+        {
+            if (asyncFunc == null || IsDisposed || !IsHandleCreated)
+                return Task.CompletedTask;
+
+            var tcs = new TaskCompletionSource<bool>();
+
+            Action wrappedAction = async () =>
+            {
+                try
+                {
+                    if (IsDisposed)
+                    {
+                        tcs.TrySetCanceled();
+                        return;
+                    }
+                    await asyncFunc().ConfigureAwait(true);
+                    tcs.TrySetResult(true);
+                }
+                catch (OperationCanceledException)
+                {
+                    tcs.TrySetCanceled();
+                }
+                catch (Exception ex)
+                {
+                    _bluetoothManager?.Log($"SafeBeginInvokeAsync exception: {ex.Message}");
+                    tcs.TrySetException(ex);
+                }
+            };
+
+            try
+            {
+                if (InvokeRequired)
+                {
+                    BeginInvoke(wrappedAction);
+                }
+                else
+                {
+                    wrappedAction();
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                tcs.TrySetCanceled();
+            }
+            catch (InvalidOperationException)
+            {
+                tcs.TrySetCanceled();
+            }
+
+            return tcs.Task;
         }
 
         private void SetStartup(bool enable)
@@ -107,7 +170,13 @@ namespace bluetooth_turnon
             {
                 string path = Path.Combine(assetsDir, fileName);
                 if (System.IO.File.Exists(path))
-                    img = Image.FromStream(new MemoryStream(System.IO.File.ReadAllBytes(path)));
+                {
+                    using (var stream = new MemoryStream(System.IO.File.ReadAllBytes(path)))
+                    using (var temp = Image.FromStream(stream))
+                    {
+                        img = new Bitmap(temp);
+                    }
+                }
                 _iconCache[fileName] = img;
             }
             return img;
@@ -129,6 +198,7 @@ namespace bluetooth_turnon
             _bluetoothManager = new BluetoothManager();
             _bluetoothManager.AdapterStateChanged    += BluetoothManager_AdapterStateChanged;
             _bluetoothManager.DeviceConnectionChanged += OnDeviceConnectionChanged;
+            _bluetoothManager.OperationProgressChanged += BluetoothManager_OperationProgressChanged;
             this.FormClosing += main_FormClosing;
         }
 
@@ -180,8 +250,32 @@ namespace bluetooth_turnon
             // Setup Refresh Timer
             _refreshTimer = new Timer();
             _refreshTimer.Interval = 60000; // 60 seconds
-            _refreshTimer.Tick += async (s, ev) => await RefreshDevicesIfIdleAsync();
+            _refreshTimer.Tick += async (s, ev) =>
+            {
+                try
+                {
+                    await RefreshDevicesIfIdleAsync();
+                }
+                catch (Exception ex)
+                {
+                    _bluetoothManager?.Log($"Refresh timer exception: {ex.Message}");
+                }
+            };
             _refreshTimer.Start();
+
+            // Setup Hover Debounce Timer (avoids flickering / card rebuilds during active hover)
+            _hoverDebounceTimer = new Timer();
+            _hoverDebounceTimer.Interval = 2000; // 2 seconds max deferral while mouse hovers over cards
+            _hoverDebounceTimer.Tick += (s, ev) =>
+            {
+                _hoverDebounceTimer.Stop();
+                if (_pendingDevices != null)
+                {
+                    var pending = _pendingDevices;
+                    _pendingDevices = null;
+                    BuildDeviceCards(pending, force: true);
+                }
+            };
 
             // Force center the title — labels live inside panelHeader, so use its width
             labelBluetooth.Left = 0;
@@ -207,7 +301,7 @@ namespace bluetooth_turnon
             labelFooter.Text = "Connectify  v2.0";
 
             // Show empty state immediately so something is visible while BT queries run
-            BuildDeviceCards(new List<DeviceInfo>());
+            BuildDeviceCards(new List<DeviceInfo>(), force: true);
 
             // Detect actual Bluetooth adapter state on form load (Rule B-2)
             await RefreshAdapterStateAsync();
@@ -239,6 +333,15 @@ namespace bluetooth_turnon
                 return;
             }
 
+            // If a controlled radio bounce is in progress, show "Reconnecting..." in the header
+            // and preserve existing device cards to avoid flickering during the brief 500ms cycle
+            if (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)
+            {
+                labelStatus.Text = "Reconnecting...";
+                labelStatus.ForeColor = Color.FromArgb(255, 200, 100);
+                return;
+            }
+
             _isUpdatingUiFromState = true;
             try
             {
@@ -258,7 +361,7 @@ namespace bluetooth_turnon
                     on_off.Value = false;
                     _bluetoothManager.StopDeviceWatcher();
                     // Clear device list immediately when adapter is off
-                    BuildDeviceCards(new List<DeviceInfo>());
+                    BuildDeviceCards(new List<DeviceInfo>(), force: true);
                 }
                 else
                 {
@@ -267,13 +370,23 @@ namespace bluetooth_turnon
                     on_off.Enabled = false;
                     on_off.Value = false;
                     _bluetoothManager.StopDeviceWatcher();
-                    BuildDeviceCards(new List<DeviceInfo>());
+                    BuildDeviceCards(new List<DeviceInfo>(), force: true);
                 }
             }
             finally
             {
                 _isUpdatingUiFromState = false;
             }
+        }
+
+        private void BluetoothManager_OperationProgressChanged(object sender, DeviceOperationProgressEventArgs e)
+        {
+            SafeBeginInvoke(() =>
+            {
+                labelStatus.Text = "Reconnecting...";
+                labelStatus.ForeColor = Color.FromArgb(255, 200, 100);
+                UpdateOperationFeedback(e.Address, e.StatusMessage, Color.FromArgb(255, 190, 50), null);
+            });
         }
 
         private void BluetoothManager_AdapterStateChanged(object sender, AdapterStateChangedEventArgs e)
@@ -308,22 +421,22 @@ namespace bluetooth_turnon
 
         /// <summary>
         /// Called by DeviceWatcher (background thread) whenever a Bluetooth device
-        /// connects or disconnects. Guards against overlapping concurrent refreshes.
+        /// connects or disconnects. Marshals to UI thread via SafeBeginInvokeAsync to safely
+        /// access _isRefreshingDevices and _refreshPending without threading races.
         /// </summary>
         private void OnDeviceConnectionChanged(object sender, EventArgs e)
         {
-            SafeBeginInvoke(async () =>
-            {
-                try
-                {
-                    await RefreshDevicesIfIdleAsync();
-                }
-                catch { }
-            });
+            SafeBeginInvokeAsync(RefreshDevicesIfIdleAsync);
         }
 
+        /// <summary>
+        /// Requests a device refresh if no refresh is currently running; otherwise queues a pending refresh.
+        /// THREAD SAFETY: Must ONLY be called on the UI thread to guard _isRefreshingDevices / _refreshPending.
+        /// </summary>
         private async Task RefreshDevicesIfIdleAsync()
         {
+            if (this.IsDisposed || !this.IsHandleCreated || _cts.IsCancellationRequested) return;
+
             if (_isRefreshingDevices)
             {
                 _refreshPending = true;
@@ -332,8 +445,14 @@ namespace bluetooth_turnon
             await RefreshDevicesAsync();
         }
 
+        /// <summary>
+        /// Queries paired devices and rebuilds cards in a coalescing loop.
+        /// THREAD SAFETY: Must ONLY be called on the UI thread to guard _isRefreshingDevices / _refreshPending.
+        /// </summary>
         private async Task RefreshDevicesAsync()
         {
+            if (this.IsDisposed || !this.IsHandleCreated || _cts.IsCancellationRequested) return;
+
             if (_isRefreshingDevices)
             {
                 _refreshPending = true;
@@ -349,13 +468,23 @@ namespace bluetooth_turnon
                     try
                     {
                         var devices = await _bluetoothManager.GetPairedDevicesAsync(_cts.Token);
-                        BuildDeviceCards(devices);
+                        if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
+                        {
+                            BuildDeviceCards(devices);
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
                     }
                     catch
                     {
-                        BuildDeviceCards(new List<DeviceInfo>());
+                        if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
+                        {
+                            BuildDeviceCards(new List<DeviceInfo>());
+                        }
                     }
-                } while (_refreshPending && !_cts.IsCancellationRequested);
+                } while (_refreshPending && !_cts.IsCancellationRequested && !this.IsDisposed);
             }
             finally
             {
@@ -364,16 +493,76 @@ namespace bluetooth_turnon
         }
 
         /// <summary>
-        /// Clears panelDeviceList and rebuilds one card per device.
-        /// Must be called from the UI thread (or will marshal via InvokeRequired).
+        /// Updates operation feedback text and color safely on typeLabel.
+        /// If originalLabel was disposed during a mid-flight card rebuild, locates the new card's typeLabel.
         /// </summary>
-        private void BuildDeviceCards(IReadOnlyList<DeviceInfo> devices)
+        private void UpdateOperationFeedback(ulong address, string text, Color color, Label originalLabel)
         {
-            if (InvokeRequired)
+            if (this.IsDisposed || !this.IsHandleCreated) return;
+
+            if (originalLabel != null && !originalLabel.IsDisposed)
             {
-                SafeBeginInvoke(() => BuildDeviceCards(devices));
+                originalLabel.Text = text;
+                originalLabel.ForeColor = color;
                 return;
             }
+
+            // Fallback: If original card/label was disposed during a rebuild, locate the newly created card for this address
+            if (panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed)
+            {
+                foreach (Control ctrl in panelDeviceList.Controls)
+                {
+                    if (ctrl is Panel p && !p.IsDisposed && p.Tag is ulong cardAddr && cardAddr == address)
+                    {
+                        foreach (Control child in p.Controls)
+                        {
+                            if (child is Label lbl && lbl.Name == "typeLabel" && !lbl.IsDisposed)
+                            {
+                                lbl.Text = text;
+                                lbl.ForeColor = color;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Clears panelDeviceList and rebuilds one card per device.
+        /// Must be called from the UI thread (or will marshal via InvokeRequired).
+        /// When force is false, defers/debounces rebuilds if the user is currently hovering over cards.
+        /// </summary>
+        private void BuildDeviceCards(IReadOnlyList<DeviceInfo> devices, bool force = false)
+        {
+            if (this.IsDisposed || !this.IsHandleCreated) return;
+
+            if (InvokeRequired)
+            {
+                SafeBeginInvoke(() => BuildDeviceCards(devices, force));
+                return;
+            }
+
+            if (this.IsDisposed || !this.IsHandleCreated) return;
+
+            // Suppress background rebuilds while user is actively hovering over cards to prevent flickering and missed clicks (Bug 9)
+            if (!force && panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed)
+            {
+                Point cursorInList = panelDeviceList.PointToClient(Cursor.Position);
+                if (panelDeviceList.ClientRectangle.Contains(cursorInList))
+                {
+                    _pendingDevices = devices;
+                    if (_hoverDebounceTimer != null && !_hoverDebounceTimer.Enabled)
+                    {
+                        _hoverDebounceTimer.Start();
+                    }
+                    return;
+                }
+            }
+
+            // If we are rebuilding now, stop any pending debounce timer
+            _hoverDebounceTimer?.Stop();
+            _pendingDevices = null;
 
             // Dispose existing child controls and clear
             foreach (Control ctrl in panelDeviceList.Controls)
@@ -399,6 +588,9 @@ namespace bluetooth_turnon
 
             int cardHeight = 72;
             int y = 0;
+            Point currentCursorInList = panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed
+                ? panelDeviceList.PointToClient(Cursor.Position)
+                : new Point(-1, -1);
 
             for (int i = 0; i < devices.Count; i++)
             {
@@ -407,10 +599,16 @@ namespace bluetooth_turnon
                 Color baseBgColor = isOdd ? RowColorOdd : RowColorEven;
                 Color hoverBgColor = Color.FromArgb(baseBgColor.R + 10, baseBgColor.G + 10, baseBgColor.B + 15);
 
+                // Preserve hover state if mouse is currently over this card's bounds (Bug 9)
+                var cardRect = new Rectangle(0, y, panelDeviceList.Width, cardHeight);
+                bool isHovered = cardRect.Contains(currentCursorInList);
+                Color initialBgColor = isHovered ? hoverBgColor : baseBgColor;
+
                 // Card panel
                 var card = new Panel
                 {
-                    BackColor = baseBgColor,
+                    Tag = device.Address,
+                    BackColor = initialBgColor,
                     Location = new Point(0, y),
                     Size = new Size(panelDeviceList.Width, cardHeight),
                     Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top,
@@ -428,7 +626,7 @@ namespace bluetooth_turnon
                 // Outer circle (drawn on a Panel via Paint)
                 var iconPanel = new Panel
                 {
-                    BackColor = baseBgColor,
+                    BackColor = initialBgColor,
                     Location  = new Point(14, 12),
                     Size      = new Size(48, 48),
                     Cursor    = Cursors.Hand
@@ -491,14 +689,21 @@ namespace bluetooth_turnon
                 // ── Device type subtitle ────────────────────────────────────────
                 string typeText = GetDeviceTypeLabel(device.DeviceType);
                 Color  typeColor = device.IsConnected ? Color.FromArgb(120, capturedAccent.R, capturedAccent.G, capturedAccent.B) : Color.FromArgb(100, 100, 110);
-                if (_connectingAddresses.Contains(device.Address))
+                bool isOpInFlight;
+                bool isConnectingOp = false;
+                lock (_connectingAddresses)
                 {
-                    typeText = device.IsConnected ? "Disconnecting..." : "Connecting...";
+                    isOpInFlight = _connectingAddresses.TryGetValue(device.Address, out isConnectingOp);
+                }
+                if (isOpInFlight)
+                {
+                    typeText = isConnectingOp ? "Connecting..." : "Disconnecting...";
                     typeColor = Color.FromArgb(255, 190, 50); // Amber
                 }
 
                 var typeLabel = new Label
                 {
+                    Name = "typeLabel",
                     Text      = typeText,
                     ForeColor = typeColor,
                     Font      = CardTypeFont,
@@ -551,65 +756,115 @@ namespace bluetooth_turnon
 
                 // ── Interactivity (Hover & Click) ──────────────────────────────
                 EventHandler onEnter = (s, e) => { card.BackColor = hoverBgColor; iconPanel.BackColor = hoverBgColor; };
-                EventHandler onLeave = (s, e) => { card.BackColor = baseBgColor; iconPanel.BackColor = baseBgColor; };
+                EventHandler onLeave = (s, e) => 
+                {
+                    Point pt = card.PointToClient(Cursor.Position);
+                    if (!card.ClientRectangle.Contains(pt))
+                    {
+                        card.BackColor = baseBgColor;
+                        iconPanel.BackColor = baseBgColor;
+
+                        // If mouse has exited the device list and an update is pending, apply it now
+                        if (panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed)
+                        {
+                            Point ptList = panelDeviceList.PointToClient(Cursor.Position);
+                            if (!panelDeviceList.ClientRectangle.Contains(ptList) && _pendingDevices != null)
+                            {
+                                var pending = _pendingDevices;
+                                _pendingDevices = null;
+                                _hoverDebounceTimer?.Stop();
+                                BuildDeviceCards(pending, force: true);
+                            }
+                        }
+                    }
+                };
 
                 EventHandler onClick = async (s, e) => 
                 {
-                    ulong addr = device.Address;
-                    if (!_connectingAddresses.Add(addr))
-                    {
-                        // Ignore duplicate clicks while operation is already in flight
+                    if (this.IsDisposed || !this.IsHandleCreated || card.IsDisposed)
                         return;
+
+                    ulong addr = device.Address;
+                    bool isConnecting = !device.IsConnected;
+                    _bluetoothManager?.Log($"User clicked device '{device.Name}' ({addr:X12}), requestedAction={(isConnecting ? "Connect" : "Disconnect")}");
+
+                    lock (_connectingAddresses)
+                    {
+                        if (_connectingAddresses.ContainsKey(addr))
+                        {
+                            // Ignore duplicate clicks while operation is already in flight
+                            return;
+                        }
+                        _connectingAddresses[addr] = isConnecting;
                     }
 
-                    bool isConnecting = !device.IsConnected;
                     try
                     {
-                        // Visual feedback
-                        if (!typeLabel.IsDisposed)
+                        // Fix Bug 7: Re-query fresh device state before deciding connect vs disconnect
+                        // to avoid acting on stale captured state if connection status changed.
+                        bool? freshConnected = await _bluetoothManager.IsDeviceConnectedAsync(addr, _cts.Token);
+                        if (freshConnected.HasValue)
                         {
-                            typeLabel.Text = isConnecting ? "Connecting..." : "Disconnecting...";
-                            typeLabel.ForeColor = Color.FromArgb(255, 190, 50); // Amber
+                            isConnecting = !freshConnected.Value;
+                            lock (_connectingAddresses)
+                            {
+                                if (_connectingAddresses.ContainsKey(addr))
+                                    _connectingAddresses[addr] = isConnecting;
+                            }
                         }
+
+                        // Check if controls or form were disposed while awaiting IsDeviceConnectedAsync
+                        if (this.IsDisposed || !this.IsHandleCreated) return;
+
+                        // Visual feedback
+                        UpdateOperationFeedback(addr, isConnecting ? "Connecting..." : "Disconnecting...", Color.FromArgb(255, 190, 50), typeLabel);
 
                         bool success;
                         if (isConnecting)
                         {
-                            success = await _bluetoothManager.ConnectDeviceAsync(addr);
+                            success = await _bluetoothManager.ConnectDeviceAsync(addr, _cts.Token);
                         }
                         else
                         {
-                            success = await _bluetoothManager.DisconnectDeviceAsync(addr);
+                            success = await _bluetoothManager.DisconnectDeviceAsync(addr, _cts.Token);
                         }
+
+                        if (this.IsDisposed || !this.IsHandleCreated) return;
 
                         if (!success)
                         {
-                            if (!typeLabel.IsDisposed)
-                            {
-                                typeLabel.Text = isConnecting ? "Connection failed" : "Disconnect failed";
-                                typeLabel.ForeColor = Color.FromArgb(230, 80, 80); // Red
-                            }
-                            await Task.Delay(1500);
+                            UpdateOperationFeedback(addr, isConnecting ? "Connection failed" : "Disconnect failed", Color.FromArgb(230, 80, 80), typeLabel);
+                            try { await Task.Delay(1500, _cts.Token); } catch { }
                         }
                         else
                         {
                             // Allow UI to show feedback briefly before refreshing
-                            await Task.Delay(200);
+                            try { await Task.Delay(200, _cts.Token); } catch { }
                         }
                     }
-                    catch
+                    catch (OperationCanceledException)
                     {
-                        if (!typeLabel.IsDisposed)
+                        // Form is closing or operation cancelled
+                    }
+                    catch (Exception ex)
+                    {
+                        _bluetoothManager?.Log($"Device click exception for {addr:X12}: {ex.Message}");
+                        if (!this.IsDisposed && this.IsHandleCreated)
                         {
-                            typeLabel.Text = isConnecting ? "Connection failed" : "Disconnect failed";
-                            typeLabel.ForeColor = Color.FromArgb(230, 80, 80); // Red
+                            UpdateOperationFeedback(addr, isConnecting ? "Connection failed" : "Disconnect failed", Color.FromArgb(230, 80, 80), typeLabel);
+                            try { await Task.Delay(1500, _cts.Token); } catch { }
                         }
-                        await Task.Delay(1500);
                     }
                     finally
                     {
-                        _connectingAddresses.Remove(addr);
-                        await RefreshDevicesIfIdleAsync();
+                        lock (_connectingAddresses)
+                        {
+                            _connectingAddresses.Remove(addr);
+                        }
+                        if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
+                        {
+                            await RefreshDevicesIfIdleAsync();
+                        }
                     }
                 };
 
@@ -745,10 +1000,17 @@ namespace bluetooth_turnon
                 _refreshTimer.Dispose();
             }
 
+            if (_hoverDebounceTimer != null)
+            {
+                _hoverDebounceTimer.Stop();
+                _hoverDebounceTimer.Dispose();
+            }
+
             if (_bluetoothManager != null)
             {
                 _bluetoothManager.AdapterStateChanged    -= BluetoothManager_AdapterStateChanged;
                 _bluetoothManager.DeviceConnectionChanged -= OnDeviceConnectionChanged;
+                _bluetoothManager.OperationProgressChanged -= BluetoothManager_OperationProgressChanged;
                 _bluetoothManager.Dispose(); // Dispose also calls StopDeviceWatcher
             }
 
@@ -757,6 +1019,12 @@ namespace bluetooth_turnon
                 _trayIcon.Visible = false;
                 _trayIcon.Dispose();
             }
+
+            foreach (var cached in _iconCache.Values)
+            {
+                try { cached?.Dispose(); } catch { }
+            }
+            _iconCache.Clear();
         }
     }
 }
