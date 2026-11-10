@@ -1198,11 +1198,52 @@ namespace bluetooth_turnon
                         {
                             bool offSuccess = await SetAdapterStateAsync(false, ct).ConfigureAwait(false);
                             Log($"  Radio bounce: adapter turned off (success={offSuccess})");
+                            if (!offSuccess)
+                            {
+                                Log("  Radio bounce: SetAdapterStateAsync(false) failed, aborting radio bounce.");
+                                return false;
+                            }
 
-                            await Task.Delay(500, ct).ConfigureAwait(false);
+                            // Wait 1000ms for USB/PCIe hardware power-down transition
+                            await Task.Delay(1000, ct).ConfigureAwait(false);
 
-                            bool onSuccess = await SetAdapterStateAsync(true, ct).ConfigureAwait(false);
-                            Log($"  Radio bounce: adapter turned on (success={onSuccess})");
+                            // Retry loop to ensure adapter successfully powers back on
+                            bool onSuccess = false;
+                            for (int onAttempt = 1; onAttempt <= 3; onAttempt++)
+                            {
+                                onSuccess = await SetAdapterStateAsync(true, ct).ConfigureAwait(false);
+                                Log($"  Radio bounce: adapter turned on attempt {onAttempt}/3 (success={onSuccess})");
+                                if (onSuccess) break;
+                                await Task.Delay(1000 * onAttempt, ct).ConfigureAwait(false);
+                            }
+
+                            if (!onSuccess)
+                            {
+                                Log("  Radio bounce: standard SetAdapterStateAsync(true) failed after 3 attempts. Attempting forced radio refresh...");
+                                var freshRadio = await GetBluetoothRadioAsync(ct, forceRefresh: true).ConfigureAwait(false);
+                                if (freshRadio != null)
+                                {
+                                    try
+                                    {
+                                        var res = await freshRadio.SetStateAsync(RadioState.On).AsTask(ct).ConfigureAwait(false);
+                                        onSuccess = (res == RadioAccessStatus.Allowed);
+                                        Log($"  Radio bounce: direct SetStateAsync(On) returned {res}, success={onSuccess}");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Log($"  Radio bounce: direct SetStateAsync(On) exception: {ex.Message}");
+                                    }
+                                }
+                            }
+
+                            if (!onSuccess && (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On))
+                            {
+                                Log("  Radio bounce: CRITICAL — could not restore Bluetooth adapter power! Aborting polling.");
+                                return false;
+                            }
+
+                            // Allow 1.5s for Windows Bluetooth stack & PnP to re-enumerate
+                            await Task.Delay(1500, ct).ConfigureAwait(false);
 
                             // Poll device.Connected up to 8 times at 1-second intervals (8 seconds total)
                             for (int attempt = 1; attempt <= 8; attempt++)
@@ -1244,6 +1285,14 @@ namespace bluetooth_turnon
                         finally
                         {
                             IsRadioBounceInProgress = false;
+                            // Raise AdapterStateChanged with the verified current state so Form1 restores
+                            // labelStatus from "Reconnecting..." to "Enabled" and updates the toggle switch.
+                            try
+                            {
+                                bool? finalState = (_bluetoothRadio != null) ? (_bluetoothRadio.State == RadioState.On) : (bool?)null;
+                                AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(finalState));
+                            }
+                            catch { }
                         }
 
                         Log($"  ConnectDeviceAsync failed for '{targetDeviceName}' after all 6 steps.");
@@ -1273,7 +1322,7 @@ namespace bluetooth_turnon
 
         /// <summary>
         /// Attempts to disconnect a paired Bluetooth device using Core Audio IKsControl disconnect,
-        /// clearing service states across supported profiles, WinRT ACL hint teardown, and controlled radio bounce as a last resort.
+        /// clearing service states across supported profiles, and WinRT ACL hint teardown.
         /// Guarded by _connectSemaphore.
         /// </summary>
         public async Task<bool> DisconnectDeviceAsync(ulong address, CancellationToken ct = default)
@@ -1395,68 +1444,14 @@ namespace bluetooth_turnon
                                 }
                             }
 
-                            if (disconnected || !device.Connected)
+                            bool isConnectedNow = false;
+                            try { isConnectedNow = device.Connected; } catch { }
+
+                            if (disconnected || !isConnectedNow)
                             {
                                 Log($"  '{targetName}' disconnected successfully via service disable.");
                                 return true;
                             }
-                        }
-
-                        // Step 5: Last resort — Controlled Radio Bounce (Fix 3A)
-                        Log($"  Device '{targetName}' remains connected after service disable. Initiating last resort: Controlled Radio Bounce...");
-                        IsRadioBounceInProgress = true;
-                        OperationProgressChanged?.Invoke(this, new DeviceOperationProgressEventArgs(address, "Reconnecting Bluetooth..."));
-                        try
-                        {
-                            bool offOk = await SetAdapterStateAsync(false, ct).ConfigureAwait(false);
-                            Log($"  Disconnect radio bounce: adapter turned off (success={offOk})");
-
-                            await Task.Delay(500, ct).ConfigureAwait(false);
-
-                            bool onOk = await SetAdapterStateAsync(true, ct).ConfigureAwait(false);
-                            Log($"  Disconnect radio bounce: adapter turned on (success={onOk})");
-
-                            // Verify device is disconnected after radio restart
-                            for (int attempt = 1; attempt <= 5; attempt++)
-                            {
-                                await Task.Delay(800, ct).ConfigureAwait(false);
-                                try
-                                {
-                                    using (var bounceClient = new InTheHand.Net.Sockets.BluetoothClient())
-                                    {
-                                        var bounceDevice = bounceClient.PairedDevices?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
-                                        if (bounceDevice != null)
-                                        {
-                                            bounceDevice.Refresh();
-                                            Log($"  Disconnect bounce verify attempt {attempt}/5: Connected={bounceDevice.Connected}");
-                                            if (!bounceDevice.Connected)
-                                            {
-                                                Log($"  '{bounceDevice.DeviceName}' disconnected successfully after radio bounce.");
-                                                return true;
-                                            }
-                                        }
-                                        else
-                                        {
-                                            Log($"  Disconnect bounce verify attempt {attempt}/5: device not found in PairedDevices (treated as disconnected).");
-                                            return true;
-                                        }
-                                    }
-                                }
-                                catch (OperationCanceledException) { throw; }
-                                catch (Exception ex)
-                                {
-                                    Log($"  Disconnect bounce verify attempt {attempt} exception: {ex.Message}");
-                                }
-                            }
-                        }
-                        catch (OperationCanceledException) { throw; }
-                        catch (Exception ex)
-                        {
-                            Log($"  Disconnect radio bounce exception: {ex.Message}");
-                        }
-                        finally
-                        {
-                            IsRadioBounceInProgress = false;
                         }
 
                         Log($"  DisconnectDeviceAsync failed for '{targetName}'.");

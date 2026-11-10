@@ -93,7 +93,7 @@ namespace bluetooth_turnon
                 }
                 catch (Exception ex)
                 {
-                    _bluetoothManager?.Log($"SafeBeginInvokeAsync exception: {ex.Message}");
+                    BluetoothManager.Log($"SafeBeginInvokeAsync exception: {ex.Message}");
                     tcs.TrySetException(ex);
                 }
             };
@@ -258,7 +258,7 @@ namespace bluetooth_turnon
                 }
                 catch (Exception ex)
                 {
-                    _bluetoothManager?.Log($"Refresh timer exception: {ex.Message}");
+                    BluetoothManager.Log($"Refresh timer exception: {ex.Message}");
                 }
             };
             _refreshTimer.Start();
@@ -396,7 +396,7 @@ namespace bluetooth_turnon
 
         private async void on_off_CheckedChanged(object sender, Bunifu.UI.WinForms.BunifuToggleSwitch.CheckedChangedEventArgs e)
         {
-            if (_isUpdatingUiFromState) return;
+            if (_isUpdatingUiFromState || (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)) return;
 
             bool targetState = e.Checked;
 
@@ -786,7 +786,7 @@ namespace bluetooth_turnon
 
                     ulong addr = device.Address;
                     bool isConnecting = !device.IsConnected;
-                    _bluetoothManager?.Log($"User clicked device '{device.Name}' ({addr:X12}), requestedAction={(isConnecting ? "Connect" : "Disconnect")}");
+                    BluetoothManager.Log($"User clicked device '{device.Name}' ({addr:X12}), requestedAction={(isConnecting ? "Connect" : "Disconnect")}");
 
                     lock (_connectingAddresses)
                     {
@@ -848,7 +848,7 @@ namespace bluetooth_turnon
                     }
                     catch (Exception ex)
                     {
-                        _bluetoothManager?.Log($"Device click exception for {addr:X12}: {ex.Message}");
+                        BluetoothManager.Log($"Device click exception for {addr:X12}: {ex.Message}");
                         if (!this.IsDisposed && this.IsHandleCreated)
                         {
                             UpdateOperationFeedback(addr, isConnecting ? "Connection failed" : "Disconnect failed", Color.FromArgb(230, 80, 80), typeLabel);
@@ -863,6 +863,7 @@ namespace bluetooth_turnon
                         }
                         if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
                         {
+                            await RefreshAdapterStateAsync();
                             await RefreshDevicesIfIdleAsync();
                         }
                     }
