@@ -1107,13 +1107,25 @@ namespace bluetooth_turnon
 
                                 if (coreAudioTriggered)
                                 {
-                                    // Brief 500ms delay in case CoreAudio instantly re-established the connection
-                                    await Task.Delay(500, ct).ConfigureAwait(false);
-                                    device.Refresh();
-                                    if (device.Connected)
+                                    Log($"  CoreAudio command sent. Polling connection status (5 attempts x 800ms = 4.0s max)...");
+                                    for (int caAttempt = 1; caAttempt <= 5; caAttempt++)
                                     {
-                                        Log($"  CoreAudio reconnected '{targetDeviceName}' immediately.");
-                                        return true;
+                                        await Task.Delay(800, ct).ConfigureAwait(false);
+                                        try
+                                        {
+                                            device.Refresh();
+                                            Log($"  CoreAudio reconnect verify attempt {caAttempt}/5: Connected={device.Connected}");
+                                            if (device.Connected)
+                                            {
+                                                Log($"  '{targetDeviceName}' reconnected successfully via CoreAudio on attempt {caAttempt}/5.");
+                                                return true;
+                                            }
+                                        }
+                                        catch (OperationCanceledException) { throw; }
+                                        catch (Exception ex)
+                                        {
+                                            Log($"  CoreAudio verify attempt {caAttempt} exception: {ex.Message}");
+                                        }
                                     }
                                 }
                             }
