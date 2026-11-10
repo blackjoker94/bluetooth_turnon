@@ -1412,7 +1412,7 @@ namespace bluetooth_turnon
                                                    deviceType == BluetoothDeviceType.Keyboard ||
                                                    deviceType == BluetoothDeviceType.Controller;
 
-                                Guid[] profilesToCycle = isHidDevice
+                                var candidateProfiles = isHidDevice
                                     ? new[] { InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice }
                                     : new[]
                                     {
@@ -1421,21 +1421,79 @@ namespace bluetooth_turnon
                                         InTheHand.Net.Bluetooth.BluetoothService.Headset
                                     };
 
-                                foreach (var profile in profilesToCycle)
+                                // Only cycle profiles that are actually installed/supported on this device
+                                var profilesToCycle = new List<Guid>();
+                                try
                                 {
-                                    token.ThrowIfCancellationRequested();
-                                    try { device.SetServiceState(profile, false); }
-                                    catch (Exception ex) { Log($"  SetServiceState({profile}, false) note: {ex.Message}"); }
+                                    var installed = device.InstalledServices;
+                                    if (installed != null && installed.Count > 0)
+                                    {
+                                        foreach (var cand in candidateProfiles)
+                                        {
+                                            if (installed.Contains(cand))
+                                            {
+                                                profilesToCycle.Add(cand);
+                                            }
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Log($"  Reading InstalledServices for '{targetDeviceName}' note: {ex.Message}");
                                 }
 
-                                await Task.Delay(200, token).ConfigureAwait(false);
-
-                                foreach (var profile in profilesToCycle)
+                                // Fallback if InstalledServices was empty or not populated
+                                if (profilesToCycle.Count == 0)
                                 {
-                                    token.ThrowIfCancellationRequested();
-                                    try { device.SetServiceState(profile, true); }
-                                    catch (Exception ex) { Log($"  SetServiceState({profile}, true) note: {ex.Message}"); }
+                                    profilesToCycle.Add(isHidDevice
+                                        ? InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice
+                                        : InTheHand.Net.Bluetooth.BluetoothService.AudioSink);
                                 }
+
+                                var disabledProfiles = new List<Guid>();
+                                try
+                                {
+                                    foreach (var profile in profilesToCycle)
+                                    {
+                                        if (token.IsCancellationRequested) break;
+                                        try
+                                        {
+                                            device.SetServiceState(profile, false);
+                                            disabledProfiles.Add(profile);
+                                            Log($"  SetServiceState({profile}, false) succeeded for '{targetDeviceName}'");
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Log($"  SetServiceState({profile}, false) note: {ex.Message}");
+                                        }
+                                    }
+
+                                    if (disabledProfiles.Count > 0)
+                                    {
+                                        await Task.Delay(200, token).ConfigureAwait(false);
+                                    }
+                                }
+                                finally
+                                {
+                                    // CRITICAL DRIVER HYGIENE: Always restore all disabled profile drivers to true,
+                                    // even if cancellation was requested (e.g. user toggled Bluetooth off or closed the app)
+                                    // or an exception occurred during the delay. Leaving profiles disabled permanently
+                                    // unbinds the PnP driver in the Windows registry.
+                                    foreach (var profile in disabledProfiles)
+                                    {
+                                        try
+                                        {
+                                            device.SetServiceState(profile, true);
+                                            Log($"  SetServiceState({profile}, true) restored for '{targetDeviceName}'");
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Log($"  SetServiceState({profile}, true) cleanup note: {ex.Message}");
+                                        }
+                                    }
+                                }
+
+                                token.ThrowIfCancellationRequested();
 
                                 // Step 5: Verify Actual Connection Status Before Returning
                                 // Initial delay of 1s after SetServiceState(true) before starting the poll loop,
