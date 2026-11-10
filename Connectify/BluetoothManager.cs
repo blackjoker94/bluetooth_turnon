@@ -49,7 +49,8 @@ namespace bluetooth_turnon
                 ctr = ct.Register(() =>
                 {
                     try { asyncOp.Cancel(); } catch { }
-                    tcs.TrySetCanceled();
+                    // Allow WinRT 500ms to invoke Completed gracefully; fallback to ensure caller is unblocked if WinRT hangs
+                    Task.Delay(500).ContinueWith(_ => tcs.TrySetCanceled());
                 });
             }
 
@@ -61,10 +62,16 @@ namespace bluetooth_turnon
                     case AsyncStatus.Completed:
                         T res = default;
                         try { res = info.GetResults(); } catch { }
-                        if (!tcs.TrySetResult(res))
+                        if (ct.IsCancellationRequested)
                         {
-                            // Task was already cancelled or faulted. The caller will never receive or dispose this object.
-                            // Immediately dispose it to prevent leaking unmanaged WinRT handles and keeping ACL/LE links open.
+                            // Cancellation was requested while the operation completed.
+                            // Immediately dispose the result so it doesn't leak or hold the ACL link open,
+                            // then signal cancellation on tcs.
+                            DisposeWinRtObject(res);
+                            tcs.TrySetCanceled();
+                        }
+                        else if (!tcs.TrySetResult(res))
+                        {
                             DisposeWinRtObject(res);
                         }
                         break;
@@ -72,7 +79,14 @@ namespace bluetooth_turnon
                         tcs.TrySetCanceled();
                         break;
                     case AsyncStatus.Error:
-                        tcs.TrySetException(info.ErrorCode ?? new Exception("WinRT error."));
+                        if (ct.IsCancellationRequested)
+                        {
+                            tcs.TrySetCanceled();
+                        }
+                        else
+                        {
+                            tcs.TrySetException(info.ErrorCode ?? new Exception("WinRT error."));
+                        }
                         break;
                 }
             };
@@ -104,7 +118,7 @@ namespace bluetooth_turnon
                 ctr = ct.Register(() =>
                 {
                     try { asyncAction.Cancel(); } catch { }
-                    tcs.TrySetCanceled();
+                    Task.Delay(500).ContinueWith(_ => tcs.TrySetCanceled());
                 });
             }
 
@@ -115,13 +129,27 @@ namespace bluetooth_turnon
                 {
                     case AsyncStatus.Completed:
                         try { info.GetResults(); } catch { }
-                        tcs.TrySetResult(true);
+                        if (ct.IsCancellationRequested)
+                        {
+                            tcs.TrySetCanceled();
+                        }
+                        else
+                        {
+                            tcs.TrySetResult(true);
+                        }
                         break;
                     case AsyncStatus.Canceled:
                         tcs.TrySetCanceled();
                         break;
                     case AsyncStatus.Error:
-                        tcs.TrySetException(info.ErrorCode ?? new Exception("WinRT error."));
+                        if (ct.IsCancellationRequested)
+                        {
+                            tcs.TrySetCanceled();
+                        }
+                        else
+                        {
+                            tcs.TrySetException(info.ErrorCode ?? new Exception("WinRT error."));
+                        }
                         break;
                 }
             };
@@ -1387,8 +1415,8 @@ namespace bluetooth_turnon
         }
 
         /// <summary>
-        /// Attempts to disconnect a paired Bluetooth device using Core Audio IKsControl disconnect,
-        /// native driver IOCTL baseband teardown (IOCTL_BTH_DISCONNECT_DEVICE), and WinRT ACL hint teardown.
+        /// Attempts to disconnect a paired Bluetooth device using Core Audio IKsControl disconnect
+        /// and native driver IOCTL baseband teardown (IOCTL_BTH_DISCONNECT_DEVICE).
         /// Preserves all Windows PnP profile drivers (AudioSink, Handsfree, Headset, HID) enabled in the registry
         /// so devices can seamlessly auto-reconnect on next power-on.
         /// Guarded by _connectSemaphore.
@@ -1451,28 +1479,7 @@ namespace bluetooth_turnon
                                 Log($"  Native IOCTL disconnect note: {ex.Message}");
                             }
 
-                            // Step 4: WinRT direct ACL drop hint
-                            try
-                            {
-                                Log($"  Attempting WinRT BluetoothDevice ACL drop hint for {address:X12}...");
-                                using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
-                                using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token))
-                                {
-                                    var winRtDevice = await Windows.Devices.Bluetooth.BluetoothDevice.FromBluetoothAddressAsync(address)
-                                        .AsTask(linkedCts.Token).ConfigureAwait(false);
-                                    if (winRtDevice != null)
-                                    {
-                                        Log($"  WinRT BluetoothDevice retrieved for '{winRtDevice.Name}', disposing to drop ACL link.");
-                                        winRtDevice.Dispose();
-                                    }
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Log($"  WinRT ACL drop hint note: {ex.Message}");
-                            }
-
-                            // Step 5: Extended Polling Window (5 x 800ms = 4s total)
+                            // Step 4: Extended Polling Window (5 x 800ms = 4s total)
                             for (int attempt = 1; attempt <= 5; attempt++)
                             {
                                 try
