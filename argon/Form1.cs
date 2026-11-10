@@ -12,13 +12,15 @@ namespace bluetooth_turnon
     {
         private readonly BluetoothManager _bluetoothManager;
         private bool _isUpdatingUiFromState;
+        private bool _isTogglingAdapter;
         // THREAD SAFETY: _isRefreshingDevices and _refreshPending must ONLY be accessed on the UI thread.
         // Access is marshaled via SafeBeginInvokeAsync to prevent cross-thread race conditions.
         private bool _isRefreshingDevices;
         private bool _refreshPending;
         private bool _forceRefreshPending;
-        private readonly Dictionary<ulong, string> _connectingAddresses = new Dictionary<ulong, string>();
+        private readonly Dictionary<ulong, (string Text, Color Color)> _connectingAddresses = new Dictionary<ulong, (string Text, Color Color)>();
         private readonly System.Threading.CancellationTokenSource _cts = new System.Threading.CancellationTokenSource();
+        private readonly object _deviceClickCtsLock = new object();
         private CancellationTokenSource _deviceClickCts = new CancellationTokenSource();
 
         private NotifyIcon _trayIcon;
@@ -27,7 +29,26 @@ namespace bluetooth_turnon
         private Timer _hoverDebounceTimer;
         private IReadOnlyList<DeviceInfo> _pendingDevices;
 
+        private readonly int _uiThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
+        private readonly SynchronizationContext _syncContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+
         public bool StartMinimized { get; set; }
+        private bool _isLoaded;
+
+        /// <summary>
+        /// Determines whether marshaling to the UI thread is required.
+        /// WinForms Control.InvokeRequired returns false on background threads when IsHandleCreated == false.
+        /// This method checks the thread ID against the main UI thread ID first, guaranteeing accurate
+        /// thread affinity detection even before the native window handle is created.
+        /// </summary>
+        private bool CheckInvokeRequired()
+        {
+            if (System.Threading.Thread.CurrentThread.ManagedThreadId != _uiThreadId)
+            {
+                return true;
+            }
+            return IsHandleCreated && InvokeRequired;
+        }
 
         protected override void SetVisibleCore(bool value)
         {
@@ -35,37 +56,65 @@ namespace bluetooth_turnon
             {
                 value = false;
                 CreateHandle();
+                if (!_isLoaded)
+                {
+                    main_Load(this, EventArgs.Empty);
+                }
             }
             base.SetVisibleCore(value);
         }
 
         /// <summary>
         /// Marshals an action to the UI thread safely.
-        /// Verifies IsHandleCreated and !IsDisposed before invoking to avoid handle exceptions.
+        /// Uses CheckInvokeRequired and SynchronizationContext fallback when IsHandleCreated is false.
         /// </summary>
         private void SafeBeginInvoke(Action action)
         {
-            if (action == null || IsDisposed || Disposing || !IsHandleCreated) return;
+            if (action == null || IsDisposed || Disposing) return;
 
             try
             {
-                if (InvokeRequired)
+                if (CheckInvokeRequired())
                 {
-                    BeginInvoke(new Action(() =>
+                    if (IsHandleCreated)
                     {
-                        try
+                        BeginInvoke(new Action(() =>
                         {
-                            if (!IsDisposed && !Disposing) action();
-                        }
-                        catch (Exception ex)
+                            try
+                            {
+                                if (!IsDisposed && !Disposing) action();
+                            }
+                            catch (Exception ex)
+                            {
+                                BluetoothManager.Log($"SafeBeginInvoke action exception: {ex.Message}");
+                            }
+                        }));
+                    }
+                    else
+                    {
+                        _syncContext.Post(_ =>
                         {
-                            BluetoothManager.Log($"SafeBeginInvoke action exception: {ex.Message}");
-                        }
-                    }));
+                            try
+                            {
+                                if (!IsDisposed && !Disposing) action();
+                            }
+                            catch (Exception ex)
+                            {
+                                BluetoothManager.Log($"SafeBeginInvoke syncContext action exception: {ex.Message}");
+                            }
+                        }, null);
+                    }
                 }
                 else
                 {
-                    action();
+                    try
+                    {
+                        if (!IsDisposed && !Disposing) action();
+                    }
+                    catch (Exception ex)
+                    {
+                        BluetoothManager.Log($"SafeBeginInvoke direct action exception: {ex.Message}");
+                    }
                 }
             }
             catch (ObjectDisposedException) { }
@@ -80,19 +129,10 @@ namespace bluetooth_turnon
         /// </summary>
         private Task SafeBeginInvokeAsync(Func<Task> asyncFunc)
         {
-            if (asyncFunc == null || IsDisposed || Disposing || !IsHandleCreated || _cts.IsCancellationRequested)
+            if (asyncFunc == null || IsDisposed || Disposing || _cts.IsCancellationRequested)
                 return Task.CompletedTask;
 
             var tcs = new TaskCompletionSource<bool>();
-
-            // Guard against unobserved task exceptions if the returned Task is not awaited by callers
-            tcs.Task.ContinueWith(t =>
-            {
-                if (t.IsFaulted)
-                {
-                    var _ = t.Exception;
-                }
-            }, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
 
             CancellationTokenRegistration ctsReg = default;
             if (!_cts.IsCancellationRequested)
@@ -113,7 +153,7 @@ namespace bluetooth_turnon
             {
                 try
                 {
-                    if (IsDisposed || Disposing || !IsHandleCreated || _cts.IsCancellationRequested)
+                    if (IsDisposed || Disposing || _cts.IsCancellationRequested)
                     {
                         tcs.TrySetCanceled();
                         return;
@@ -138,9 +178,16 @@ namespace bluetooth_turnon
 
             try
             {
-                if (InvokeRequired)
+                if (CheckInvokeRequired())
                 {
-                    BeginInvoke(wrappedAction);
+                    if (IsHandleCreated)
+                    {
+                        BeginInvoke(wrappedAction);
+                    }
+                    else
+                    {
+                        _syncContext.Post(_ => wrappedAction(), null);
+                    }
                 }
                 else
                 {
@@ -254,7 +301,7 @@ namespace bluetooth_turnon
         /// </summary>
         public void ShowAndActivate()
         {
-            if (InvokeRequired)
+            if (CheckInvokeRequired())
             {
                 SafeBeginInvoke(ShowAndActivate);
                 return;
@@ -269,8 +316,40 @@ namespace bluetooth_turnon
             BringToFront();
         }
 
+        private const int WM_DEVICECHANGE = 0x0219;
+
+        /// <summary>
+        /// Listens for Windows hardware device arrival/removal messages (WM_DEVICECHANGE).
+        /// When a USB Bluetooth dongle is plugged in or removed, immediately rechecks adapter state.
+        /// </summary>
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == WM_DEVICECHANGE && !_cts.IsCancellationRequested && !IsDisposed && IsHandleCreated)
+            {
+                SafeBeginInvoke(async () =>
+                {
+                    try
+                    {
+                        await RefreshAdapterStateAsync();
+                        if (labelStatus.Text != "No Adapter")
+                        {
+                            await RefreshDevicesIfIdleAsync();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        BluetoothManager.Log($"WM_DEVICECHANGE refresh exception: {ex.Message}");
+                    }
+                });
+            }
+        }
+
         private async void main_Load(object sender, EventArgs e)
         {
+            if (_isLoaded) return;
+            _isLoaded = true;
+
             try
             {
                 // Setup NotifyIcon
@@ -300,6 +379,10 @@ namespace bluetooth_turnon
                 {
                     try
                     {
+                        if (labelStatus.Text == "No Adapter")
+                        {
+                            await RefreshAdapterStateAsync();
+                        }
                         await RefreshDevicesIfIdleAsync();
                     }
                     catch (Exception ex)
@@ -309,11 +392,28 @@ namespace bluetooth_turnon
                 };
                 _refreshTimer.Start();
 
+                // Enable DoubleBuffered on child scroll panel to prevent GDI repaint flicker
+                SetDoubleBuffered(panelDeviceList);
+
                 // Setup Hover Debounce Timer (avoids flickering / card rebuilds during active hover)
                 _hoverDebounceTimer = new Timer();
                 _hoverDebounceTimer.Interval = 2000; // 2 seconds max deferral while mouse hovers over cards
                 _hoverDebounceTimer.Tick += (s, ev) =>
                 {
+                    if (this.IsDisposed || !this.IsHandleCreated || panelDeviceList.IsDisposed || !panelDeviceList.IsHandleCreated)
+                    {
+                        _hoverDebounceTimer.Stop();
+                        return;
+                    }
+
+                    // If user is still hovering over the device list, do NOT destroy cards under cursor;
+                    // keep timer running to re-check until the mouse leaves the list
+                    Point cursorInList = panelDeviceList.PointToClient(Cursor.Position);
+                    if (panelDeviceList.ClientRectangle.Contains(cursorInList))
+                    {
+                        return;
+                    }
+
                     _hoverDebounceTimer.Stop();
                     if (_pendingDevices != null)
                     {
@@ -379,18 +479,19 @@ namespace bluetooth_turnon
 
         private void ApplyAdapterStateToUi(bool? isEnabled)
         {
-            if (InvokeRequired)
+            if (CheckInvokeRequired())
             {
                 SafeBeginInvoke(() => ApplyAdapterStateToUi(isEnabled));
                 return;
             }
 
             // If a controlled radio bounce is in progress, show "Reconnecting..." in the header
-            // and preserve existing device cards to avoid flickering during the brief 500ms cycle
+            // and disable the toggle switch so the user cannot toggle mid-bounce
             if (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)
             {
                 labelStatus.Text = "Reconnecting...";
                 labelStatus.ForeColor = Color.FromArgb(255, 200, 100);
+                on_off.Enabled = false;
                 return;
             }
 
@@ -401,7 +502,10 @@ namespace bluetooth_turnon
                 {
                     labelStatus.Text = "Enabled";
                     labelStatus.ForeColor = Color.FromArgb(100, 180, 255);
-                    on_off.Enabled = true;
+                    if (!_isTogglingAdapter)
+                    {
+                        on_off.Enabled = true;
+                    }
                     on_off.Checked = true;
                     on_off.Value = true;
                     _bluetoothManager.StartDeviceWatcher();
@@ -410,7 +514,10 @@ namespace bluetooth_turnon
                 {
                     labelStatus.Text = "Disabled";
                     labelStatus.ForeColor = Color.FromArgb(200, 80, 80);
-                    on_off.Enabled = true;
+                    if (!_isTogglingAdapter)
+                    {
+                        on_off.Enabled = true;
+                    }
                     on_off.Checked = false;
                     on_off.Value = false;
                     _bluetoothManager.StopDeviceWatcher();
@@ -444,7 +551,7 @@ namespace bluetooth_turnon
                 {
                     if (_connectingAddresses.ContainsKey(e.Address))
                     {
-                        _connectingAddresses[e.Address] = e.StatusMessage;
+                        _connectingAddresses[e.Address] = (e.StatusMessage, Color.FromArgb(255, 190, 50));
                     }
                 }
                 UpdateOperationFeedback(e.Address, e.StatusMessage, Color.FromArgb(255, 190, 50), null);
@@ -458,11 +565,28 @@ namespace bluetooth_turnon
 
         private async void on_off_CheckedChanged(object sender, Bunifu.UI.WinForms.BunifuToggleSwitch.CheckedChangedEventArgs e)
         {
-            if (_isUpdatingUiFromState || (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)) return;
+            if (_isUpdatingUiFromState) return;
+
+            if (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)
+            {
+                // Revert visual toggle state back to ON because radio bounce is active and will restore ON
+                _isUpdatingUiFromState = true;
+                try
+                {
+                    on_off.Checked = true;
+                    on_off.Value = true;
+                }
+                finally
+                {
+                    _isUpdatingUiFromState = false;
+                }
+                return;
+            }
 
             bool targetState = e.Checked;
 
-            // Guard against rapid duplicate clicks while operation is in flight
+            // Guard against rapid duplicate clicks and premature re-enabling by background state events
+            _isTogglingAdapter = true;
             on_off.Enabled = false;
 
             try
@@ -472,13 +596,15 @@ namespace bluetooth_turnon
                     // User explicitly requested Bluetooth OFF:
                     // Cancel any in-flight device operations immediately so they do not keep running
                     // or attempt a radio bounce
-                    try
+                    lock (_deviceClickCtsLock)
                     {
-                        _deviceClickCts?.Cancel();
-                        _deviceClickCts?.Dispose();
+                        try
+                        {
+                            _deviceClickCts.Cancel();
+                        }
+                        catch { }
                         _deviceClickCts = new CancellationTokenSource();
                     }
-                    catch { }
 
                     lock (_connectingAddresses)
                     {
@@ -523,6 +649,7 @@ namespace bluetooth_turnon
             }
             finally
             {
+                _isTogglingAdapter = false;
                 // Re-enable toggle switch unless adapter is absent
                 if (labelStatus.Text != "No Adapter" && !_isUpdatingUiFromState)
                 {
@@ -592,6 +719,7 @@ namespace bluetooth_turnon
                 do
                 {
                     bool currentForce = force || _forceRefreshPending;
+                    force = false; // Reset method parameter so subsequent coalesced passes only use _forceRefreshPending
                     _refreshPending = false;
                     _forceRefreshPending = false;
                     try
@@ -634,7 +762,7 @@ namespace bluetooth_turnon
             {
                 if (_connectingAddresses.ContainsKey(address))
                 {
-                    _connectingAddresses[address] = text;
+                    _connectingAddresses[address] = (text, color);
                 }
             }
 
@@ -673,9 +801,9 @@ namespace bluetooth_turnon
         /// </summary>
         private void BuildDeviceCards(IReadOnlyList<DeviceInfo> devices, bool force = false)
         {
-            if (this.IsDisposed || !this.IsHandleCreated) return;
+            if (this.IsDisposed) return;
 
-            if (InvokeRequired)
+            if (CheckInvokeRequired())
             {
                 SafeBeginInvoke(() => BuildDeviceCards(devices, force));
                 return;
@@ -760,9 +888,10 @@ namespace bluetooth_turnon
                 int cardHeight = 72;
                 int totalHeight = devices.Count * cardHeight;
                 bool needsVerticalScroll = totalHeight > panelDeviceList.ClientSize.Height;
+                int availableWidth = panelDeviceList.ClientSize.Width + (panelDeviceList.VerticalScroll.Visible ? SystemInformation.VerticalScrollBarWidth : 0);
                 int cardWidth = needsVerticalScroll
-                    ? (panelDeviceList.Width - SystemInformation.VerticalScrollBarWidth)
-                    : panelDeviceList.Width;
+                    ? (availableWidth - SystemInformation.VerticalScrollBarWidth)
+                    : availableWidth;
 
                 int y = 0;
                 Point currentCursorInList = panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed
@@ -791,6 +920,7 @@ namespace bluetooth_turnon
                         Anchor = AnchorStyles.Left | AnchorStyles.Top,
                         Cursor = Cursors.Hand
                     };
+                    SetDoubleBuffered(card);
 
                 // ── Type-specific icon ────────────────────────────────────
                 string iconFile = GetDeviceIconFileName(device.DeviceType);
@@ -808,6 +938,7 @@ namespace bluetooth_turnon
                     Size      = new Size(48, 48),
                     Cursor    = Cursors.Hand
                 };
+                SetDoubleBuffered(iconPanel);
                 var capturedAccent = accentColor; // capture for lambda
                 iconPanel.Paint += (s, pe) =>
                 {
@@ -866,15 +997,16 @@ namespace bluetooth_turnon
                 // ── Device type subtitle ────────────────────────────────────────
                 string typeText = GetDeviceTypeLabel(device.DeviceType);
                 Color  typeColor = device.IsConnected ? Color.FromArgb(120, capturedAccent.R, capturedAccent.G, capturedAccent.B) : Color.FromArgb(100, 100, 110);
-                string inFlightStatus = null;
+                (string Text, Color Color) inFlightStatus = default;
+                bool hasInFlight = false;
                 lock (_connectingAddresses)
                 {
-                    _connectingAddresses.TryGetValue(device.Address, out inFlightStatus);
+                    hasInFlight = _connectingAddresses.TryGetValue(device.Address, out inFlightStatus);
                 }
-                if (!string.IsNullOrEmpty(inFlightStatus))
+                if (hasInFlight && !string.IsNullOrEmpty(inFlightStatus.Text))
                 {
-                    typeText = inFlightStatus;
-                    typeColor = Color.FromArgb(255, 190, 50); // Amber
+                    typeText = inFlightStatus.Text;
+                    typeColor = inFlightStatus.Color;
                 }
 
                 var typeLabel = new Label
@@ -940,7 +1072,8 @@ namespace bluetooth_turnon
                         card.BackColor = baseBgColor;
                         iconPanel.BackColor = baseBgColor;
 
-                        // If mouse has exited the device list and an update is pending, apply it now
+                        // If mouse has exited the device list and an update is pending, apply it asynchronously
+                        // via BeginInvoke to avoid disposing controls during their own MouseLeave message dispatch
                         if (panelDeviceList.IsHandleCreated && !panelDeviceList.IsDisposed)
                         {
                             Point ptList = panelDeviceList.PointToClient(Cursor.Position);
@@ -949,7 +1082,13 @@ namespace bluetooth_turnon
                                 var pending = _pendingDevices;
                                 _pendingDevices = null;
                                 _hoverDebounceTimer?.Stop();
-                                BuildDeviceCards(pending, force: true);
+                                this.BeginInvoke((Action)(() =>
+                                {
+                                    if (!this.IsDisposed && this.IsHandleCreated)
+                                    {
+                                        BuildDeviceCards(pending, force: true);
+                                    }
+                                }));
                             }
                         }
                     }
@@ -964,21 +1103,32 @@ namespace bluetooth_turnon
                     bool isConnecting = !device.IsConnected;
                     BluetoothManager.Log($"User clicked device '{device.Name}' ({addr:X12}), requestedAction={(isConnecting ? "Connect" : "Disconnect")}");
 
-                    lock (_connectingAddresses)
+                    bool registeredClick = false;
+                    try
                     {
-                        if (_connectingAddresses.ContainsKey(addr))
+                        lock (_connectingAddresses)
                         {
-                            // Ignore duplicate clicks while operation is already in flight
-                            return;
+                            if (_connectingAddresses.ContainsKey(addr))
+                            {
+                                // Ignore duplicate clicks while operation is already in flight
+                                return;
+                            }
+                            _connectingAddresses[addr] = (isConnecting ? "Connecting..." : "Disconnecting...", Color.FromArgb(255, 190, 50));
+                            registeredClick = true;
                         }
-                        _connectingAddresses[addr] = isConnecting ? "Connecting..." : "Disconnecting...";
-                    }
 
-                    using (var clickCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, _deviceClickCts.Token))
-                    {
-                        var token = clickCts.Token;
-                        try
+                        CancellationTokenSource clickCts = null;
+                        lock (_deviceClickCtsLock)
                         {
+                            if (_cts.IsCancellationRequested || this.IsDisposed || !this.IsHandleCreated)
+                                return;
+                            clickCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, _deviceClickCts.Token);
+                        }
+
+                        using (clickCts)
+                        {
+                            var token = clickCts.Token;
+
                             // Fix Bug 7: Re-query fresh device state before deciding connect vs disconnect
                             // to avoid acting on stale captured state if connection status changed.
                             bool? freshConnected = await _bluetoothManager.IsDeviceConnectedAsync(addr, token);
@@ -988,7 +1138,7 @@ namespace bluetooth_turnon
                                 lock (_connectingAddresses)
                                 {
                                     if (_connectingAddresses.ContainsKey(addr))
-                                        _connectingAddresses[addr] = isConnecting ? "Connecting..." : "Disconnecting...";
+                                        _connectingAddresses[addr] = (isConnecting ? "Connecting..." : "Disconnecting...", Color.FromArgb(255, 190, 50));
                                 }
                             }
 
@@ -1021,20 +1171,23 @@ namespace bluetooth_turnon
                                 try { await Task.Delay(200, token); } catch { }
                             }
                         }
-                        catch (OperationCanceledException)
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Form is closing, Bluetooth turned off, or operation cancelled
+                    }
+                    catch (Exception ex)
+                    {
+                        BluetoothManager.Log($"Device click exception for {addr:X12}: {ex.Message}");
+                        if (!this.IsDisposed && this.IsHandleCreated)
                         {
-                            // Form is closing, Bluetooth turned off, or operation cancelled
+                            UpdateOperationFeedback(addr, isConnecting ? "Connection failed" : "Disconnect failed", Color.FromArgb(230, 80, 80), typeLabel);
+                            try { await Task.Delay(1500); } catch { }
                         }
-                        catch (Exception ex)
-                        {
-                            BluetoothManager.Log($"Device click exception for {addr:X12}: {ex.Message}");
-                            if (!this.IsDisposed && this.IsHandleCreated)
-                            {
-                                UpdateOperationFeedback(addr, isConnecting ? "Connection failed" : "Disconnect failed", Color.FromArgb(230, 80, 80), typeLabel);
-                                try { await Task.Delay(1500, token); } catch { }
-                            }
-                        }
-                        finally
+                    }
+                    finally
+                    {
+                        if (registeredClick)
                         {
                             lock (_connectingAddresses)
                             {
@@ -1075,21 +1228,25 @@ namespace bluetooth_turnon
                 y += cardHeight;
             }
 
-            // Ensure horizontal scrollbar never appears
+                panelDeviceList.AutoScrollMinSize = new Size(0, totalHeight);
+            }
+            finally
+            {
+                panelDeviceList.ResumeLayout(true);
+            }
+
+            // Must configure horizontal scrollbar AFTER ResumeLayout(true)
+            // because WinForms' internal AdjustFormScrollbars pass during ResumeLayout
+            // will override any earlier setting of HorizontalScroll.Visible.
             panelDeviceList.HorizontalScroll.Maximum = 0;
+            panelDeviceList.HorizontalScroll.Enabled = false;
             panelDeviceList.HorizontalScroll.Visible = false;
-            panelDeviceList.AutoScrollMinSize = new Size(0, totalHeight);
 
             // Restore vertical scroll position
             if (needsVerticalScroll && previousScrollY > 0)
             {
                 panelDeviceList.AutoScrollPosition = new Point(0, previousScrollY);
             }
-        }
-        finally
-        {
-            panelDeviceList.ResumeLayout(true);
-        }
 
         // ── Device type helpers ───────────────────────────────────────────────
 
@@ -1180,6 +1337,20 @@ namespace bluetooth_turnon
             }
         }
 
+        /// <summary>
+        /// Enables DoubleBuffered on a Control (such as Panel) using reflection to eliminate GDI repaint flicker.
+        /// </summary>
+        private static void SetDoubleBuffered(Control control)
+        {
+            if (control == null) return;
+            try
+            {
+                typeof(Control).GetProperty("DoubleBuffered", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                    ?.SetValue(control, true, null);
+            }
+            catch { }
+        }
+
         // ── Disposal ─────────────────────────────────────────────────────────
 
         /// <summary>
@@ -1196,7 +1367,10 @@ namespace bluetooth_turnon
             }
 
             _cts.Cancel();
-            try { _deviceClickCts?.Cancel(); _deviceClickCts?.Dispose(); } catch { }
+            lock (_deviceClickCtsLock)
+            {
+                try { _deviceClickCts?.Cancel(); _deviceClickCts?.Dispose(); } catch { }
+            }
             
             if (_refreshTimer != null)
             {
@@ -1222,6 +1396,13 @@ namespace bluetooth_turnon
             {
                 _trayIcon.Visible = false;
                 _trayIcon.Dispose();
+                _trayIcon = null;
+            }
+
+            if (_trayMenu != null)
+            {
+                _trayMenu.Dispose();
+                _trayMenu = null;
             }
 
             foreach (var cached in _iconCache.Values)

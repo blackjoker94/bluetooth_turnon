@@ -134,15 +134,6 @@ namespace bluetooth_turnon
 
             var tcs = new TaskCompletionSource<bool>();
 
-            // Guard against unobserved task exceptions if the returned Task is not awaited by callers
-            tcs.Task.ContinueWith(t =>
-            {
-                if (t.IsFaulted)
-                {
-                    var _ = t.Exception;
-                }
-            }, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
-
             CancellationTokenRegistration ctsReg = default;
             if (!_cts.IsCancellationRequested)
             {
@@ -1112,18 +1103,20 @@ namespace bluetooth_turnon
                     bool isConnecting = !device.IsConnected;
                     BluetoothManager.Log($"User clicked device '{device.Name}' ({addr:X12}), requestedAction={(isConnecting ? "Connect" : "Disconnect")}");
 
-                    lock (_connectingAddresses)
-                    {
-                        if (_connectingAddresses.ContainsKey(addr))
-                        {
-                            // Ignore duplicate clicks while operation is already in flight
-                            return;
-                        }
-                        _connectingAddresses[addr] = (isConnecting ? "Connecting..." : "Disconnecting...", Color.FromArgb(255, 190, 50));
-                    }
-
+                    bool registeredClick = false;
                     try
                     {
+                        lock (_connectingAddresses)
+                        {
+                            if (_connectingAddresses.ContainsKey(addr))
+                            {
+                                // Ignore duplicate clicks while operation is already in flight
+                                return;
+                            }
+                            _connectingAddresses[addr] = (isConnecting ? "Connecting..." : "Disconnecting...", Color.FromArgb(255, 190, 50));
+                            registeredClick = true;
+                        }
+
                         CancellationTokenSource clickCts = null;
                         lock (_deviceClickCtsLock)
                         {
@@ -1194,20 +1187,23 @@ namespace bluetooth_turnon
                     }
                     finally
                     {
-                        lock (_connectingAddresses)
+                        if (registeredClick)
                         {
-                            _connectingAddresses.Remove(addr);
-                        }
-                        if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
-                        {
-                            try
+                            lock (_connectingAddresses)
                             {
-                                await RefreshAdapterStateAsync();
-                                await RefreshDevicesIfIdleAsync(force: true);
+                                _connectingAddresses.Remove(addr);
                             }
-                            catch (Exception ex)
+                            if (!this.IsDisposed && this.IsHandleCreated && !_cts.IsCancellationRequested)
                             {
-                                BluetoothManager.Log($"onClick refresh exception: {ex.Message}");
+                                try
+                                {
+                                    await RefreshAdapterStateAsync();
+                                    await RefreshDevicesIfIdleAsync(force: true);
+                                }
+                                catch (Exception ex)
+                                {
+                                    BluetoothManager.Log($"onClick refresh exception: {ex.Message}");
+                                }
                             }
                         }
                     }

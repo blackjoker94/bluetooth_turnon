@@ -1274,11 +1274,8 @@ namespace bluetooth_turnon
                                                 string fn = Marshal.PtrToStringUni(pv.pwszVal);
                                                 if (!string.IsNullOrEmpty(fn))
                                                 {
-                                                    if (string.Equals(fn, deviceName, StringComparison.OrdinalIgnoreCase))
-                                                    {
-                                                        matchedByName = true;
-                                                    }
-                                                    else if (deviceName.Length >= 4 && fn.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0)
+                                                    if (string.Equals(fn, deviceName, StringComparison.OrdinalIgnoreCase) ||
+                                                        fn.IndexOf($"({deviceName})", StringComparison.OrdinalIgnoreCase) >= 0)
                                                     {
                                                         matchedByName = true;
                                                     }
@@ -1370,8 +1367,7 @@ namespace bluetooth_turnon
                                             continue;
 
                                         // Verify that the adapter device is a Bluetooth audio adapter or matches the device's address
-                                        bool isBtAdapter = matchedByAddress ||
-                                                           adapterDeviceId.IndexOf(addrHex12, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                        bool isBtAdapter = adapterDeviceId.IndexOf(addrHex12, StringComparison.OrdinalIgnoreCase) >= 0 ||
                                                            adapterDeviceId.IndexOf("BTH", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                                            adapterDeviceId.IndexOf("BLUETOOTH", StringComparison.OrdinalIgnoreCase) >= 0;
                                         if (!isBtAdapter)
@@ -2872,15 +2868,21 @@ namespace bluetooth_turnon
                 }
             }
 
+            CancellationToken opToken;
+            lock (_deviceOpCtsLock)
+            {
+                opToken = _deviceOpCts.Token;
+            }
+
             Log($"  Scheduling deferred battery query (3s) for '{deviceName}' ({address:X12})...");
 
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    await Task.Delay(3000).ConfigureAwait(false);
+                    await Task.Delay(3000, opToken).ConfigureAwait(false);
 
-                    if (_disposed) return;
+                    if (_disposed || opToken.IsCancellationRequested) return;
 
                     // Guard 1: Verify retry is still registered (removed by disconnect or device removal)
                     lock (_batteryRetryLock)
@@ -2933,7 +2935,7 @@ namespace bluetooth_turnon
                             return;
                         }
 
-                        retriedBattery = await QueryBatteryViaGattAsync(address, deviceName, CancellationToken.None).ConfigureAwait(false);
+                        retriedBattery = await QueryBatteryViaGattAsync(address, deviceName, opToken).ConfigureAwait(false);
                     }
 
                     // Guard 4: Verify device wasn't disconnected while query was running before updating cache
@@ -2988,8 +2990,15 @@ namespace bluetooth_turnon
                     BluetoothLEDevice bleDevice = null;
                     try
                     {
-                        // Fix 5B: Look up paired BLE device by name first since BLE address may differ from Classic address
-                        if (!string.IsNullOrWhiteSpace(deviceName))
+                        // 1. Look up by Bluetooth address first (exact match)
+                        if (bluetoothAddress != 0)
+                        {
+                            bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
+                                .AsTask(token).ConfigureAwait(false);
+                        }
+
+                        // 2. If address lookup returned null, fall back to name matching via DeviceInformation
+                        if (bleDevice == null && !string.IsNullOrWhiteSpace(deviceName))
                         {
                             try
                             {
@@ -3022,13 +3031,6 @@ namespace bluetooth_turnon
                             {
                                 Log($"    Battery GATT: DeviceInformation.FindAllAsync lookup note: {ex.Message}");
                             }
-                        }
-
-                        // Fall back to FromBluetoothAddressAsync if not matched by name
-                        if (bleDevice == null && bluetoothAddress != 0)
-                        {
-                            bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
-                                .AsTask(token).ConfigureAwait(false);
                         }
 
                         if (bleDevice == null)
