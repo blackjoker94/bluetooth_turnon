@@ -343,8 +343,10 @@ namespace bluetooth_turnon
             new ConcurrentDictionary<ulong, (int? Battery, DateTime LastCheckedUtc)>();
         private volatile Radio _bluetoothRadio;
         private volatile bool _radioDiscoveryAttempted;
-        private DeviceWatcher _deviceWatcher;
-        private volatile bool _watcherEnumerationComplete;
+        private DeviceWatcher _classicWatcher;
+        private DeviceWatcher _bleWatcher;
+        private volatile bool _classicEnumerationComplete;
+        private volatile bool _bleEnumerationComplete;
         private bool _disposed;
         private readonly object _deviceOpCtsLock = new object();
         private CancellationTokenSource _deviceOpCts = new CancellationTokenSource();
@@ -666,7 +668,7 @@ namespace bluetooth_turnon
         // ── Devices ──────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Returns all paired Bluetooth (Classic) devices with their connection status.
+        /// Returns all paired Bluetooth (Classic and BLE) devices with their connection status.
         /// Battery is queried via PnP property or BLE GATT fallback for connected devices.
         /// Returns an empty list if the adapter is off, no devices are paired, or any error occurs.
         /// Completely lock-free so background refreshes never block user clicks or device operations.
@@ -690,17 +692,18 @@ namespace bluetooth_turnon
 
             try
             {
-                // BluetoothClient.PairedDevices is a synchronous, potentially blocking call
-                // so we run it on the thread pool to avoid freezing the UI thread (Rule A-2).
+                // Synchronous and WinRT calls run on the thread pool to avoid freezing the UI thread (Rule A-2).
                 var results = await Task.Run(async () =>
                 {
                     var list = new List<DeviceInfo>();
+
+                    // 1. Enumerate Classic Bluetooth paired devices
                     try
                     {
                         using (var client = new InTheHand.Net.Sockets.BluetoothClient())
                         {
                             var paired = client.PairedDevices;
-                            Log($"GetPairedDevicesAsync: BluetoothClient.PairedDevices returned {paired?.Count() ?? 0} device(s)");
+                            Log($"GetPairedDevicesAsync: BluetoothClient.PairedDevices returned {paired?.Count() ?? 0} Classic device(s)");
                             if (paired != null)
                             {
                                 foreach (var device in paired)
@@ -763,7 +766,7 @@ namespace bluetooth_turnon
                                                 _batteryCache[address] = (battery, DateTime.UtcNow);
                                             }
 
-                                            // Fix 5A: Schedule deferred battery retry after short delay for freshly connected devices
+                                            // Schedule deferred battery retry after short delay for freshly connected devices
                                             if (battery == null)
                                             {
                                                 ScheduleDeferredBatteryQuery(address, name);
@@ -771,7 +774,7 @@ namespace bluetooth_turnon
                                         }
                                     }
 
-                                    Log($"  Paired device: '{name}' ({address:X12}), Connected={isConnected}, Type={deviceType}, Battery={battery?.ToString() ?? "N/A"}");
+                                    Log($"  Paired Classic device: '{name}' ({address:X12}), Connected={isConnected}, Type={deviceType}, Battery={battery?.ToString() ?? "N/A"}");
                                     list.Add(new DeviceInfo(name, battery, deviceType, isConnected, address));
                                 }
                             }
@@ -783,9 +786,154 @@ namespace bluetooth_turnon
                     }
                     catch (Exception ex)
                     {
-                        Log($"GetPairedDevicesAsync Task.Run exception: {ex.Message}");
-                        // Return whatever we collected before the error
+                        Log($"GetPairedDevicesAsync Classic enumeration exception: {ex.Message}");
                     }
+
+                    // 2. Enumerate Bluetooth LE paired devices
+                    try
+                    {
+                        string bleSelector = BluetoothLEDevice.GetDeviceSelectorFromPairingState(true);
+                        var bleCollection = await DeviceInformation.FindAllAsync(
+                            bleSelector,
+                            new string[] { "System.Devices.Aep.IsConnected" }
+                        ).AsTask(ct).ConfigureAwait(false);
+
+                        if (bleCollection != null)
+                        {
+                            Log($"GetPairedDevicesAsync: Found {bleCollection.Count} paired BLE device(s)");
+                            foreach (var devInfo in bleCollection)
+                            {
+                                ct.ThrowIfCancellationRequested();
+
+                                BluetoothLEDevice bleDevice = null;
+                                try
+                                {
+                                    using (var lookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+                                    using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, lookupCts.Token))
+                                    {
+                                        bleDevice = await BluetoothLEDevice.FromIdAsync(devInfo.Id)
+                                            .AsTask(linkedCts.Token).ConfigureAwait(false);
+                                    }
+
+                                    if (bleDevice == null)
+                                    {
+                                        Log($"GetPairedDevicesAsync: FromIdAsync returned null for '{devInfo.Name}' ({devInfo.Id})");
+                                        continue;
+                                    }
+
+                                    ulong address = bleDevice.BluetoothAddress;
+                                    if (address == 0)
+                                    {
+                                        Log($"GetPairedDevicesAsync: BLE device '{bleDevice.Name}' address was 0; skipping");
+                                        continue;
+                                    }
+
+                                    string name = !string.IsNullOrWhiteSpace(bleDevice.Name)
+                                        ? bleDevice.Name
+                                        : (!string.IsNullOrWhiteSpace(devInfo.Name) ? devInfo.Name : "Unknown BLE Device");
+
+                                    bool isConnected = (bleDevice.ConnectionStatus == BluetoothConnectionStatus.Connected);
+                                    var deviceType = ClassifyBleDevice(bleDevice);
+
+                                    int existingIndex = list.FindIndex(d => d.Address == address);
+                                    if (existingIndex >= 0)
+                                    {
+                                        // Device was already discovered via Classic Bluetooth (dual-mode device)
+                                        var existing = list[existingIndex];
+                                        bool mergedConnected = existing.IsConnected || isConnected;
+                                        string mergedName = (existing.Name == "Unknown Device" && name != "Unknown BLE Device") ? name : existing.Name;
+                                        var mergedType = (existing.DeviceType == BluetoothDeviceType.Unknown && deviceType != BluetoothDeviceType.Unknown) ? deviceType : existing.DeviceType;
+                                        int? mergedBattery = existing.BatteryPercent;
+
+                                        if (mergedConnected && mergedBattery == null)
+                                        {
+                                            string addrHex = address.ToString("X12");
+                                            mergedBattery = QueryBatteryViaPnp(addrHex);
+                                            if (mergedBattery != null)
+                                            {
+                                                _batteryCache[address] = (mergedBattery, DateTime.UtcNow);
+                                            }
+                                            else if (_batteryCache.TryGetValue(address, out var cachedEntry) &&
+                                                     (DateTime.UtcNow - cachedEntry.LastCheckedUtc) < TimeSpan.FromMinutes(5))
+                                            {
+                                                mergedBattery = cachedEntry.Battery;
+                                            }
+                                        }
+
+                                        Log($"  Paired BLE device: '{mergedName}' ({address:X12}) merged with Classic entry. Connected={mergedConnected}, Type={mergedType}, Battery={mergedBattery?.ToString() ?? "N/A"}");
+                                        list[existingIndex] = new DeviceInfo(mergedName, mergedBattery, mergedType, mergedConnected, address);
+                                    }
+                                    else
+                                    {
+                                        // Pure BLE device
+                                        int? battery = null;
+                                        if (!isConnected)
+                                        {
+                                            _batteryCache.TryRemove(address, out _);
+                                            lock (_batteryRetryLock)
+                                            {
+                                                _activeBatteryRetries.Remove(address);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            string addrHex = address.ToString("X12");
+                                            battery = QueryBatteryViaPnp(addrHex);
+
+                                            if (battery != null)
+                                            {
+                                                _batteryCache[address] = (battery, DateTime.UtcNow);
+                                            }
+                                            else
+                                            {
+                                                bool hasRecentGattCheck = _batteryCache.TryGetValue(address, out var cachedEntry) &&
+                                                                          (DateTime.UtcNow - cachedEntry.LastCheckedUtc) < TimeSpan.FromMinutes(5);
+
+                                                if (hasRecentGattCheck)
+                                                {
+                                                    battery = cachedEntry.Battery;
+                                                }
+                                                else
+                                                {
+                                                    battery = await QueryBatteryViaGattAsync(address, name, ct).ConfigureAwait(false);
+                                                    _batteryCache[address] = (battery, DateTime.UtcNow);
+                                                }
+
+                                                if (battery == null)
+                                                {
+                                                    ScheduleDeferredBatteryQuery(address, name);
+                                                }
+                                            }
+                                        }
+
+                                        Log($"  Paired BLE device (Pure): '{name}' ({address:X12}), Connected={isConnected}, Type={deviceType}, Battery={battery?.ToString() ?? "N/A"}");
+                                        list.Add(new DeviceInfo(name, battery, deviceType, isConnected, address));
+                                    }
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                    throw;
+                                }
+                                catch (Exception ex)
+                                {
+                                    Log($"GetPairedDevicesAsync: BLE entry processing exception for '{devInfo.Name}': {ex.Message}");
+                                }
+                                finally
+                                {
+                                    try { bleDevice?.Dispose(); } catch { }
+                                }
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"GetPairedDevicesAsync BLE enumeration exception: {ex.Message}");
+                    }
+
                     // Sort: connected devices first, then alphabetically by name
                     return list.OrderByDescending(d => d.IsConnected).ThenBy(d => d.Name).ToList();
 
@@ -806,7 +954,7 @@ namespace bluetooth_turnon
         }
 
         /// <summary>
-        /// Queries the current connection state of a specific paired Bluetooth device.
+        /// Queries the current connection state of a specific paired Bluetooth device (Classic or BLE).
         /// Returns true if connected, false if disconnected, or null if the device or adapter is not found.
         /// Completely non-blocking and safe to call from UI event handlers to avoid acting on stale cached states.
         /// </summary>
@@ -821,26 +969,74 @@ namespace bluetooth_turnon
                     : await GetAdapterStateAsync(ct).ConfigureAwait(false);
                 if (adapterState != true) return null;
 
-                return await Task.Run(() =>
+                return await Task.Run(async () =>
                 {
                     try
                     {
+                        // 1. Check Classic Bluetooth
+                        bool classicFound = false;
                         using (var client = new InTheHand.Net.Sockets.BluetoothClient())
                         {
                             var paired = client.PairedDevices;
-                            if (paired == null) return (bool?)null;
-
-                            var target = paired.FirstOrDefault(d =>
+                            if (paired != null)
                             {
-                                try { return d.DeviceAddress.ToUInt64() == address; }
-                                catch { return false; }
-                            });
+                                var target = paired.FirstOrDefault(d =>
+                                {
+                                    try { return d.DeviceAddress.ToUInt64() == address; }
+                                    catch { return false; }
+                                });
 
-                            if (target == null) return (bool?)null;
-
-                            try { target.Refresh(); } catch { }
-                            return (bool?)target.Connected;
+                                if (target != null)
+                                {
+                                    classicFound = true;
+                                    try { target.Refresh(); } catch { }
+                                    if (target.Connected)
+                                    {
+                                        return (bool?)true;
+                                    }
+                                }
+                            }
                         }
+
+                        // 2. Check Bluetooth LE (for pure BLE devices or dual-mode connected over BLE)
+                        BluetoothLEDevice bleDevice = null;
+                        try
+                        {
+                            using (var lookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+                            using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, lookupCts.Token))
+                            {
+                                bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
+                                    .AsTask(linkedCts.Token).ConfigureAwait(false);
+
+                                if (bleDevice != null)
+                                {
+                                    bool isBleConnected = (bleDevice.ConnectionStatus == BluetoothConnectionStatus.Connected);
+                                    Log($"IsDeviceConnectedAsync: BLE device {address:X12} found, ConnectionStatus={bleDevice.ConnectionStatus}");
+                                    return (bool?)isBleConnected;
+                                }
+                            }
+                        }
+                        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                        {
+                            Log($"IsDeviceConnectedAsync: BLE address lookup timed out for {address:X12}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"IsDeviceConnectedAsync: BLE address lookup exception for {address:X12}: {ex.Message}");
+                        }
+                        finally
+                        {
+                            try { bleDevice?.Dispose(); } catch { }
+                        }
+
+                        // If found in Classic (and target.Connected was false), return false
+                        if (classicFound)
+                        {
+                            return (bool?)false;
+                        }
+
+                        Log($"IsDeviceConnectedAsync: device {address:X12} not found in Classic or BLE");
+                        return (bool?)null;
                     }
                     catch (Exception ex)
                     {
@@ -1329,8 +1525,8 @@ namespace bluetooth_turnon
                                 var device = paired?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
                                 if (device == null)
                                 {
-                                    Log($"  ConnectDeviceAsync: device {address:X12} not found in PairedDevices");
-                                    return false;
+                                    Log($"  ConnectDeviceAsync: device {address:X12} not found in Classic PairedDevices. Attempting BLE connection...");
+                                    return await ConnectBleDeviceAsync(address, token).ConfigureAwait(false);
                                 }
 
                                 targetDeviceName = device.DeviceName;
@@ -1716,8 +1912,8 @@ namespace bluetooth_turnon
                                 var device = paired?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
                                 if (device == null)
                                 {
-                                    Log($"  DisconnectDeviceAsync: device {address:X12} not found in PairedDevices");
-                                    return false;
+                                    Log($"  DisconnectDeviceAsync: device {address:X12} not found in Classic PairedDevices. Attempting BLE disconnect...");
+                                    return await DisconnectBleDeviceAsync(address, token).ConfigureAwait(false);
                                 }
 
                                 targetName = device.DeviceName;
@@ -1888,6 +2084,205 @@ namespace bluetooth_turnon
                 {
                     try { NativeMethods.CloseHandle(hRadio); } catch { }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Connects to a paired Bluetooth LE device by requesting uncached GATT services to trigger link establishment.
+        /// </summary>
+        private async Task<bool> ConnectBleDeviceAsync(ulong address, CancellationToken token)
+        {
+            Log($"  ConnectBleDeviceAsync called for {address:X12}");
+            BluetoothLEDevice bleDevice = null;
+            try
+            {
+                using (var lookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(4)))
+                using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, lookupCts.Token))
+                {
+                    bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
+                        .AsTask(linkedCts.Token).ConfigureAwait(false);
+                }
+
+                if (bleDevice == null)
+                {
+                    Log($"  ConnectBleDeviceAsync: BluetoothLEDevice {address:X12} not found.");
+                    return false;
+                }
+
+                string bleName = !string.IsNullOrWhiteSpace(bleDevice.Name) ? bleDevice.Name : "BLE Device";
+                Log($"  ConnectBleDeviceAsync: Found '{bleName}', initial ConnectionStatus={bleDevice.ConnectionStatus}");
+
+                if (bleDevice.ConnectionStatus == BluetoothConnectionStatus.Connected)
+                {
+                    Log($"  ConnectBleDeviceAsync: '{bleName}' is already connected.");
+                    return true;
+                }
+
+                // Querying uncached GATT services prompts Windows to initiate an active connection to the paired BLE device
+                Log($"  ConnectBleDeviceAsync: Requesting uncached GATT services to trigger connection for '{bleName}'...");
+                try
+                {
+                    using (var gattCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+                    using (var linkedGattCts = CancellationTokenSource.CreateLinkedTokenSource(token, gattCts.Token))
+                    {
+                        var gattResult = await bleDevice.GetGattServicesAsync(BluetoothCacheMode.Uncached)
+                            .AsTask(linkedGattCts.Token).ConfigureAwait(false);
+
+                        if (gattResult?.Services != null)
+                        {
+                            foreach (var svc in gattResult.Services)
+                            {
+                                try { svc.Dispose(); } catch { }
+                            }
+                        }
+                        Log($"  ConnectBleDeviceAsync: GATT query completed with status {gattResult?.Status}.");
+                    }
+                }
+                catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                {
+                    Log($"  ConnectBleDeviceAsync: GATT service query timed out; checking connection status...");
+                }
+                catch (Exception ex)
+                {
+                    Log($"  ConnectBleDeviceAsync: GATT service query note: {ex.Message}");
+                }
+
+                // Verify connection status (poll 5 times x 800ms)
+                for (int attempt = 1; attempt <= 5; attempt++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    Log($"  ConnectBleDeviceAsync: Verify attempt {attempt}/5: ConnectionStatus={bleDevice.ConnectionStatus}");
+                    if (bleDevice.ConnectionStatus == BluetoothConnectionStatus.Connected)
+                    {
+                        Log($"  ConnectBleDeviceAsync: '{bleName}' connected successfully on attempt {attempt}/5.");
+                        return true;
+                    }
+                    await Task.Delay(800, token).ConfigureAwait(false);
+                }
+
+                Log($"  ConnectBleDeviceAsync failed for '{bleName}' ({address:X12}).");
+                return false;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Log($"  ConnectBleDeviceAsync exception: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                try { bleDevice?.Dispose(); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// Disconnects a paired Bluetooth LE device by sending an IOCTL baseband teardown and releasing GATT references.
+        /// </summary>
+        private async Task<bool> DisconnectBleDeviceAsync(ulong address, CancellationToken token)
+        {
+            Log($"  DisconnectBleDeviceAsync called for {address:X12}");
+            BluetoothLEDevice bleDevice = null;
+            try
+            {
+                using (var lookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(4)))
+                using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, lookupCts.Token))
+                {
+                    bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
+                        .AsTask(linkedCts.Token).ConfigureAwait(false);
+                }
+
+                if (bleDevice == null)
+                {
+                    Log($"  DisconnectBleDeviceAsync: BluetoothLEDevice {address:X12} not found.");
+                    return false;
+                }
+
+                string bleName = !string.IsNullOrWhiteSpace(bleDevice.Name) ? bleDevice.Name : "BLE Device";
+                Log($"  DisconnectBleDeviceAsync: Found '{bleName}', initial ConnectionStatus={bleDevice.ConnectionStatus}");
+
+                if (bleDevice.ConnectionStatus == BluetoothConnectionStatus.Disconnected)
+                {
+                    _batteryCache.TryRemove(address, out _);
+                    lock (_batteryRetryLock)
+                    {
+                        _activeBatteryRetries.Remove(address);
+                    }
+                    Log($"  DisconnectBleDeviceAsync: '{bleName}' is already disconnected.");
+                    return true;
+                }
+
+                // Step 1: Native IOCTL baseband disconnect
+                try
+                {
+                    bool ioctlSuccess = DisconnectDeviceViaIoctl(address);
+                    Log($"  DisconnectBleDeviceAsync: IOCTL disconnect returned {ioctlSuccess} for '{bleName}'");
+                }
+                catch (Exception ex)
+                {
+                    Log($"  DisconnectBleDeviceAsync: IOCTL disconnect note: {ex.Message}");
+                }
+
+                // Step 2: Release BLE device handle so our process doesn't keep the link alive
+                try
+                {
+                    bleDevice.Dispose();
+                    bleDevice = null;
+                }
+                catch { }
+
+                // Step 3: Polling verification (5 x 800ms)
+                for (int attempt = 1; attempt <= 5; attempt++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    await Task.Delay(800, token).ConfigureAwait(false);
+
+                    try
+                    {
+                        using (var checkCts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
+                        using (var linkedCheckCts = CancellationTokenSource.CreateLinkedTokenSource(token, checkCts.Token))
+                        {
+                            using (var checkDev = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
+                                .AsTask(linkedCheckCts.Token).ConfigureAwait(false))
+                            {
+                                if (checkDev == null || checkDev.ConnectionStatus == BluetoothConnectionStatus.Disconnected)
+                                {
+                                    _batteryCache.TryRemove(address, out _);
+                                    lock (_batteryRetryLock)
+                                    {
+                                        _activeBatteryRetries.Remove(address);
+                                    }
+                                    Log($"  DisconnectBleDeviceAsync: '{bleName}' disconnected on attempt {attempt}/5.");
+                                    return true;
+                                }
+                                Log($"  DisconnectBleDeviceAsync: Verify attempt {attempt}/5: ConnectionStatus={checkDev.ConnectionStatus}");
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        Log($"  DisconnectBleDeviceAsync verify attempt {attempt} note: {ex.Message}");
+                    }
+                }
+
+                Log($"  DisconnectBleDeviceAsync failed for '{bleName}' ({address:X12}).");
+                return false;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Log($"  DisconnectBleDeviceAsync exception: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                try { bleDevice?.Dispose(); } catch { }
             }
         }
 
@@ -2715,6 +3110,54 @@ namespace bluetooth_turnon
         // ── Device Classification ─────────────────────────────────────────────
 
         /// <summary>
+        /// Classifies a Bluetooth LE device using its BluetoothLEAppearance or name-based heuristics.
+        /// </summary>
+        private static BluetoothDeviceType ClassifyBleDevice(BluetoothLEDevice bleDevice)
+        {
+            if (bleDevice == null) return BluetoothDeviceType.Unknown;
+
+            try
+            {
+                var appearance = bleDevice.Appearance;
+                if (appearance != null)
+                {
+                    var fromAppearance = ClassifyByAppearance(appearance.Category, appearance.SubCategory);
+                    if (fromAppearance != BluetoothDeviceType.Unknown)
+                        return fromAppearance;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"  ClassifyBleDevice appearance exception: {ex.Message}");
+            }
+
+            string name = bleDevice.Name ?? string.Empty;
+            return ClassifyByName(name);
+        }
+
+        private static BluetoothDeviceType ClassifyByAppearance(ushort category, ushort subCategory)
+        {
+            switch (category)
+            {
+                case 0x03C0: // Human Interface Device
+                    if (subCategory == 1) return BluetoothDeviceType.Keyboard;
+                    if (subCategory == 2) return BluetoothDeviceType.Mouse;
+                    if (subCategory == 3 || subCategory == 4) return BluetoothDeviceType.Controller;
+                    return BluetoothDeviceType.Mouse;
+                case 0x0040: // Phone
+                    return BluetoothDeviceType.Phone;
+                case 0x0080: // Computer
+                    return BluetoothDeviceType.Computer;
+                case 0x00C0: // Watch / Wearable
+                    return BluetoothDeviceType.Smartwatch;
+                case 0x0840: // Media Player / Audio
+                    return BluetoothDeviceType.AudioDevice;
+                default:
+                    return BluetoothDeviceType.Unknown;
+            }
+        }
+
+        /// <summary>
         /// Reads the Bluetooth Class of Device (CoD) bitmask to determine device type.
         /// Falls back to name-pattern matching for unclassified CoDs.
         /// </summary>
@@ -2869,104 +3312,195 @@ namespace bluetooth_turnon
             return BluetoothDeviceType.Unknown;
         }
 
-        // ── Device Watcher (real-time connect/disconnect) ─────────────────────
+        // ── Device Watcher (real-time connect/disconnect for Classic and BLE) ─
 
         /// <summary>
-        /// Starts a DeviceWatcher that raises DeviceConnectionChanged whenever a Bluetooth
-        /// device connects or disconnects. Safe to call multiple times — returns early if already active.
+        /// Starts DeviceWatchers for both Classic and BLE devices that raise DeviceConnectionChanged
+        /// whenever a Bluetooth device connects, disconnects, pairs, or unpairs.
+        /// Safe to call multiple times — returns early if already active.
         /// </summary>
         public void StartDeviceWatcher()
         {
-            if (_deviceWatcher != null &&
-                (_deviceWatcher.Status == DeviceWatcherStatus.Started ||
-                 _deviceWatcher.Status == DeviceWatcherStatus.EnumerationCompleted))
+            bool classicRunning = _classicWatcher != null &&
+                (_classicWatcher.Status == DeviceWatcherStatus.Started ||
+                 _classicWatcher.Status == DeviceWatcherStatus.EnumerationCompleted);
+            bool bleRunning = _bleWatcher != null &&
+                (_bleWatcher.Status == DeviceWatcherStatus.Started ||
+                 _bleWatcher.Status == DeviceWatcherStatus.EnumerationCompleted);
+
+            if (classicRunning && bleRunning)
             {
-                Log("DeviceWatcher: Already running (Started or EnumerationCompleted), ignoring start request");
+                Log("DeviceWatcher: Both Classic and BLE watchers already running, ignoring start request");
                 return;
             }
 
             StopDeviceWatcher();
-            Log("DeviceWatcher: Starting...");
+            Log("DeviceWatcher: Starting Classic and BLE watchers...");
 
-            _watcherEnumerationComplete = false;
+            _classicEnumerationComplete = false;
+            _bleEnumerationComplete = false;
 
-            // Watch all Bluetooth Classic devices; request the IsConnected property so
-            // Updated events fire when connection status changes.
-            string selector = Windows.Devices.Bluetooth.BluetoothDevice.GetDeviceSelector();
-            _deviceWatcher = DeviceInformation.CreateWatcher(
-                selector,
-                new string[] { "System.Devices.Aep.IsConnected" },
-                DeviceInformationKind.AssociationEndpoint);
-
-            _deviceWatcher.Added             += DeviceWatcher_Added;
-            _deviceWatcher.Removed           += DeviceWatcher_Removed;
-            _deviceWatcher.Updated           += DeviceWatcher_Updated;
-            _deviceWatcher.EnumerationCompleted += DeviceWatcher_EnumerationCompleted;
-
-            _deviceWatcher.Start();
-            Log("DeviceWatcher: Started (waiting for initial enumeration to complete)");
-        }
-
-        /// <summary>
-        /// Stops and cleans up the DeviceWatcher. Safe to call even if no watcher is running.
-        /// </summary>
-        public void StopDeviceWatcher()
-        {
-            if (_deviceWatcher == null) return;
-            Log("DeviceWatcher: Stopping...");
             try
             {
-                _deviceWatcher.Added             -= DeviceWatcher_Added;
-                _deviceWatcher.Removed           -= DeviceWatcher_Removed;
-                _deviceWatcher.Updated           -= DeviceWatcher_Updated;
-                _deviceWatcher.EnumerationCompleted -= DeviceWatcher_EnumerationCompleted;
+                // Watch all paired Classic Bluetooth devices
+                string classicSelector = Windows.Devices.Bluetooth.BluetoothDevice.GetDeviceSelector();
+                _classicWatcher = DeviceInformation.CreateWatcher(
+                    classicSelector,
+                    new string[] { "System.Devices.Aep.IsConnected" },
+                    DeviceInformationKind.AssociationEndpoint);
 
-                if (_deviceWatcher.Status == DeviceWatcherStatus.Started ||
-                    _deviceWatcher.Status == DeviceWatcherStatus.EnumerationCompleted)
-                {
-                    _deviceWatcher.Stop();
-                }
+                _classicWatcher.Added += ClassicWatcher_Added;
+                _classicWatcher.Removed += ClassicWatcher_Removed;
+                _classicWatcher.Updated += ClassicWatcher_Updated;
+                _classicWatcher.EnumerationCompleted += ClassicWatcher_EnumerationCompleted;
+
+                _classicWatcher.Start();
+                Log("DeviceWatcher: Classic watcher started");
             }
             catch (Exception ex)
             {
-                Log($"DeviceWatcher: StopDeviceWatcher exception: {ex.Message}");
+                Log($"DeviceWatcher: Failed to start Classic watcher: {ex.Message}");
             }
-            finally
+
+            try
             {
-                _deviceWatcher = null;
-                _watcherEnumerationComplete = false;
-                Log("DeviceWatcher: Stopped");
+                // Watch all paired Bluetooth LE devices
+                string bleSelector = Windows.Devices.Bluetooth.BluetoothLEDevice.GetDeviceSelectorFromPairingState(true);
+                _bleWatcher = DeviceInformation.CreateWatcher(
+                    bleSelector,
+                    new string[] { "System.Devices.Aep.IsConnected" },
+                    DeviceInformationKind.AssociationEndpoint);
+
+                _bleWatcher.Added += BleWatcher_Added;
+                _bleWatcher.Removed += BleWatcher_Removed;
+                _bleWatcher.Updated += BleWatcher_Updated;
+                _bleWatcher.EnumerationCompleted += BleWatcher_EnumerationCompleted;
+
+                _bleWatcher.Start();
+                Log("DeviceWatcher: BLE watcher started");
+            }
+            catch (Exception ex)
+            {
+                Log($"DeviceWatcher: Failed to start BLE watcher: {ex.Message}");
             }
         }
 
-        private void DeviceWatcher_EnumerationCompleted(DeviceWatcher sender, object args)
+        /// <summary>
+        /// Stops and cleans up both Classic and BLE DeviceWatchers. Safe to call even if no watcher is running.
+        /// </summary>
+        public void StopDeviceWatcher()
         {
-            _watcherEnumerationComplete = true;
-            Log("DeviceWatcher: Initial enumeration complete — now live-watching for changes");
+            if (_classicWatcher == null && _bleWatcher == null) return;
+            Log("DeviceWatcher: Stopping watchers...");
+
+            if (_classicWatcher != null)
+            {
+                try
+                {
+                    _classicWatcher.Added -= ClassicWatcher_Added;
+                    _classicWatcher.Removed -= ClassicWatcher_Removed;
+                    _classicWatcher.Updated -= ClassicWatcher_Updated;
+                    _classicWatcher.EnumerationCompleted -= ClassicWatcher_EnumerationCompleted;
+
+                    if (_classicWatcher.Status == DeviceWatcherStatus.Started ||
+                        _classicWatcher.Status == DeviceWatcherStatus.EnumerationCompleted)
+                    {
+                        _classicWatcher.Stop();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"DeviceWatcher: Stop Classic watcher exception: {ex.Message}");
+                }
+                finally
+                {
+                    _classicWatcher = null;
+                    _classicEnumerationComplete = false;
+                }
+            }
+
+            if (_bleWatcher != null)
+            {
+                try
+                {
+                    _bleWatcher.Added -= BleWatcher_Added;
+                    _bleWatcher.Removed -= BleWatcher_Removed;
+                    _bleWatcher.Updated -= BleWatcher_Updated;
+                    _bleWatcher.EnumerationCompleted -= BleWatcher_EnumerationCompleted;
+
+                    if (_bleWatcher.Status == DeviceWatcherStatus.Started ||
+                        _bleWatcher.Status == DeviceWatcherStatus.EnumerationCompleted)
+                    {
+                        _bleWatcher.Stop();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"DeviceWatcher: Stop BLE watcher exception: {ex.Message}");
+                }
+                finally
+                {
+                    _bleWatcher = null;
+                    _bleEnumerationComplete = false;
+                }
+            }
+
+            Log("DeviceWatcher: Stopped all watchers");
         }
 
-        // Fires when a device that wasn't previously visible appears (i.e. device connected)
-        private void DeviceWatcher_Added(DeviceWatcher sender, DeviceInformation args)
+        private void ClassicWatcher_EnumerationCompleted(DeviceWatcher sender, object args)
         {
-            if (!_watcherEnumerationComplete) return; // ignore initial population
-            Log($"DeviceWatcher: Device connected: '{args.Name}'");
+            _classicEnumerationComplete = true;
+            Log("DeviceWatcher (Classic): Initial enumeration complete — now live-watching for changes");
+        }
+
+        private void ClassicWatcher_Added(DeviceWatcher sender, DeviceInformation args)
+        {
+            if (!_classicEnumerationComplete) return;
+            Log($"DeviceWatcher (Classic): Device connected/paired: '{args.Name}'");
             DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
         }
 
-        // Fires when a tracked device disappears (i.e. device disconnected/unpaired)
-        private void DeviceWatcher_Removed(DeviceWatcher sender, DeviceInformationUpdate args)
+        private void ClassicWatcher_Removed(DeviceWatcher sender, DeviceInformationUpdate args)
         {
-            if (!_watcherEnumerationComplete) return;
-            Log($"DeviceWatcher: Device disconnected/removed: {args.Id}");
+            if (!_classicEnumerationComplete) return;
+            Log($"DeviceWatcher (Classic): Device disconnected/unpaired: {args.Id}");
             DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
         }
 
-        // Fires when a device property changes — including IsConnected toggling
-        private void DeviceWatcher_Updated(DeviceWatcher sender, DeviceInformationUpdate args)
+        private void ClassicWatcher_Updated(DeviceWatcher sender, DeviceInformationUpdate args)
         {
-            if (!_watcherEnumerationComplete) return;
+            if (!_classicEnumerationComplete) return;
             if (!args.Properties.ContainsKey("System.Devices.Aep.IsConnected")) return;
-            Log($"DeviceWatcher: IsConnected changed for {args.Id}");
+            Log($"DeviceWatcher (Classic): IsConnected changed for {args.Id}");
+            DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        private void BleWatcher_EnumerationCompleted(DeviceWatcher sender, object args)
+        {
+            _bleEnumerationComplete = true;
+            Log("DeviceWatcher (BLE): Initial enumeration complete — now live-watching for changes");
+        }
+
+        private void BleWatcher_Added(DeviceWatcher sender, DeviceInformation args)
+        {
+            if (!_bleEnumerationComplete) return;
+            Log($"DeviceWatcher (BLE): Device connected/paired: '{args.Name}'");
+            DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        private void BleWatcher_Removed(DeviceWatcher sender, DeviceInformationUpdate args)
+        {
+            if (!_bleEnumerationComplete) return;
+            Log($"DeviceWatcher (BLE): Device disconnected/unpaired: {args.Id}");
+            DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        private void BleWatcher_Updated(DeviceWatcher sender, DeviceInformationUpdate args)
+        {
+            if (!_bleEnumerationComplete) return;
+            if (!args.Properties.ContainsKey("System.Devices.Aep.IsConnected")) return;
+            Log($"DeviceWatcher (BLE): IsConnected changed for {args.Id}");
             DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
         }
 
