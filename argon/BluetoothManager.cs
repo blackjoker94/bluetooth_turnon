@@ -327,6 +327,17 @@ namespace bluetooth_turnon
         private bool _disposed;
         private CancellationTokenSource _deviceOpCts = new CancellationTokenSource();
 
+        private static void SafeRelease(SemaphoreSlim semaphore)
+        {
+            if (semaphore == null) return;
+            try
+            {
+                semaphore.Release();
+            }
+            catch (ObjectDisposedException) { }
+            catch (SemaphoreFullException) { }
+        }
+
         /// <summary>
         /// Fired whenever the Bluetooth adapter state changes (internally or externally in Windows).
         /// </summary>
@@ -386,6 +397,8 @@ namespace bluetooth_turnon
         /// </summary>
         private async Task<Radio> GetBluetoothRadioAsync(CancellationToken ct = default, bool forceRefresh = false)
         {
+            if (_disposed) return null;
+
             if (_bluetoothRadio != null)
             {
                 return _bluetoothRadio;
@@ -484,7 +497,7 @@ namespace bluetooth_turnon
             }
             finally
             {
-                _radioInitSemaphore.Release();
+                SafeRelease(_radioInitSemaphore);
             }
         }
 
@@ -542,6 +555,7 @@ namespace bluetooth_turnon
         public async Task<bool> SetAdapterStateAsync(bool enable, CancellationToken ct = default)
         {
             Log($"SetAdapterStateAsync(enable={enable}) called");
+            if (_disposed) return false;
 
             if (!enable)
             {
@@ -581,7 +595,7 @@ namespace bluetooth_turnon
             }
             finally
             {
-                _adapterToggleSemaphore.Release();
+                SafeRelease(_adapterToggleSemaphore);
             }
         }
 
@@ -1186,6 +1200,7 @@ namespace bluetooth_turnon
         public async Task<bool> ConnectDeviceAsync(ulong address, CancellationToken ct = default)
         {
             Log($"ConnectDeviceAsync called for {address:X12}");
+            if (_disposed) return false;
 
             // Guard: Do not attempt to connect if Bluetooth radio is currently off
             if (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.On)
@@ -1490,7 +1505,7 @@ namespace bluetooth_turnon
                 }
                 finally
                 {
-                    _connectSemaphore.Release();
+                    SafeRelease(_connectSemaphore);
                 }
             }
         }
@@ -1505,6 +1520,7 @@ namespace bluetooth_turnon
         public async Task<bool> DisconnectDeviceAsync(ulong address, CancellationToken ct = default)
         {
             Log($"DisconnectDeviceAsync called for {address:X12}");
+            if (_disposed) return false;
 
             using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _deviceOpCts.Token))
             {
@@ -1620,7 +1636,7 @@ namespace bluetooth_turnon
                 }
                 finally
                 {
-                    _connectSemaphore.Release();
+                    SafeRelease(_connectSemaphore);
                 }
             }
         }
@@ -2631,9 +2647,15 @@ namespace bluetooth_turnon
             }
 
             try { _deviceOpCts?.Cancel(); _deviceOpCts?.Dispose(); } catch { }
-            try { _radioInitSemaphore.Dispose(); } catch { }
-            try { _adapterToggleSemaphore.Dispose(); } catch { }
-            try { _connectSemaphore.Dispose(); } catch { }
+
+            // Note on semaphores (_radioInitSemaphore, _adapterToggleSemaphore, _connectSemaphore):
+            // We do NOT call .Dispose() on the semaphores here to eliminate race conditions where background
+            // tasks (ConnectDeviceAsync, DisconnectDeviceAsync, SetAdapterStateAsync, GetBluetoothRadioAsync)
+            // are unwinding their finally blocks upon application shutdown. Calling .Dispose() on a SemaphoreSlim
+            // causes subsequent .Release() calls to throw ObjectDisposedException. Since SemaphoreSlim does not
+            // allocate unmanaged handles unless AvailableWaitHandle is accessed (which this codebase does not use),
+            // omitting Dispose prevents ObjectDisposedException while allowing GC to collect them normally.
+            // Additionally, SafeRelease guards all .Release() calls against ObjectDisposedException.
         }
     }
 }
