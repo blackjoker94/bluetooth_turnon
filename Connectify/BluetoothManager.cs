@@ -2023,51 +2023,88 @@ namespace bluetooth_turnon
         }
 
         /// <summary>
-        /// Sends IOCTL_BTH_DISCONNECT_DEVICE directly to the local Bluetooth radio driver handle.
-        /// Instructs bthport.sys to cleanly terminate the baseband ACL connection
+        /// Sends IOCTL_BTH_DISCONNECT_DEVICE to all local Bluetooth radio handles.
+        /// Enumerates all radios on the system (supporting multi-adapter machines with motherboard + USB dongle)
+        /// to ensure the target device's baseband ACL connection is cleanly terminated regardless of which radio hosts it,
         /// without unbinding or disabling the device's PnP profile drivers (AudioSink, Handsfree, Headset, HID) in the registry.
         /// </summary>
         private static bool DisconnectDeviceViaIoctl(ulong address)
         {
             if (address == 0) return false;
 
-            IntPtr hRadio = IntPtr.Zero;
+            var radioHandles = new List<IntPtr>();
             IntPtr hFind = IntPtr.Zero;
             try
             {
                 var radioParams = new NativeMethods.BLUETOOTH_FIND_RADIO_PARAMS();
                 radioParams.dwSize = (uint)Marshal.SizeOf(typeof(NativeMethods.BLUETOOTH_FIND_RADIO_PARAMS));
 
+                IntPtr hRadio = IntPtr.Zero;
                 hFind = NativeMethods.BluetoothFindFirstRadio(ref radioParams, out hRadio);
-                if (hFind == IntPtr.Zero || hRadio == IntPtr.Zero)
+                if (hFind != IntPtr.Zero && hRadio != IntPtr.Zero)
+                {
+                    radioHandles.Add(hRadio);
+                    while (NativeMethods.BluetoothFindNextRadio(hFind, out IntPtr nextRadio))
+                    {
+                        if (nextRadio != IntPtr.Zero)
+                        {
+                            radioHandles.Add(nextRadio);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"  DisconnectDeviceViaIoctl radio enumeration exception: {ex.Message}");
+            }
+            finally
+            {
+                if (hFind != IntPtr.Zero)
+                {
+                    try { NativeMethods.BluetoothFindRadioClose(hFind); } catch { }
+                }
+            }
+
+            try
+            {
+                if (radioHandles.Count == 0)
                 {
                     Log("  DisconnectDeviceViaIoctl: No local Bluetooth radio handle found.");
                     return false;
                 }
 
+                Log($"  DisconnectDeviceViaIoctl: Enumerated {radioHandles.Count} radio(s). Sending IOCTL_BTH_DISCONNECT_DEVICE for {address:X12}...");
+                bool anyDisconnected = false;
                 long inBuffer = (long)address;
-                int bytesReturned = 0;
-                bool success = NativeMethods.DeviceIoControl(
-                    hRadio,
-                    NativeMethods.IOCTL_BTH_DISCONNECT_DEVICE,
-                    ref inBuffer,
-                    sizeof(long),
-                    IntPtr.Zero,
-                    0,
-                    out bytesReturned,
-                    IntPtr.Zero
-                );
 
-                if (!success)
+                for (int i = 0; i < radioHandles.Count; i++)
                 {
-                    int win32Err = Marshal.GetLastWin32Error();
-                    // Error 1167 = ERROR_DEVICE_NOT_CONNECTED (already disconnected)
-                    Log($"  DisconnectDeviceViaIoctl DeviceIoControl returned false. Win32 error={win32Err}");
-                    return (win32Err == 1167);
+                    IntPtr hRadio = radioHandles[i];
+                    int bytesReturned = 0;
+                    bool success = NativeMethods.DeviceIoControl(
+                        hRadio,
+                        NativeMethods.IOCTL_BTH_DISCONNECT_DEVICE,
+                        ref inBuffer,
+                        sizeof(long),
+                        IntPtr.Zero,
+                        0,
+                        out bytesReturned,
+                        IntPtr.Zero
+                    );
+
+                    if (success)
+                    {
+                        Log($"  DisconnectDeviceViaIoctl: IOCTL succeeded on radio #{i + 1}");
+                        anyDisconnected = true;
+                    }
+                    else
+                    {
+                        int win32Err = Marshal.GetLastWin32Error();
+                        Log($"  DisconnectDeviceViaIoctl: Radio #{i + 1} DeviceIoControl returned false. Win32 error={win32Err}");
+                    }
                 }
 
-                Log("  DisconnectDeviceViaIoctl DeviceIoControl succeeded.");
-                return true;
+                return anyDisconnected;
             }
             catch (Exception ex)
             {
@@ -2076,13 +2113,12 @@ namespace bluetooth_turnon
             }
             finally
             {
-                if (hFind != IntPtr.Zero)
+                foreach (var hRadio in radioHandles)
                 {
-                    try { NativeMethods.BluetoothFindRadioClose(hFind); } catch { }
-                }
-                if (hRadio != IntPtr.Zero)
-                {
-                    try { NativeMethods.CloseHandle(hRadio); } catch { }
+                    if (hRadio != IntPtr.Zero)
+                    {
+                        try { NativeMethods.CloseHandle(hRadio); } catch { }
+                    }
                 }
             }
         }
@@ -2537,6 +2573,10 @@ namespace bluetooth_turnon
 
             [System.Runtime.InteropServices.DllImport("bthprops.cpl", SetLastError = true)]
             public static extern IntPtr BluetoothFindFirstRadio(ref BLUETOOTH_FIND_RADIO_PARAMS pbtfrp, out IntPtr phRadio);
+
+            [System.Runtime.InteropServices.DllImport("bthprops.cpl", SetLastError = true)]
+            [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+            public static extern bool BluetoothFindNextRadio(IntPtr hFind, out IntPtr phRadio);
 
             [System.Runtime.InteropServices.DllImport("bthprops.cpl", SetLastError = true)]
             [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
