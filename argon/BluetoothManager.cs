@@ -45,16 +45,35 @@ namespace bluetooth_turnon
             var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
             CancellationTokenRegistration ctr = default;
             if (ct.CanBeCanceled)
-                ctr = ct.Register(() => { try { asyncOp.Cancel(); } catch { } tcs.TrySetCanceled(); });
+            {
+                ctr = ct.Register(() =>
+                {
+                    try { asyncOp.Cancel(); } catch { }
+                    tcs.TrySetCanceled();
+                });
+            }
 
             asyncOp.Completed = (info, status) =>
             {
-                ctr.Dispose();
+                try { ctr.Dispose(); } catch { }
                 switch (status)
                 {
-                    case AsyncStatus.Completed: tcs.TrySetResult(info.GetResults()); break;
-                    case AsyncStatus.Canceled: tcs.TrySetCanceled(); break;
-                    case AsyncStatus.Error: tcs.TrySetException(info.ErrorCode ?? new Exception("WinRT error.")); break;
+                    case AsyncStatus.Completed:
+                        T res = default;
+                        try { res = info.GetResults(); } catch { }
+                        if (!tcs.TrySetResult(res))
+                        {
+                            // Task was already cancelled or faulted. The caller will never receive or dispose this object.
+                            // Immediately dispose it to prevent leaking unmanaged WinRT handles and keeping ACL/LE links open.
+                            DisposeWinRtObject(res);
+                        }
+                        break;
+                    case AsyncStatus.Canceled:
+                        tcs.TrySetCanceled();
+                        break;
+                    case AsyncStatus.Error:
+                        tcs.TrySetException(info.ErrorCode ?? new Exception("WinRT error."));
+                        break;
                 }
             };
             return tcs.Task;
@@ -81,19 +100,66 @@ namespace bluetooth_turnon
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             CancellationTokenRegistration ctr = default;
             if (ct.CanBeCanceled)
-                ctr = ct.Register(() => { try { asyncAction.Cancel(); } catch { } tcs.TrySetCanceled(); });
+            {
+                ctr = ct.Register(() =>
+                {
+                    try { asyncAction.Cancel(); } catch { }
+                    tcs.TrySetCanceled();
+                });
+            }
 
             asyncAction.Completed = (info, status) =>
             {
-                ctr.Dispose();
+                try { ctr.Dispose(); } catch { }
                 switch (status)
                 {
-                    case AsyncStatus.Completed: info.GetResults(); tcs.TrySetResult(true); break;
-                    case AsyncStatus.Canceled: tcs.TrySetCanceled(); break;
-                    case AsyncStatus.Error: tcs.TrySetException(info.ErrorCode ?? new Exception("WinRT error.")); break;
+                    case AsyncStatus.Completed:
+                        try { info.GetResults(); } catch { }
+                        tcs.TrySetResult(true);
+                        break;
+                    case AsyncStatus.Canceled:
+                        tcs.TrySetCanceled();
+                        break;
+                    case AsyncStatus.Error:
+                        tcs.TrySetException(info.ErrorCode ?? new Exception("WinRT error."));
+                        break;
                 }
             };
             return tcs.Task;
+        }
+
+        private static void DisposeWinRtObject(object obj)
+        {
+            if (obj == null) return;
+            try
+            {
+                if (obj is Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult gattResult)
+                {
+                    if (gattResult.Services != null)
+                    {
+                        foreach (var s in gattResult.Services)
+                        {
+                            try { s.Dispose(); } catch { }
+                        }
+                    }
+                }
+                else if (obj is Windows.Devices.Bluetooth.Rfcomm.RfcommDeviceServicesResult rfcommResult)
+                {
+                    if (rfcommResult.Services != null)
+                    {
+                        foreach (var s in rfcommResult.Services)
+                        {
+                            try { s.Dispose(); } catch { }
+                        }
+                    }
+                }
+
+                if (obj is IDisposable disposable)
+                {
+                    disposable.Dispose();
+                }
+            }
+            catch { }
         }
     }
 
@@ -678,55 +744,43 @@ namespace bluetooth_turnon
         private static async Task WakeBasebandLinkAsync(ulong address, CancellationToken ct)
         {
             BluetoothDevice winRtDevice = null;
-            IAsyncOperation<Windows.Devices.Bluetooth.Rfcomm.RfcommDeviceServicesResult> rfcommOp = null;
-            IAsyncOperation<BluetoothDevice> deviceOp = null;
-
             try
             {
                 Log($"  Waking baseband link for {address:X12} via WinRT uncached RFCOMM discovery...");
                 using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(4)))
                 using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token))
                 {
-                    deviceOp = BluetoothDevice.FromBluetoothAddressAsync(address);
-                    using (linkedCts.Token.Register(() =>
-                    {
-                        try { deviceOp?.Cancel(); } catch { }
-                        try { rfcommOp?.Cancel(); } catch { }
-                    }))
-                    {
-                        winRtDevice = await deviceOp.AsTask(linkedCts.Token).ConfigureAwait(false);
+                    winRtDevice = await BluetoothDevice.FromBluetoothAddressAsync(address)
+                        .AsTask(linkedCts.Token).ConfigureAwait(false);
 
-                        if (winRtDevice != null)
+                    if (winRtDevice != null)
+                    {
+                        var rfcommResult = await winRtDevice.GetRfcommServicesAsync(BluetoothCacheMode.Uncached)
+                            .AsTask(linkedCts.Token).ConfigureAwait(false);
+                        try
                         {
-                            rfcommOp = winRtDevice.GetRfcommServicesAsync(BluetoothCacheMode.Uncached);
-                            var rfcommResult = await rfcommOp.AsTask(linkedCts.Token).ConfigureAwait(false);
-                            try
+                            Log($"  WinRT RFCOMM wake completed. Found {rfcommResult?.Services?.Count ?? 0} service(s), Error={rfcommResult?.Error}");
+                        }
+                        finally
+                        {
+                            if (rfcommResult?.Services != null)
                             {
-                                Log($"  WinRT RFCOMM wake completed. Found {rfcommResult?.Services?.Count ?? 0} service(s), Error={rfcommResult?.Error}");
-                            }
-                            finally
-                            {
-                                if (rfcommResult?.Services != null)
+                                foreach (var svc in rfcommResult.Services)
                                 {
-                                    foreach (var svc in rfcommResult.Services)
-                                    {
-                                        try { svc.Dispose(); } catch { }
-                                    }
+                                    try { svc.Dispose(); } catch { }
                                 }
                             }
                         }
-                        else
-                        {
-                            Log($"  WinRT BluetoothDevice was null for address {address:X12}.");
-                        }
+                    }
+                    else
+                    {
+                        Log($"  WinRT BluetoothDevice was null for address {address:X12}.");
                     }
                 }
             }
             catch (OperationCanceledException)
             {
-                Log("  WinRT baseband link wake timed out (4s) or was cancelled; cancelling operations and proceeding with connection.");
-                try { rfcommOp?.Cancel(); } catch { }
-                try { deviceOp?.Cancel(); } catch { }
+                Log("  WinRT baseband link wake timed out (4s) or was cancelled; proceeding with connection.");
             }
             catch (Exception ex)
             {
@@ -2085,50 +2139,49 @@ namespace bluetooth_turnon
                 {
                     var token = linkedCts.Token;
                     BluetoothLEDevice bleDevice = null;
-
-                    // Fix 5B: Look up paired BLE device by name first since BLE address may differ from Classic address
-                    if (!string.IsNullOrWhiteSpace(deviceName))
+                    try
                     {
-                        try
+                        // Fix 5B: Look up paired BLE device by name first since BLE address may differ from Classic address
+                        if (!string.IsNullOrWhiteSpace(deviceName))
                         {
-                            string selector = BluetoothLEDevice.GetDeviceSelectorFromPairingState(true);
-                            var pairedBleDevices = await DeviceInformation.FindAllAsync(selector).AsTask(token).ConfigureAwait(false);
-                            if (pairedBleDevices != null)
+                            try
                             {
-                                var match = pairedBleDevices.FirstOrDefault(d =>
-                                    !string.IsNullOrEmpty(d.Name) &&
-                                    (string.Equals(d.Name, deviceName, StringComparison.OrdinalIgnoreCase) ||
-                                     d.Name.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                     deviceName.IndexOf(d.Name, StringComparison.OrdinalIgnoreCase) >= 0));
-
-                                if (match != null)
+                                string selector = BluetoothLEDevice.GetDeviceSelectorFromPairingState(true);
+                                var pairedBleDevices = await DeviceInformation.FindAllAsync(selector).AsTask(token).ConfigureAwait(false);
+                                if (pairedBleDevices != null)
                                 {
-                                    Log($"    Battery GATT: Matched paired BLE device '{match.Name}' (Id={match.Id}) for '{deviceName}'");
-                                    bleDevice = await BluetoothLEDevice.FromIdAsync(match.Id).AsTask(token).ConfigureAwait(false);
+                                    var match = pairedBleDevices.FirstOrDefault(d =>
+                                        !string.IsNullOrEmpty(d.Name) &&
+                                        (string.Equals(d.Name, deviceName, StringComparison.OrdinalIgnoreCase) ||
+                                         d.Name.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                         deviceName.IndexOf(d.Name, StringComparison.OrdinalIgnoreCase) >= 0));
+
+                                    if (match != null)
+                                    {
+                                        Log($"    Battery GATT: Matched paired BLE device '{match.Name}' (Id={match.Id}) for '{deviceName}'");
+                                        bleDevice = await BluetoothLEDevice.FromIdAsync(match.Id).AsTask(token).ConfigureAwait(false);
+                                    }
                                 }
                             }
+                            catch (Exception ex)
+                            {
+                                Log($"    Battery GATT: DeviceInformation.FindAllAsync lookup note: {ex.Message}");
+                            }
                         }
-                        catch (Exception ex)
+
+                        // Fall back to FromBluetoothAddressAsync if not matched by name
+                        if (bleDevice == null && bluetoothAddress != 0)
                         {
-                            Log($"    Battery GATT: DeviceInformation.FindAllAsync lookup note: {ex.Message}");
+                            bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
+                                .AsTask(token).ConfigureAwait(false);
                         }
-                    }
 
-                    // Fall back to FromBluetoothAddressAsync if not matched by name
-                    if (bleDevice == null && bluetoothAddress != 0)
-                    {
-                        bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
-                            .AsTask(token).ConfigureAwait(false);
-                    }
+                        if (bleDevice == null)
+                        {
+                            Log($"    Battery GATT: BLE device not found for '{deviceName}' (address {bluetoothAddress:X12})");
+                            return null;
+                        }
 
-                    if (bleDevice == null)
-                    {
-                        Log($"    Battery GATT: BLE device not found for '{deviceName}' (address {bluetoothAddress:X12})");
-                        return null;
-                    }
-
-                    using (bleDevice)
-                    {
                         var servicesResult = await bleDevice
                             .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Uncached)
                             .AsTask(token).ConfigureAwait(false);
@@ -2182,6 +2235,10 @@ namespace bluetooth_turnon
                                 }
                             }
                         }
+                    }
+                    finally
+                    {
+                        try { bleDevice?.Dispose(); } catch { }
                     }
                 }
             }
