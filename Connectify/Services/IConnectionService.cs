@@ -14,6 +14,8 @@ namespace bluetooth_turnon.Services
         ConcurrentDictionary<ulong, BluetoothLEDevice> ConnectedBleDevices { get; }
         ConcurrentDictionary<ulong, GattSession> ConnectedBleSessions { get; }
 
+        Task<DeviceOperationResult> ConnectDeviceWithResultAsync(ulong address, CancellationToken ct = default);
+        Task<DeviceOperationResult> DisconnectDeviceWithResultAsync(ulong address, CancellationToken ct = default);
         Task<bool> ConnectDeviceAsync(ulong address, CancellationToken ct = default);
         Task<bool> DisconnectDeviceAsync(ulong address, CancellationToken ct = default);
         void CancelDeviceOperations(bool userRequestedAdapterOff = false);

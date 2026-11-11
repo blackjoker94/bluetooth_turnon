@@ -18,7 +18,7 @@ namespace bluetooth_turnon.Services
 
         public bool CanHandle(ConnectionRoute route) => route == ConnectionRoute.ClassicWithHid;
 
-        public async Task<bool> ConnectAsync(ulong address, string name, CancellationToken ct)
+        public async Task<DeviceOperationResult> ConnectAsync(ulong address, string name, CancellationToken ct)
         {
             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicHidConnectionStrategy.ConnectAsync called for {address:X12}");
 
@@ -33,7 +33,7 @@ namespace bluetooth_turnon.Services
                         if (device == null)
                         {
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ClassicHid: device {address:X12} not found in PairedDevices.");
-                            return false;
+                            return DeviceOperationResult.DeviceNotFound($"Classic device {address:X12} not found in PairedDevices.");
                         }
 
                         string targetName = device.DeviceName ?? (name ?? "HID Device");
@@ -41,7 +41,7 @@ namespace bluetooth_turnon.Services
                         if (device.Connected)
                         {
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicHid: '{targetName}' is already connected.");
-                            return true;
+                            return DeviceOperationResult.AlreadyConnected($"'{targetName}' is already connected.");
                         }
 
                         ct.ThrowIfCancellationRequested();
@@ -72,7 +72,7 @@ namespace bluetooth_turnon.Services
                                 {
                                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicHid: '{targetName}' connected successfully on attempt {attempt}/5.");
                                     _batteryService?.ScheduleDeferredBatteryQuery(address, targetName, isClassicOnly: true, immediate: true);
-                                    return true;
+                                    return DeviceOperationResult.Succeeded($"'{targetName}' connected successfully on attempt {attempt}/5.");
                                 }
                             }
                             catch (OperationCanceledException) { throw; }
@@ -83,19 +83,22 @@ namespace bluetooth_turnon.Services
                         }
 
                         AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ClassicHid: Connect failed for '{targetName}'.");
-                        return false;
+                        return DeviceOperationResult.Failed($"Connect failed for '{targetName}'.");
                     }
                 }
-                catch (OperationCanceledException) { throw; }
+                catch (OperationCanceledException)
+                {
+                    return DeviceOperationResult.Cancelled();
+                }
                 catch (Exception ex)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"  ClassicHid.ConnectAsync exception: {ex.Message}");
-                    return false;
+                    return DeviceOperationResult.Failed(ex.Message);
                 }
             }, ct).ConfigureAwait(false);
         }
 
-        public async Task<bool> DisconnectAsync(ulong address, string name, CancellationToken ct)
+        public async Task<DeviceOperationResult> DisconnectAsync(ulong address, string name, CancellationToken ct)
         {
             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicHidConnectionStrategy.DisconnectAsync called for {address:X12}");
 
@@ -110,7 +113,7 @@ namespace bluetooth_turnon.Services
                         if (device == null)
                         {
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ClassicHid: device {address:X12} not found in PairedDevices.");
-                            return false;
+                            return DeviceOperationResult.DeviceNotFound($"Classic device {address:X12} not found in PairedDevices.");
                         }
 
                         string targetName = device.DeviceName ?? (name ?? "HID Device");
@@ -119,7 +122,7 @@ namespace bluetooth_turnon.Services
                         {
                             _batteryService?.HandleDeviceDisconnected(address);
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicHid: '{targetName}' is already disconnected.");
-                            return true;
+                            return DeviceOperationResult.AlreadyDisconnected($"'{targetName}' is already disconnected.");
                         }
 
                         bool ioctlOk = NativeMethods.DisconnectDeviceViaIoctl(address);
@@ -138,7 +141,7 @@ namespace bluetooth_turnon.Services
                                 {
                                     _batteryService?.HandleDeviceDisconnected(address);
                                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicHid: '{targetName}' disconnected successfully.");
-                                    return true;
+                                    return DeviceOperationResult.Succeeded($"'{targetName}' disconnected successfully.");
                                 }
                             }
                             catch (Exception ex)
@@ -148,14 +151,17 @@ namespace bluetooth_turnon.Services
                         }
 
                         AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ClassicHid: Disconnect failed for '{targetName}'.");
-                        return false;
+                        return DeviceOperationResult.Failed($"Disconnect failed for '{targetName}'.");
                     }
                 }
-                catch (OperationCanceledException) { throw; }
+                catch (OperationCanceledException)
+                {
+                    return DeviceOperationResult.Cancelled();
+                }
                 catch (Exception ex)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"  ClassicHid.DisconnectAsync exception: {ex.Message}");
-                    return false;
+                    return DeviceOperationResult.Failed(ex.Message);
                 }
             }, ct).ConfigureAwait(false);
         }

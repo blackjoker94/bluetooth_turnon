@@ -20,7 +20,7 @@ namespace bluetooth_turnon.Services
 
         public bool CanHandle(ConnectionRoute route) => route == ConnectionRoute.BleDirect;
 
-        public async Task<bool> ConnectAsync(ulong address, string name, CancellationToken ct)
+        public async Task<DeviceOperationResult> ConnectAsync(ulong address, string name, CancellationToken ct)
         {
             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ConnectBleDeviceAsync called for {address:X12}");
             BluetoothLEDevice bleDevice = null;
@@ -37,7 +37,7 @@ namespace bluetooth_turnon.Services
                 if (bleDevice == null)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ConnectBleDeviceAsync: BluetoothLEDevice {address:X12} not found.");
-                    return false;
+                    return DeviceOperationResult.DeviceNotFound($"BluetoothLEDevice {address:X12} not found.");
                 }
 
                 string bleName = !string.IsNullOrWhiteSpace(bleDevice.Name) ? bleDevice.Name : (name ?? "BLE Device");
@@ -53,7 +53,7 @@ namespace bluetooth_turnon.Services
                     });
                     success = true;
                     _batteryService?.ScheduleDeferredBatteryQuery(address, bleName, isClassicOnly: false, immediate: true);
-                    return true;
+                    return DeviceOperationResult.AlreadyConnected($"'{bleName}' is already connected.");
                 }
 
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"  ConnectBleDeviceAsync: Requesting uncached GATT services to trigger connection for '{bleName}'...");
@@ -111,7 +111,7 @@ namespace bluetooth_turnon.Services
 
                         success = true;
                         _batteryService?.ScheduleDeferredBatteryQuery(address, bleName, isClassicOnly: false, immediate: true);
-                        return true;
+                        return DeviceOperationResult.Succeeded($"'{bleName}' connected successfully.");
                     }
                     await Task.Delay(800, ct).ConfigureAwait(false);
                 }
@@ -122,16 +122,16 @@ namespace bluetooth_turnon.Services
                 }
 
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ConnectBleDeviceAsync failed for '{bleName}' ({address:X12}).");
-                return false;
+                return DeviceOperationResult.Failed($"Connection failed for '{bleName}' ({address:X12}).");
             }
             catch (OperationCanceledException)
             {
-                throw;
+                return DeviceOperationResult.Cancelled();
             }
             catch (Exception ex)
             {
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"  ConnectBleDeviceAsync exception: {ex.Message}");
-                return false;
+                return DeviceOperationResult.Failed(ex.Message);
             }
             finally
             {
@@ -142,7 +142,7 @@ namespace bluetooth_turnon.Services
             }
         }
 
-        public async Task<bool> DisconnectAsync(ulong address, string name, CancellationToken ct)
+        public async Task<DeviceOperationResult> DisconnectAsync(ulong address, string name, CancellationToken ct)
         {
             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  DisconnectBleDeviceAsync called for {address:X12}");
 
@@ -161,7 +161,7 @@ namespace bluetooth_turnon.Services
                 if (bleDevice == null)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  DisconnectBleDeviceAsync: BluetoothLEDevice {address:X12} not found.");
-                    return false;
+                    return DeviceOperationResult.DeviceNotFound($"BluetoothLEDevice {address:X12} not found.");
                 }
 
                 string bleName = !string.IsNullOrWhiteSpace(bleDevice.Name) ? bleDevice.Name : (name ?? "BLE Device");
@@ -171,7 +171,7 @@ namespace bluetooth_turnon.Services
                 {
                     _batteryService?.HandleDeviceDisconnected(address);
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  DisconnectBleDeviceAsync: '{bleName}' is already disconnected.");
-                    return true;
+                    return DeviceOperationResult.AlreadyDisconnected($"'{bleName}' is already disconnected.");
                 }
 
                 try
@@ -208,7 +208,7 @@ namespace bluetooth_turnon.Services
                                 {
                                     _batteryService?.HandleDeviceDisconnected(address);
                                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  DisconnectBleDeviceAsync: '{bleName}' disconnected on attempt {attempt}/5.");
-                                    return true;
+                                    return DeviceOperationResult.Succeeded($"'{bleName}' disconnected successfully.");
                                 }
                                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"  DisconnectBleDeviceAsync: Verify attempt {attempt}/5: ConnectionStatus={checkDev.ConnectionStatus}");
                             }
@@ -222,16 +222,16 @@ namespace bluetooth_turnon.Services
                 }
 
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  DisconnectBleDeviceAsync failed for '{bleName}' ({address:X12}).");
-                return false;
+                return DeviceOperationResult.Failed($"Disconnect failed for '{bleName}' ({address:X12}).");
             }
             catch (OperationCanceledException)
             {
-                throw;
+                return DeviceOperationResult.Cancelled();
             }
             catch (Exception ex)
             {
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"  DisconnectBleDeviceAsync exception: {ex.Message}");
-                return false;
+                return DeviceOperationResult.Failed(ex.Message);
             }
             finally
             {

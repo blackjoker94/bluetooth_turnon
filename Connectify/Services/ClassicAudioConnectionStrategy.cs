@@ -621,7 +621,7 @@ namespace bluetooth_turnon.Services
             }
         }
 
-        public async Task<bool> ConnectAsync(ulong address, string name, CancellationToken ct)
+        public async Task<DeviceOperationResult> ConnectAsync(ulong address, string name, CancellationToken ct)
         {
             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicAudioConnectionStrategy.ConnectAsync called for {address:X12}");
 
@@ -637,7 +637,7 @@ namespace bluetooth_turnon.Services
                         if (device == null)
                         {
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ClassicAudio: device {address:X12} not found in PairedDevices.");
-                            return false;
+                            return DeviceOperationResult.DeviceNotFound($"Classic device {address:X12} not found in PairedDevices.");
                         }
 
                         targetDeviceName = device.DeviceName ?? (name ?? "Audio Device");
@@ -645,7 +645,7 @@ namespace bluetooth_turnon.Services
                         if (device.Connected)
                         {
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicAudio: '{targetDeviceName}' is already connected.");
-                            return true;
+                            return DeviceOperationResult.AlreadyConnected($"'{targetDeviceName}' is already connected.");
                         }
 
                         // Step 2: Wake baseband link
@@ -660,7 +660,7 @@ namespace bluetooth_turnon.Services
                             {
                                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{targetDeviceName}' connected after baseband wake in {swWake.ElapsedMilliseconds}ms.");
                                 _batteryService?.ScheduleDeferredBatteryQuery(address, targetDeviceName, isClassicOnly: false, immediate: true);
-                                return true;
+                                return DeviceOperationResult.Succeeded($"'{targetDeviceName}' connected after baseband wake in {swWake.ElapsedMilliseconds}ms.");
                             }
                         }
 
@@ -685,7 +685,7 @@ namespace bluetooth_turnon.Services
                                         {
                                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{targetDeviceName}' reconnected successfully via CoreAudio in {swCore.ElapsedMilliseconds}ms.");
                                             _batteryService?.ScheduleDeferredBatteryQuery(address, targetDeviceName, isClassicOnly: false, immediate: true);
-                                            return true;
+                                            return DeviceOperationResult.Succeeded($"'{targetDeviceName}' reconnected successfully via CoreAudio in {swCore.ElapsedMilliseconds}ms.");
                                         }
                                     }
                                     catch (OperationCanceledException) { throw; }
@@ -807,7 +807,7 @@ namespace bluetooth_turnon.Services
                             {
                                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{targetDeviceName}' connected successfully via service state cycle in {swCycle.ElapsedMilliseconds}ms.");
                                 _batteryService?.ScheduleDeferredBatteryQuery(address, targetDeviceName, isClassicOnly: false, immediate: true);
-                                return true;
+                                return DeviceOperationResult.Succeeded($"'{targetDeviceName}' connected successfully via service state cycle in {swCycle.ElapsedMilliseconds}ms.");
                             }
                         }
                     }
@@ -816,13 +816,13 @@ namespace bluetooth_turnon.Services
                     if (ct.IsCancellationRequested || _radioService.UserRequestedAdapterOff)
                     {
                         AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, "  ConnectAsync: User requested adapter OFF or cancelled. Skipping Step 6 (Radio Bounce).");
-                        return false;
+                        return DeviceOperationResult.Cancelled("User requested adapter OFF or cancelled.");
                     }
 
                     if (!RadioService.AllowAutomaticRadioBounce)
                     {
                         AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, "  ConnectAsync: Automatic radio bounce is disabled by default. Skipping Step 6 (Radio Bounce).");
-                        return false;
+                        return DeviceOperationResult.Failed("Automatic radio bounce is disabled by default.");
                     }
 
                     if (_peripheralsChecker != null)
@@ -831,27 +831,27 @@ namespace bluetooth_turnon.Services
                         if (periph.hasPeripherals)
                         {
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ConnectAsync: Connected input peripheral '{periph.name}' ({periph.type}) detected. Skipping Step 6 (Radio Bounce).");
-                            return false;
+                            return DeviceOperationResult.PeripheralProtected($"Connected input peripheral '{periph.name}' ({periph.type}) detected. Skipping radio bounce.");
                         }
                     }
 
                     if (!BluetoothManager.EnableStepBounce)
                     {
                         AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, "  ConnectAsync: Step 6 (Radio Bounce) SKIPPED via diagnostic switch.");
-                        return false;
+                        return DeviceOperationResult.Failed("Step 6 (Radio Bounce) skipped via diagnostic switch.");
                     }
 
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  Steps 1-4 failed to connect '{targetDeviceName}'. Initiating Step 6: Controlled Radio Bounce...");
                     _progressNotifier?.Invoke(address, "Reconnecting Bluetooth...");
 
                     bool resetOk = await _radioService.ManualResetBluetoothAsync(ct).ConfigureAwait(false);
-                    if (!resetOk) return false;
+                    if (!resetOk) return DeviceOperationResult.Failed("Bluetooth radio reset failed.");
 
                     await Task.Delay(1500, ct).ConfigureAwait(false);
 
                     for (int attempt = 1; attempt <= 8; attempt++)
                     {
-                        if (_radioService.UserRequestedAdapterOff) return false;
+                        if (_radioService.UserRequestedAdapterOff) return DeviceOperationResult.Cancelled("User requested adapter OFF during radio bounce.");
                         await Task.Delay(1000, ct).ConfigureAwait(false);
 
                         using (var bounceClient = new BluetoothClient())
@@ -865,24 +865,27 @@ namespace bluetooth_turnon.Services
                                 {
                                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{bounceDevice.DeviceName}' connected successfully after radio bounce on attempt {attempt}/8.");
                                     _batteryService?.ScheduleDeferredBatteryQuery(address, bounceDevice.DeviceName, isClassicOnly: false, immediate: true);
-                                    return true;
+                                    return DeviceOperationResult.Succeeded($"'{bounceDevice.DeviceName}' connected successfully after radio bounce on attempt {attempt}/8.");
                                 }
                             }
                         }
                     }
 
-                    return false;
+                    return DeviceOperationResult.TimedOut($"Connection timed out after radio bounce for '{targetDeviceName}'.");
                 }
-                catch (OperationCanceledException) { throw; }
+                catch (OperationCanceledException)
+                {
+                    return DeviceOperationResult.Cancelled();
+                }
                 catch (Exception ex)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"  ClassicAudioConnectionStrategy.ConnectAsync exception: {ex.Message}");
-                    return false;
+                    return DeviceOperationResult.Failed(ex.Message);
                 }
             }, ct).ConfigureAwait(false);
         }
 
-        public async Task<bool> DisconnectAsync(ulong address, string name, CancellationToken ct)
+        public async Task<DeviceOperationResult> DisconnectAsync(ulong address, string name, CancellationToken ct)
         {
             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicAudioConnectionStrategy.DisconnectAsync called for {address:X12}");
 
@@ -897,7 +900,7 @@ namespace bluetooth_turnon.Services
                         if (device == null)
                         {
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ClassicAudio: device {address:X12} not found in PairedDevices.");
-                            return false;
+                            return DeviceOperationResult.DeviceNotFound($"Classic device {address:X12} not found in PairedDevices.");
                         }
 
                         string targetName = device.DeviceName ?? (name ?? "Audio Device");
@@ -906,7 +909,7 @@ namespace bluetooth_turnon.Services
                         {
                             _batteryService?.HandleDeviceDisconnected(address);
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicAudio: '{targetName}' is already disconnected.");
-                            return true;
+                            return DeviceOperationResult.AlreadyDisconnected($"'{targetName}' is already disconnected.");
                         }
 
                         // Step 2: Core Audio disconnect
@@ -966,18 +969,21 @@ namespace bluetooth_turnon.Services
                         {
                             _batteryService?.HandleDeviceDisconnected(address);
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{targetName}' disconnected successfully.");
-                            return true;
+                            return DeviceOperationResult.Succeeded($"'{targetName}' disconnected successfully.");
                         }
 
                         AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ClassicAudio: Disconnect failed for '{targetName}'.");
-                        return false;
+                        return DeviceOperationResult.Failed($"Disconnect failed for '{targetName}'.");
                     }
                 }
-                catch (OperationCanceledException) { throw; }
+                catch (OperationCanceledException)
+                {
+                    return DeviceOperationResult.Cancelled();
+                }
                 catch (Exception ex)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"  ClassicAudio.DisconnectAsync exception: {ex.Message}");
-                    return false;
+                    return DeviceOperationResult.Failed(ex.Message);
                 }
             }, ct).ConfigureAwait(false);
         }

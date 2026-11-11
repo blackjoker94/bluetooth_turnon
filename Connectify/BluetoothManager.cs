@@ -54,7 +54,10 @@ namespace bluetooth_turnon
         Cancelled,
         AccessDenied,
         AlreadyInDesiredState,
-        RadioOff
+        RadioOff,
+        DeviceNotFound,
+        TimedOut,
+        PeripheralInputProtected
     }
 
     public sealed class DeviceOperationResult
@@ -75,6 +78,36 @@ namespace bluetooth_turnon
         public static DeviceOperationResult Cancelled(string msg = "Cancelled") => new DeviceOperationResult(DeviceOperationStatus.Cancelled, msg);
         public static DeviceOperationResult Failed(string reason) => new DeviceOperationResult(DeviceOperationStatus.Failed, reason);
         public static DeviceOperationResult AccessDenied(string reason = "Elevation required") => new DeviceOperationResult(DeviceOperationStatus.AccessDenied, reason);
+        public static DeviceOperationResult RadioOff(string reason = "Bluetooth adapter is off") => new DeviceOperationResult(DeviceOperationStatus.RadioOff, reason);
+        public static DeviceOperationResult TimedOut(string reason = "Operation timed out") => new DeviceOperationResult(DeviceOperationStatus.TimedOut, reason);
+        public static DeviceOperationResult DeviceNotFound(string reason = "Device not found") => new DeviceOperationResult(DeviceOperationStatus.DeviceNotFound, reason);
+        public static DeviceOperationResult PeripheralProtected(string reason = "Radio reset skipped to protect active keyboard/mouse") => new DeviceOperationResult(DeviceOperationStatus.PeripheralInputProtected, reason);
+
+        public string ToUiStatusString()
+        {
+            switch (Status)
+            {
+                case DeviceOperationStatus.Success:
+                    return Message ?? "Success";
+                case DeviceOperationStatus.AlreadyInDesiredState:
+                    return Message ?? "Already in desired state";
+                case DeviceOperationStatus.RadioOff:
+                    return "Bluetooth is turned off";
+                case DeviceOperationStatus.AccessDenied:
+                    return "Administrator permissions required";
+                case DeviceOperationStatus.Cancelled:
+                    return "Operation cancelled";
+                case DeviceOperationStatus.TimedOut:
+                    return "Device did not respond (timed out)";
+                case DeviceOperationStatus.DeviceNotFound:
+                    return "Device not found or out of range";
+                case DeviceOperationStatus.PeripheralInputProtected:
+                    return "Bluetooth reset prevented (input device in use)";
+                case DeviceOperationStatus.Failed:
+                default:
+                    return Message ?? "Operation failed";
+            }
+        }
     }
 
     /// <summary>
@@ -397,9 +430,19 @@ namespace bluetooth_turnon
             return await _connectionService.ConnectDeviceAsync(address, ct).ConfigureAwait(false);
         }
 
+        internal async Task<DeviceOperationResult> ConnectDeviceWithResultAsync(ulong address, CancellationToken ct = default)
+        {
+            return await _connectionService.ConnectDeviceWithResultAsync(address, ct).ConfigureAwait(false);
+        }
+
         public async Task<bool> DisconnectDeviceAsync(ulong address, CancellationToken ct = default)
         {
             return await _connectionService.DisconnectDeviceAsync(address, ct).ConfigureAwait(false);
+        }
+
+        internal async Task<DeviceOperationResult> DisconnectDeviceWithResultAsync(ulong address, CancellationToken ct = default)
+        {
+            return await _connectionService.DisconnectDeviceWithResultAsync(address, ct).ConfigureAwait(false);
         }
 
         public void CancelDeviceOperations(bool userRequestedAdapterOff = false)

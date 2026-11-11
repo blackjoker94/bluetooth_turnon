@@ -1384,6 +1384,26 @@ namespace bluetooth_turnon
                 UpdateOperationFeedback(addr, "Elevation required", Color.FromArgb(230, 80, 80), view.TypeLabel);
                 try { await Task.Delay(1500, _cts.Token); } catch { }
             }
+            else if (result.Status == DeviceOperationStatus.PeripheralInputProtected)
+            {
+                UpdateOperationFeedback(addr, "Input in use (Reset skipped)", Color.FromArgb(230, 80, 80), view.TypeLabel);
+                try { await Task.Delay(1500, _cts.Token); } catch { }
+            }
+            else if (result.Status == DeviceOperationStatus.RadioOff)
+            {
+                UpdateOperationFeedback(addr, "Bluetooth is OFF", Color.FromArgb(230, 80, 80), view.TypeLabel);
+                try { await Task.Delay(1500, _cts.Token); } catch { }
+            }
+            else if (result.Status == DeviceOperationStatus.TimedOut)
+            {
+                UpdateOperationFeedback(addr, "Timed out", Color.FromArgb(230, 80, 80), view.TypeLabel);
+                try { await Task.Delay(1500, _cts.Token); } catch { }
+            }
+            else if (result.Status == DeviceOperationStatus.DeviceNotFound)
+            {
+                UpdateOperationFeedback(addr, "Device not found", Color.FromArgb(230, 80, 80), view.TypeLabel);
+                try { await Task.Delay(1500, _cts.Token); } catch { }
+            }
             else if (result.IsSuccess)
             {
                 try { await Task.Delay(200, _cts.Token); } catch { }

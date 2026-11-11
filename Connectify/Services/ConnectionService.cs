@@ -125,12 +125,18 @@ namespace bluetooth_turnon.Services
 
         public async Task<bool> ConnectDeviceAsync(ulong address, CancellationToken ct = default)
         {
+            var res = await ConnectDeviceWithResultAsync(address, ct).ConfigureAwait(false);
+            return res.IsSuccess;
+        }
+
+        public async Task<DeviceOperationResult> ConnectDeviceWithResultAsync(ulong address, CancellationToken ct = default)
+        {
             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"ConnectDeviceAsync called for {address:X12}");
 
             if (_radioService.BluetoothRadio == null || _radioService.BluetoothRadio.State != RadioState.On)
             {
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ConnectDeviceAsync: Bluetooth adapter is OFF or absent. Aborting connection for {address:X12}.");
-                return false;
+                return DeviceOperationResult.RadioOff("Bluetooth adapter is OFF or absent");
             }
 
             CancellationTokenSource linkedCts;
@@ -150,7 +156,7 @@ namespace bluetooth_turnon.Services
                 catch (OperationCanceledException)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"ConnectDeviceAsync: Cancelled while waiting for lock ({address:X12})");
-                    return false;
+                    return DeviceOperationResult.Cancelled("Cancelled while waiting for lock");
                 }
 
                 try
@@ -177,7 +183,7 @@ namespace bluetooth_turnon.Services
                                 if (device.Connected)
                                 {
                                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{targetDeviceName}' is already connected.");
-                                    return true;
+                                    return DeviceOperationResult.AlreadyConnected($"'{targetDeviceName}' is already connected");
                                 }
 
                                 bool bleConnected = false;
@@ -281,28 +287,32 @@ namespace bluetooth_turnon.Services
                                 }
                                 else
                                 {
-                                    bool audioOk = await _classicAudioStrategy.ConnectAsync(address, targetDeviceName, token).ConfigureAwait(false);
-                                    if (!audioOk && isBlePaired && !token.IsCancellationRequested && !_radioService.UserRequestedAdapterOff)
+                                    var audioRes = await _classicAudioStrategy.ConnectAsync(address, targetDeviceName, token).ConfigureAwait(false);
+                                    if (!audioRes.IsSuccess && isBlePaired && !token.IsCancellationRequested && !_radioService.UserRequestedAdapterOff)
                                     {
                                         AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  Classic connect chain did not establish connection for dual-mode device '{targetDeviceName}'. Attempting BLE fallback...");
-                                        return await _bleStrategy.ConnectAsync(address, targetDeviceName, token).ConfigureAwait(false);
+                                        var bleRes = await _bleStrategy.ConnectAsync(address, targetDeviceName, token).ConfigureAwait(false);
+                                        if (bleRes.IsSuccess) return bleRes;
                                     }
-                                    return audioOk;
+                                    return audioRes;
                                 }
                             }
                         }
-                        catch (OperationCanceledException) { throw; }
+                        catch (OperationCanceledException)
+                        {
+                            return DeviceOperationResult.Cancelled();
+                        }
                         catch (Exception ex)
                         {
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"ConnectDeviceAsync inner exception: {ex.Message}");
-                            return false;
+                            return DeviceOperationResult.Failed(ex.Message);
                         }
                     }, token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"ConnectDeviceAsync cancelled for {address:X12}");
-                    return false;
+                    return DeviceOperationResult.Cancelled();
                 }
                 finally
                 {
@@ -312,6 +322,12 @@ namespace bluetooth_turnon.Services
         }
 
         public async Task<bool> DisconnectDeviceAsync(ulong address, CancellationToken ct = default)
+        {
+            var res = await DisconnectDeviceWithResultAsync(address, ct).ConfigureAwait(false);
+            return res.IsSuccess;
+        }
+
+        public async Task<DeviceOperationResult> DisconnectDeviceWithResultAsync(ulong address, CancellationToken ct = default)
         {
             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"DisconnectDeviceAsync called for {address:X12}");
 
@@ -332,7 +348,7 @@ namespace bluetooth_turnon.Services
                 catch (OperationCanceledException)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"DisconnectDeviceAsync: Cancelled while waiting for lock ({address:X12})");
-                    return false;
+                    return DeviceOperationResult.Cancelled("Cancelled while waiting for lock");
                 }
 
                 try
@@ -366,7 +382,7 @@ namespace bluetooth_turnon.Services
                                         try
                                         {
                                             using (var bleLookupCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1200)))
-                                            using (var bleLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, bleLookupCts.Token))
+                                             using (var bleLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, bleLookupCts.Token))
                                             using (var checkDev = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
                                                 .AsTask(bleLinkedCts.Token).ConfigureAwait(false))
                                             {
@@ -385,7 +401,7 @@ namespace bluetooth_turnon.Services
 
                                     _batteryService?.HandleDeviceDisconnected(address);
                                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{targetName}' is already disconnected (Classic and BLE).");
-                                    return true;
+                                    return DeviceOperationResult.AlreadyDisconnected($"'{targetName}' is already disconnected (Classic and BLE)");
                                 }
 
                                 bool isHid = false;
@@ -397,32 +413,35 @@ namespace bluetooth_turnon.Services
                                 }
                                 catch { }
 
-                                bool disconnected = false;
+                                DeviceOperationResult disconnectedRes;
                                 if (isHid)
                                 {
-                                    disconnected = await _classicHidStrategy.DisconnectAsync(address, targetName, token).ConfigureAwait(false);
+                                    disconnectedRes = await _classicHidStrategy.DisconnectAsync(address, targetName, token).ConfigureAwait(false);
                                 }
                                 else
                                 {
-                                    disconnected = await _classicAudioStrategy.DisconnectAsync(address, targetName, token).ConfigureAwait(false);
+                                    disconnectedRes = await _classicAudioStrategy.DisconnectAsync(address, targetName, token).ConfigureAwait(false);
                                 }
 
                                 ReleaseConnectedBleHandle(address);
-                                return disconnected;
+                                return disconnectedRes;
                             }
                         }
-                        catch (OperationCanceledException) { throw; }
+                        catch (OperationCanceledException)
+                        {
+                            return DeviceOperationResult.Cancelled();
+                        }
                         catch (Exception ex)
                         {
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"DisconnectDeviceAsync inner exception: {ex.Message}");
-                            return false;
+                            return DeviceOperationResult.Failed(ex.Message);
                         }
                     }, token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"DisconnectDeviceAsync cancelled for {address:X12}");
-                    return false;
+                    return DeviceOperationResult.Cancelled();
                 }
                 finally
                 {

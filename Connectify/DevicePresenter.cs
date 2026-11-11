@@ -15,8 +15,8 @@ namespace bluetooth_turnon
     {
         private readonly BluetoothManager _bluetoothManager;
         private readonly Func<ulong, CancellationToken, Task<bool?>> _connectionStatusChecker;
-        private readonly Func<ulong, CancellationToken, Task<bool>> _connectRunner;
-        private readonly Func<ulong, CancellationToken, Task<bool>> _disconnectRunner;
+        private readonly Func<ulong, CancellationToken, Task<DeviceOperationResult>> _connectRunner;
+        private readonly Func<ulong, CancellationToken, Task<DeviceOperationResult>> _disconnectRunner;
         private readonly ConcurrentDictionary<ulong, (string Text, Color Color)> _inFlightOperations =
             new ConcurrentDictionary<ulong, (string Text, Color Color)>();
         private readonly object _ctsLock = new object();
@@ -27,8 +27,8 @@ namespace bluetooth_turnon
             : this(
                 bluetoothManager,
                 bluetoothManager != null ? bluetoothManager.IsDeviceConnectedAsync : (Func<ulong, CancellationToken, Task<bool?>>)null,
-                bluetoothManager != null ? bluetoothManager.ConnectDeviceAsync : (Func<ulong, CancellationToken, Task<bool>>)null,
-                bluetoothManager != null ? bluetoothManager.DisconnectDeviceAsync : (Func<ulong, CancellationToken, Task<bool>>)null)
+                bluetoothManager != null ? (Func<ulong, CancellationToken, Task<DeviceOperationResult>>)bluetoothManager.ConnectDeviceWithResultAsync : null,
+                bluetoothManager != null ? (Func<ulong, CancellationToken, Task<DeviceOperationResult>>)bluetoothManager.DisconnectDeviceWithResultAsync : null)
         {
         }
 
@@ -37,11 +37,36 @@ namespace bluetooth_turnon
             Func<ulong, CancellationToken, Task<bool?>> connectionStatusChecker,
             Func<ulong, CancellationToken, Task<bool>> connectRunner,
             Func<ulong, CancellationToken, Task<bool>> disconnectRunner)
+            : this(
+                bluetoothManager,
+                connectionStatusChecker,
+                connectRunner != null
+                    ? (Func<ulong, CancellationToken, Task<DeviceOperationResult>>)(async (addr, ct) =>
+                    {
+                        bool ok = await connectRunner(addr, ct).ConfigureAwait(false);
+                        return ok ? DeviceOperationResult.Succeeded("Connected") : DeviceOperationResult.Failed("Connection failed");
+                    })
+                    : null,
+                disconnectRunner != null
+                    ? (Func<ulong, CancellationToken, Task<DeviceOperationResult>>)(async (addr, ct) =>
+                    {
+                        bool ok = await disconnectRunner(addr, ct).ConfigureAwait(false);
+                        return ok ? DeviceOperationResult.Succeeded("Disconnected") : DeviceOperationResult.Failed("Disconnect failed");
+                    })
+                    : null)
+        {
+        }
+
+        public DevicePresenter(
+            BluetoothManager bluetoothManager,
+            Func<ulong, CancellationToken, Task<bool?>> connectionStatusChecker,
+            Func<ulong, CancellationToken, Task<DeviceOperationResult>> connectRunner,
+            Func<ulong, CancellationToken, Task<DeviceOperationResult>> disconnectRunner)
         {
             _bluetoothManager = bluetoothManager;
             _connectionStatusChecker = connectionStatusChecker ?? (bluetoothManager != null ? bluetoothManager.IsDeviceConnectedAsync : null);
-            _connectRunner = connectRunner ?? (bluetoothManager != null ? bluetoothManager.ConnectDeviceAsync : null);
-            _disconnectRunner = disconnectRunner ?? (bluetoothManager != null ? bluetoothManager.DisconnectDeviceAsync : null);
+            _connectRunner = connectRunner ?? (bluetoothManager != null ? bluetoothManager.ConnectDeviceWithResultAsync : null);
+            _disconnectRunner = disconnectRunner ?? (bluetoothManager != null ? bluetoothManager.DisconnectDeviceWithResultAsync : null);
         }
 
         /// <summary>
@@ -184,38 +209,39 @@ namespace bluetooth_turnon
                 }
 
                 // Fresh state null means unknown, so proceed with the intended action. Never flip.
-                bool success = false;
+                DeviceOperationResult opResult;
                 if (userIntentConnect)
                 {
                     if (_connectRunner != null)
                     {
-                        success = await _connectRunner(addr, linkedToken).ConfigureAwait(false);
+                        opResult = await _connectRunner(addr, linkedToken).ConfigureAwait(false);
                     }
                     else if (_bluetoothManager != null)
                     {
-                        success = await _bluetoothManager.ConnectDeviceAsync(addr, linkedToken).ConfigureAwait(false);
+                        opResult = await _bluetoothManager.ConnectDeviceWithResultAsync(addr, linkedToken).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        opResult = DeviceOperationResult.Failed("No connect runner available");
                     }
                 }
                 else
                 {
                     if (_disconnectRunner != null)
                     {
-                        success = await _disconnectRunner(addr, linkedToken).ConfigureAwait(false);
+                        opResult = await _disconnectRunner(addr, linkedToken).ConfigureAwait(false);
                     }
                     else if (_bluetoothManager != null)
                     {
-                        success = await _bluetoothManager.DisconnectDeviceAsync(addr, linkedToken).ConfigureAwait(false);
+                        opResult = await _bluetoothManager.DisconnectDeviceWithResultAsync(addr, linkedToken).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        opResult = DeviceOperationResult.Failed("No disconnect runner available");
                     }
                 }
 
-                if (success)
-                {
-                    return DeviceOperationResult.Succeeded(userIntentConnect ? "Connected" : "Disconnected");
-                }
-                else
-                {
-                    return DeviceOperationResult.Failed(userIntentConnect ? "Connection failed" : "Disconnect failed");
-                }
+                return opResult;
             }
             catch (OperationCanceledException)
             {
