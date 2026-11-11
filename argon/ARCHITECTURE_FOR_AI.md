@@ -164,6 +164,7 @@ Classified by `ConnectRoutingPolicy.ClassifyTransportCapability`:
   2. In-flight marker: HKCU registry `Software\Connectify\BounceInProgress`. Recovered on next app startup if abnormal shutdown occurs.
   3. Peripheral Guard: `CheckConnectedPeripheralsAsync` detects active connection handles, cached connections, paired BLE HIDs (`System.Devices.Aep.IsConnected`), and Classic paired HIDs without blocking the UI thread.
   4. User Intent Guard: If the user explicitly turns the adapter off, `_userRequestedAdapterOff` aborts any active bounce retry loops and forces radio power OFF. Flag resets automatically when the radio is re-enabled externally.
+  5. Internal Power-Down Suppression: During an active bounce, `BluetoothRadio_StateChanged` suppresses `RadioTurnedOff` unless `_userRequestedAdapterOff` is true. `BluetoothManager` guards `CancelDeviceOperations` against `IsRadioBounceInProgress`, ensuring the bounce's own 1-second power-down does not cancel `_deviceOpCts` or abort itself mid-reset.
 
 ### 4.5 Battery Hydration & Caching Pipeline
 - **Budgets**:

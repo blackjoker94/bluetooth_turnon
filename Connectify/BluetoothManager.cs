@@ -368,7 +368,10 @@ namespace bluetooth_turnon
 
             _radioService.RadioTurnedOff += (reason) =>
             {
-                CancelDeviceOperations(userRequestedAdapterOff: false);
+                if (!_radioService.IsRadioBounceInProgress || _radioService.UserRequestedAdapterOff)
+                {
+                    CancelDeviceOperations(userRequestedAdapterOff: false);
+                }
                 _connectionService.ReleaseAllConnectedBleHandles(reason);
                 _batteryService.HandleAdapterTurnedOff();
             };

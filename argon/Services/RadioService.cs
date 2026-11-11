@@ -380,7 +380,10 @@ namespace bluetooth_turnon.Services
                 }
                 else
                 {
-                    RadioTurnedOff?.Invoke("external radio off");
+                    if (!IsRadioBounceInProgress || _userRequestedAdapterOff)
+                    {
+                        RadioTurnedOff?.Invoke("external radio off");
+                    }
                 }
 
                 AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(isEnabled));
