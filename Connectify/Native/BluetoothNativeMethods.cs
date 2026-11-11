@@ -99,5 +99,99 @@ namespace bluetooth_turnon
             int nOutBufferSize,
             out int lpBytesReturned,
             IntPtr lpOverlapped);
+
+        public static bool DisconnectDeviceViaIoctl(ulong address)
+        {
+            if (address == 0) return false;
+
+            var radioHandles = new System.Collections.Generic.List<IntPtr>();
+            IntPtr hFind = IntPtr.Zero;
+            try
+            {
+                var radioParams = new BLUETOOTH_FIND_RADIO_PARAMS();
+                radioParams.dwSize = (uint)Marshal.SizeOf(typeof(BLUETOOTH_FIND_RADIO_PARAMS));
+
+                IntPtr hRadio = IntPtr.Zero;
+                hFind = BluetoothFindFirstRadio(ref radioParams, out hRadio);
+                if (hFind != IntPtr.Zero && hRadio != IntPtr.Zero)
+                {
+                    radioHandles.Add(hRadio);
+                    while (BluetoothFindNextRadio(hFind, out hRadio))
+                    {
+                        if (hRadio != IntPtr.Zero)
+                        {
+                            radioHandles.Add(hRadio);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  DisconnectDeviceViaIoctl radio enumeration exception: {ex.Message}");
+            }
+            finally
+            {
+                if (hFind != IntPtr.Zero)
+                {
+                    try { BluetoothFindRadioClose(hFind); } catch { }
+                }
+            }
+
+            try
+            {
+                if (radioHandles.Count == 0)
+                {
+                    AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, "  DisconnectDeviceViaIoctl: No local Bluetooth radio handle found.");
+                    return false;
+                }
+
+                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  DisconnectDeviceViaIoctl: Enumerated {radioHandles.Count} radio(s). Sending IOCTL_BTH_DISCONNECT_DEVICE for {address:X12}...");
+                bool anyDisconnected = false;
+                long inBuffer = (long)address;
+
+                for (int i = 0; i < radioHandles.Count; i++)
+                {
+                    IntPtr hRadio = radioHandles[i];
+                    int bytesReturned = 0;
+                    bool success = DeviceIoControl(
+                        hRadio,
+                        IOCTL_BTH_DISCONNECT_DEVICE,
+                        ref inBuffer,
+                        sizeof(long),
+                        IntPtr.Zero,
+                        0,
+                        out bytesReturned,
+                        IntPtr.Zero);
+
+                    if (success)
+                    {
+                        AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  DisconnectDeviceViaIoctl: IOCTL succeeded on radio #{i + 1}");
+                        anyDisconnected = true;
+                    }
+                    else
+                    {
+                        int win32Err = Marshal.GetLastWin32Error();
+                        AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  DisconnectDeviceViaIoctl: Radio #{i + 1} DeviceIoControl returned false. Win32 error={win32Err}");
+                    }
+                }
+
+                return anyDisconnected;
+            }
+            catch (Exception ex)
+            {
+                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"  DisconnectDeviceViaIoctl exception: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                foreach (var hRadio in radioHandles)
+                {
+                    if (hRadio != IntPtr.Zero)
+                    {
+                        try { CloseHandle(hRadio); } catch { }
+                    }
+                }
+            }
+        }
     }
 }

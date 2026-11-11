@@ -183,6 +183,19 @@
     <Compile Include="Logging\AsyncFileLogger.cs" />
     <Compile Include="Native\BluetoothNativeMethods.cs" />
     <Compile Include="Native\CoreAudioInterop.cs" />
+    <Compile Include="Common\WinRtAsyncExtensions.cs" />
+    <Compile Include="Services\IRadioService.cs" />
+    <Compile Include="Services\RadioService.cs" />
+    <Compile Include="Services\IBatteryService.cs" />
+    <Compile Include="Services\BatteryService.cs" />
+    <Compile Include="Services\IDeviceEnumerator.cs" />
+    <Compile Include="Services\DeviceEnumerator.cs" />
+    <Compile Include="Services\IConnectionStrategy.cs" />
+    <Compile Include="Services\BleConnectionStrategy.cs" />
+    <Compile Include="Services\ClassicAudioConnectionStrategy.cs" />
+    <Compile Include="Services\ClassicHidConnectionStrategy.cs" />
+    <Compile Include="Services\IConnectionService.cs" />
+    <Compile Include="Services\ConnectionService.cs" />
     <EmbeddedResource Include="Form1.resx">
       <DependentUpon>Form1.cs</DependentUpon>
     </EmbeddedResource>

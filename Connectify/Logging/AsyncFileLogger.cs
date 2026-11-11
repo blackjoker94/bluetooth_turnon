@@ -13,6 +13,14 @@ namespace bluetooth_turnon
     /// </summary>
     internal static class AsyncFileLogger
     {
+        public enum LogLevel
+        {
+            Debug,
+            Info,
+            Warning,
+            Error
+        }
+
         private const long MaxLogFileSizeBytes = 1024 * 1024; // 1 MB
         private static readonly string _logPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -54,12 +62,19 @@ namespace bluetooth_turnon
             });
         }
 
-        public static void Log(BluetoothManager.LogLevel level, string msg)
+        public static void Log(string msg) => Log(LogLevel.Info, msg);
+
+        public static void Log(LogLevel level, string msg)
         {
             if (string.IsNullOrEmpty(msg) || !_logWriterRunning) return;
             string masked = MaskAddress(msg);
             string entry = $"{DateTime.Now:HH:mm:ss.fff} [{level}] {masked}";
             _logQueue.TryAdd(entry);
+        }
+
+        public static void Log(BluetoothManager.LogLevel level, string msg)
+        {
+            Log((LogLevel)level, msg);
         }
 
         private static void ProcessLogQueue()
