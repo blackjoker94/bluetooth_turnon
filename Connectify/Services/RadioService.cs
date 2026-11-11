@@ -183,7 +183,12 @@ namespace bluetooth_turnon.Services
         public event EventHandler<DeviceOperationProgressEventArgs> OperationProgressChanged;
         public event Action<string> RadioTurnedOff;
 
-        public bool IsRadioBounceInProgress { get; internal set; }
+        private volatile bool _isRadioBounceInProgress;
+        public bool IsRadioBounceInProgress
+        {
+            get => _isRadioBounceInProgress;
+            internal set => _isRadioBounceInProgress = value;
+        }
 
         public bool UserRequestedAdapterOff
         {
@@ -369,7 +374,11 @@ namespace bluetooth_turnon.Services
                 bool isEnabled = (sender.State == RadioState.On);
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"BluetoothRadio_StateChanged: isEnabled={isEnabled}");
 
-                if (!isEnabled)
+                if (isEnabled)
+                {
+                    _userRequestedAdapterOff = false;
+                }
+                else
                 {
                     RadioTurnedOff?.Invoke("external radio off");
                 }
@@ -516,6 +525,7 @@ namespace bluetooth_turnon.Services
             IsRadioBounceInProgress = true;
             SetBounceInProgressMarker(true);
             bool radioTurnedOffByBounce = false;
+            bool onSuccess = false;
             OperationProgressChanged?.Invoke(this, new DeviceOperationProgressEventArgs(0, "Resetting Bluetooth adapter..."));
 
             try
@@ -523,7 +533,8 @@ namespace bluetooth_turnon.Services
                 if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, "ManualResetBluetoothAsync: Adapter is OFF or absent. Turning adapter ON...");
-                    return await SetAdapterStateAsync(true, ct, isUserInitiated: true).ConfigureAwait(false);
+                    onSuccess = await SetAdapterStateAsync(true, ct, isUserInitiated: true).ConfigureAwait(false);
+                    return onSuccess;
                 }
 
                 bool offSuccess = await SetAdapterStateAsync(false, ct, isUserInitiated: false).ConfigureAwait(false);
@@ -537,7 +548,6 @@ namespace bluetooth_turnon.Services
 
                 await Task.Delay(1000, ct).ConfigureAwait(false);
 
-                bool onSuccess = false;
                 for (int attempt = 1; attempt <= 3; attempt++)
                 {
                     if (_userRequestedAdapterOff)
@@ -591,6 +601,7 @@ namespace bluetooth_turnon.Services
                         }
                     }
                     else if (radioTurnedOffByBounce &&
+                        !onSuccess &&
                         (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On) &&
                         !_disposed)
                     {
@@ -607,7 +618,7 @@ namespace bluetooth_turnon.Services
                 {
                     bool? finalState = _userRequestedAdapterOff
                         ? false
-                        : ((_bluetoothRadio != null && _bluetoothRadio.State != RadioState.Unknown) ? (_bluetoothRadio.State == RadioState.On) : (bool?)null);
+                        : (onSuccess ? true : ((_bluetoothRadio != null && _bluetoothRadio.State != RadioState.Unknown) ? (_bluetoothRadio.State == RadioState.On) : (bool?)null));
                     AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(finalState));
                 }
                 catch { }

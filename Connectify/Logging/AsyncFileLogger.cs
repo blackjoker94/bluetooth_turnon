@@ -28,7 +28,7 @@ namespace bluetooth_turnon
         private static readonly BlockingCollection<string> _logQueue = new BlockingCollection<string>(new ConcurrentQueue<string>(), 2000);
         private static readonly Thread _logWorkerThread;
         private static volatile bool _logWriterRunning = true;
-        private static readonly Regex _macRegex = new Regex(@"\b([0-9A-Fa-f]{2}[:-]?){5}([0-9A-Fa-f]{2})\b|\b[0-9A-Fa-f]{12}\b", RegexOptions.Compiled);
+        private static readonly Regex _macRegex = new Regex(@"(?<!-[0-9A-Fa-f]{4}-)(?<=^|[^0-9A-Fa-f]|BluetoothLE)(?:([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}|[0-9A-Fa-f]{12})(?=[^0-9A-Fa-f]|$)", RegexOptions.Compiled);
 
         static AsyncFileLogger()
         {
@@ -55,8 +55,8 @@ namespace bluetooth_turnon
                 }
                 else if (val.Length == 17)
                 {
-                    // Form XX:XX:XX:XX:XX:XX -> **:**:**:**:XX:XX
-                    return "**:**:**:**:" + val.Substring(12);
+                    char sep = val[2];
+                    return $"**{sep}**{sep}**{sep}**{sep}" + val.Substring(12);
                 }
                 return val;
             });

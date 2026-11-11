@@ -50,6 +50,16 @@ namespace bluetooth_turnon
             IReadOnlyCollection<Guid> installedServices,
             int codMajor)
         {
+            return ClassifyTransportCapability(isBlePaired, installedServicesReadSuccess, installedServices, codMajor, codReadSuccess: true);
+        }
+
+        public static DeviceTransportCapability ClassifyTransportCapability(
+            bool isBlePaired,
+            bool installedServicesReadSuccess,
+            IReadOnlyCollection<Guid> installedServices,
+            int codMajor,
+            bool codReadSuccess)
+        {
             // Empty or exception means Unknown
             if (!installedServicesReadSuccess || installedServices == null)
             {
@@ -79,6 +89,12 @@ namespace bluetooth_turnon
             if (hasClassicAudio || hasClassicHid)
             {
                 return DeviceTransportCapability.ClassicCapable;
+            }
+
+            // If CoD read failed, we do not have positive evidence that CoD is not Classic
+            if (!codReadSuccess)
+            {
+                return DeviceTransportCapability.Unknown;
             }
 
             // 2. Empty installed services: if read succeeded but count is 0,

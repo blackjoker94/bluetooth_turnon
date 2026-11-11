@@ -211,6 +211,13 @@ namespace bluetooth_turnon
             string assetsDir,
             Func<string, string, Image> iconLoader)
         {
+            // Update background color based on hover state
+            Point cursorInCard = view.Card.PointToClient(Cursor.Position);
+            view.IsHovered = view.Card.ClientRectangle.Contains(cursorInCard);
+            Color currentBg = view.IsHovered ? vm.HoverBgColor : vm.BaseBgColor;
+
+            bool needIconRepaint = (view.AccentColor != vm.AccentColor || view.IconPanel.BackColor != currentBg);
+
             view.BoundDevice = boundDevice;
             view.BaseBgColor = vm.BaseBgColor;
             view.HoverBgColor = vm.HoverBgColor;
@@ -229,10 +236,6 @@ namespace bluetooth_turnon
                 view.BatteryLabel.Location = new Point(batteryColX + 32, (cardHeight - 20) / 2);
             }
 
-            // Update background color based on hover state
-            Point cursorInCard = view.Card.PointToClient(Cursor.Position);
-            view.IsHovered = view.Card.ClientRectangle.Contains(cursorInCard);
-            Color currentBg = view.IsHovered ? vm.HoverBgColor : vm.BaseBgColor;
             if (view.Card.BackColor != currentBg) view.Card.BackColor = currentBg;
             if (view.IconPanel.BackColor != currentBg) view.IconPanel.BackColor = currentBg;
 
@@ -258,7 +261,10 @@ namespace bluetooth_turnon
             Image iconImg = iconLoader(assetsDir, iconFile);
             if (view.IconBox.Image != iconImg) view.IconBox.Image = iconImg;
 
-            view.IconPanel.Invalidate();
+            if (needIconRepaint)
+            {
+                view.IconPanel.Invalidate();
+            }
         }
 
         public static void SetDoubleBuffered(Control c)

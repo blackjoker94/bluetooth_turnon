@@ -194,41 +194,46 @@ namespace bluetooth_turnon.Services
 
                                 isBlePaired = false;
                                 BluetoothDeviceType bleType = BluetoothDeviceType.Unknown;
+                                BluetoothLEDevice tempBle = null;
                                 try
                                 {
                                     using (var bleLookupCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1200)))
                                     using (var bleLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, bleLookupCts.Token))
-                                    using (var tempBle = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
-                                        .AsTask(bleLinkedCts.Token).ConfigureAwait(false))
                                     {
-                                        if (tempBle != null)
+                                        tempBle = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
+                                            .AsTask(bleLinkedCts.Token).ConfigureAwait(false);
+                                    }
+
+                                    if (tempBle != null)
+                                    {
+                                        if (tempBle.ConnectionStatus == BluetoothConnectionStatus.Connected)
+                                            bleConnected = true;
+                                        isBlePaired = (tempBle.DeviceInformation?.Pairing?.IsPaired == true);
+                                        bleType = DeviceClassifier.ClassifyByAppearance(tempBle.Appearance.Category, tempBle.Appearance.SubCategory);
+                                        if (bleType == BluetoothDeviceType.Unknown)
                                         {
-                                            if (tempBle.ConnectionStatus == BluetoothConnectionStatus.Connected)
-                                                bleConnected = true;
-                                            isBlePaired = (tempBle.DeviceInformation?.Pairing?.IsPaired == true);
-                                            bleType = DeviceClassifier.ClassifyByAppearance(tempBle.Appearance.Category, tempBle.Appearance.SubCategory);
-                                            if (bleType == BluetoothDeviceType.Unknown)
-                                            {
-                                                bleType = DeviceClassifier.ClassifyByName(tempBle.Name);
-                                            }
+                                            bleType = DeviceClassifier.ClassifyByName(tempBle.Name);
                                         }
                                     }
                                 }
                                 catch { }
-
-                                if (bleConnected)
+                                finally
                                 {
-                                    AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ConnectDeviceAsync: '{targetDeviceName}' found connected over BLE. Routing to BLE connect path.");
-                                    return await _bleStrategy.ConnectAsync(address, targetDeviceName, token).ConfigureAwait(false);
+                                    if (tempBle != null && (!_connectedBleDevices.TryGetValue(address, out var tracked) || !ReferenceEquals(tracked, tempBle)))
+                                    {
+                                        try { tempBle.Dispose(); } catch { }
+                                    }
                                 }
 
                                 int codMajor = 0;
                                 int codMinor = 0;
+                                bool codReadSuccess = false;
                                 try
                                 {
                                     int cod = (int)device.ClassOfDevice.Value;
                                     codMajor = (cod >> 8) & 0x1F;
                                     codMinor = (cod >> 2) & 0x3F;
+                                    codReadSuccess = true;
                                 }
                                 catch { }
 
@@ -272,7 +277,7 @@ namespace bluetooth_turnon.Services
 
                                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  [InstalledServices] Device '{targetDeviceName}' ({address:X12}, Connected={device.Connected}): count={installedCount}, profiles=[{installedProfilesStr}]");
 
-                                var capability = ConnectRoutingPolicy.ClassifyTransportCapability(isBlePaired, installedReadSuccess, installedServices, codMajor);
+                                var capability = ConnectRoutingPolicy.ClassifyTransportCapability(isBlePaired, installedReadSuccess, installedServices, codMajor, codReadSuccess);
                                 var route = ConnectRoutingPolicy.DetermineConnectionRoute(capability, codMajor, isPeripheral);
 
                                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  [Routing Decision] Device '{targetDeviceName}' ({address:X12}): Capability={capability}, Route={route}, isBlePaired={isBlePaired}, CoDMajor=0x{codMajor:X2}, isPeripheral={isPeripheral}");
@@ -288,7 +293,11 @@ namespace bluetooth_turnon.Services
                                 else
                                 {
                                     var audioRes = await _classicAudioStrategy.ConnectAsync(address, targetDeviceName, token).ConfigureAwait(false);
-                                    if (!audioRes.IsSuccess && isBlePaired && !token.IsCancellationRequested && !_radioService.UserRequestedAdapterOff)
+                                    if ((audioRes.Status == DeviceOperationStatus.Failed || audioRes.Status == DeviceOperationStatus.TimedOut)
+                                        && codMajor != 0x04
+                                        && isBlePaired
+                                        && !token.IsCancellationRequested
+                                        && !_radioService.UserRequestedAdapterOff)
                                     {
                                         AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  Classic connect chain did not establish connection for dual-mode device '{targetDeviceName}'. Attempting BLE fallback...");
                                         var bleRes = await _bleStrategy.ConnectAsync(address, targetDeviceName, token).ConfigureAwait(false);
@@ -379,18 +388,27 @@ namespace bluetooth_turnon.Services
                                     }
                                     if (!bleStillConnected)
                                     {
+                                        BluetoothLEDevice checkDev = null;
                                         try
                                         {
                                             using (var bleLookupCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1200)))
-                                             using (var bleLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, bleLookupCts.Token))
-                                            using (var checkDev = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
-                                                .AsTask(bleLinkedCts.Token).ConfigureAwait(false))
+                                            using (var bleLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, bleLookupCts.Token))
                                             {
-                                                if (checkDev != null)
-                                                    bleStillConnected = (checkDev.ConnectionStatus == BluetoothConnectionStatus.Connected);
+                                                checkDev = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
+                                                    .AsTask(bleLinkedCts.Token).ConfigureAwait(false);
                                             }
+
+                                            if (checkDev != null)
+                                                bleStillConnected = (checkDev.ConnectionStatus == BluetoothConnectionStatus.Connected);
                                         }
                                         catch { }
+                                        finally
+                                        {
+                                            if (checkDev != null && (!_connectedBleDevices.TryGetValue(address, out var tracked) || !ReferenceEquals(tracked, checkDev)))
+                                            {
+                                                try { checkDev.Dispose(); } catch { }
+                                            }
+                                        }
                                     }
 
                                     if (bleStillConnected)
@@ -404,17 +422,33 @@ namespace bluetooth_turnon.Services
                                     return DeviceOperationResult.AlreadyDisconnected($"'{targetName}' is already disconnected (Classic and BLE)");
                                 }
 
-                                bool isHid = false;
+                                bool isPeripheral = false;
+                                int codMajor = 0;
+                                int codMinor = 0;
                                 try
                                 {
                                     int cod = (int)device.ClassOfDevice.Value;
-                                    int major = (cod >> 8) & 0x1F;
-                                    isHid = (major == 0x05);
+                                    codMajor = (cod >> 8) & 0x1F;
+                                    codMinor = (cod >> 2) & 0x3F;
                                 }
                                 catch { }
 
+                                var classifiedType = DeviceClassifier.ClassifyByCod(codMajor, codMinor);
+                                if (classifiedType != BluetoothDeviceType.Unknown)
+                                {
+                                    isPeripheral = DeviceClassifier.IsPeripheralType(classifiedType);
+                                }
+                                if (!isPeripheral)
+                                {
+                                    var nameType = DeviceClassifier.ClassifyByName(targetName);
+                                    if (nameType != BluetoothDeviceType.Unknown)
+                                    {
+                                        isPeripheral = DeviceClassifier.IsPeripheralType(nameType);
+                                    }
+                                }
+
                                 DeviceOperationResult disconnectedRes;
-                                if (isHid)
+                                if (isPeripheral)
                                 {
                                     disconnectedRes = await _classicHidStrategy.DisconnectAsync(address, targetName, token).ConfigureAwait(false);
                                 }

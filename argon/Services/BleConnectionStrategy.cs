@@ -24,6 +24,7 @@ namespace bluetooth_turnon.Services
         {
             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ConnectBleDeviceAsync called for {address:X12}");
             BluetoothLEDevice bleDevice = null;
+            GattDeviceServicesResult gattResult = null;
             bool success = false;
             try
             {
@@ -57,7 +58,6 @@ namespace bluetooth_turnon.Services
                 }
 
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"  ConnectBleDeviceAsync: Requesting uncached GATT services to trigger connection for '{bleName}'...");
-                GattDeviceServicesResult gattResult = null;
                 try
                 {
                     using (var gattCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
@@ -116,11 +116,6 @@ namespace bluetooth_turnon.Services
                     await Task.Delay(800, ct).ConfigureAwait(false);
                 }
 
-                if (gattResult?.Services != null)
-                {
-                    foreach (var svc in gattResult.Services) { try { svc.Dispose(); } catch { } }
-                }
-
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  ConnectBleDeviceAsync failed for '{bleName}' ({address:X12}).");
                 return DeviceOperationResult.Failed($"Connection failed for '{bleName}' ({address:X12}).");
             }
@@ -135,6 +130,10 @@ namespace bluetooth_turnon.Services
             }
             finally
             {
+                if (gattResult?.Services != null)
+                {
+                    foreach (var svc in gattResult.Services) { try { svc.Dispose(); } catch { } }
+                }
                 if (!success)
                 {
                     try { bleDevice?.Dispose(); } catch { }

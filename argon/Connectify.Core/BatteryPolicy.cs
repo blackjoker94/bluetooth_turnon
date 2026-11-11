@@ -7,9 +7,10 @@ namespace bluetooth_turnon
     /// </summary>
     public enum BatteryQueryOutcome
     {
-        Success,
-        Unsupported,
-        TransientFailure
+        Success = 0,
+        Unsupported = 1,
+        TransientFailure = 2,
+        Unknown = 3
     }
 
     /// <summary>
@@ -18,6 +19,8 @@ namespace bluetooth_turnon
     /// </summary>
     public sealed class BatteryCacheEntry
     {
+        private readonly object _lock = new object();
+
         public ulong Address { get; set; }
         public string DeviceName { get; set; }
         public int? BatteryPercent { get; set; }
@@ -31,67 +34,90 @@ namespace bluetooth_turnon
 
         public int? GetEffectiveBattery()
         {
-            if (Outcome == BatteryQueryOutcome.Unsupported) return null;
-            if (BatteryPercent.HasValue) return BatteryPercent;
-            if (LastGoodBattery.HasValue && LastGoodUtc.HasValue &&
-                (DateTime.UtcNow - LastGoodUtc.Value) < BatteryPolicy.BatteryLastGoodRetentionDuration)
+            lock (_lock)
             {
-                return LastGoodBattery;
+                if (Outcome == BatteryQueryOutcome.Unsupported) return null;
+                if (BatteryPercent.HasValue) return BatteryPercent;
+                if (LastGoodBattery.HasValue && LastGoodUtc.HasValue &&
+                    (DateTime.UtcNow - LastGoodUtc.Value) < BatteryPolicy.BatteryLastGoodRetentionDuration)
+                {
+                    return LastGoodBattery;
+                }
+                return null;
             }
-            return null;
         }
 
         public bool ShouldRetry()
         {
-            if (Outcome == BatteryQueryOutcome.Unsupported)
+            lock (_lock)
             {
-                return DateTime.UtcNow >= NextAllowedRetryUtc;
+                if (Outcome == BatteryQueryOutcome.Success)
+                {
+                    return DateTime.UtcNow >= NextAllowedRetryUtc;
+                }
+                if (Outcome == BatteryQueryOutcome.Unsupported)
+                {
+                    return DateTime.UtcNow >= NextAllowedRetryUtc;
+                }
+                if (Outcome == BatteryQueryOutcome.TransientFailure)
+                {
+                    if (FailureCount >= BatteryPolicy.MaxBatteryRetries)
+                    {
+                        return false;
+                    }
+                    return DateTime.UtcNow >= NextAllowedRetryUtc;
+                }
+                return false;
             }
-            if (Outcome == BatteryQueryOutcome.TransientFailure)
-            {
-                return DateTime.UtcNow >= NextAllowedRetryUtc;
-            }
-            return false;
         }
 
         public void RecordSuccess(int level, string deviceName)
         {
-            DeviceName = deviceName;
-            BatteryPercent = level;
-            LastGoodBattery = level;
-            LastGoodUtc = DateTime.UtcNow;
-            Outcome = BatteryQueryOutcome.Success;
-            LastCheckedUtc = DateTime.UtcNow;
-            FailureCount = 0;
-            NextAllowedRetryUtc = DateTime.UtcNow.AddMinutes(5);
+            lock (_lock)
+            {
+                DeviceName = deviceName;
+                BatteryPercent = level;
+                LastGoodBattery = level;
+                LastGoodUtc = DateTime.UtcNow;
+                Outcome = BatteryQueryOutcome.Success;
+                LastCheckedUtc = DateTime.UtcNow;
+                FailureCount = 0;
+                NextAllowedRetryUtc = DateTime.UtcNow.AddMinutes(5);
+            }
         }
 
         public void RecordUnsupported(string deviceName, bool isClassicOnly = false)
         {
-            DeviceName = deviceName;
-            BatteryPercent = null;
-            Outcome = BatteryQueryOutcome.Unsupported;
-            LastCheckedUtc = DateTime.UtcNow;
-            IsClassicOnly = isClassicOnly;
-            NextAllowedRetryUtc = DateTime.UtcNow.Add(BatteryPolicy.BatteryUnsupportedCacheDuration);
+            lock (_lock)
+            {
+                DeviceName = deviceName;
+                BatteryPercent = null;
+                Outcome = BatteryQueryOutcome.Unsupported;
+                LastCheckedUtc = DateTime.UtcNow;
+                IsClassicOnly = isClassicOnly;
+                NextAllowedRetryUtc = DateTime.UtcNow.Add(BatteryPolicy.BatteryUnsupportedCacheDuration);
+            }
         }
 
         public void RecordTransientFailure(string deviceName)
         {
-            DeviceName = deviceName;
-            Outcome = BatteryQueryOutcome.TransientFailure;
-            LastCheckedUtc = DateTime.UtcNow;
-            FailureCount++;
-            NextAllowedRetryUtc = DateTime.UtcNow.Add(BatteryPolicy.GetTransientBackoff(FailureCount));
+            lock (_lock)
+            {
+                DeviceName = deviceName;
+                Outcome = BatteryQueryOutcome.TransientFailure;
+                LastCheckedUtc = DateTime.UtcNow;
+                FailureCount++;
+                NextAllowedRetryUtc = DateTime.UtcNow.Add(BatteryPolicy.GetTransientBackoff(FailureCount));
 
-            if (LastGoodBattery.HasValue && LastGoodUtc.HasValue &&
-                (DateTime.UtcNow - LastGoodUtc.Value) < BatteryPolicy.BatteryLastGoodRetentionDuration)
-            {
-                BatteryPercent = LastGoodBattery;
-            }
-            else
-            {
-                BatteryPercent = null;
+                if (LastGoodBattery.HasValue && LastGoodUtc.HasValue &&
+                    (DateTime.UtcNow - LastGoodUtc.Value) < BatteryPolicy.BatteryLastGoodRetentionDuration)
+                {
+                    BatteryPercent = LastGoodBattery;
+                }
+                else
+                {
+                    BatteryPercent = null;
+                }
             }
         }
     }
@@ -168,6 +194,21 @@ namespace bluetooth_turnon
                     {
                         sub = sub.Substring("#BluetoothLE".Length);
                     }
+
+                    // Check for standard Windows WinRT format: <adapterMAC>-<deviceMAC>
+                    int hyphenIdx = sub.IndexOf('-');
+                    if (hyphenIdx > 0)
+                    {
+                        string afterHyphen = sub.Substring(hyphenIdx + 1);
+                        int endAfter = afterHyphen.IndexOfAny(new[] { '_', '#' });
+                        if (endAfter > 0) afterHyphen = afterHyphen.Substring(0, endAfter);
+                        string cleanAfter = afterHyphen.Replace(":", "").Replace("-", "").Trim();
+                        if (cleanAfter.Length == 12 && ulong.TryParse(cleanAfter, System.Globalization.NumberStyles.HexNumber, null, out ulong devAddr) && devAddr != 0)
+                        {
+                            return devAddr;
+                        }
+                    }
+
                     int endIdx = sub.IndexOfAny(new[] { '-', '_', '#' });
                     if (endIdx > 0) sub = sub.Substring(0, endIdx);
                     sub = sub.Replace(":", "").Replace("-", "").Trim();

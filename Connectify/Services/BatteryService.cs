@@ -13,7 +13,7 @@ using Windows.Storage.Streams;
 
 namespace bluetooth_turnon.Services
 {
-    public sealed class BatteryService : IBatteryService
+    public sealed class BatteryService : IBatteryService, IDisposable
     {
         private static readonly ConcurrentDictionary<string, string> _pnpInstanceIdCache =
             new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -22,6 +22,7 @@ namespace bluetooth_turnon.Services
             new ConcurrentDictionary<ulong, BatteryCacheEntry>();
         private readonly HashSet<ulong> _inFlightBatteryQueries = new HashSet<ulong>();
         private readonly object _batteryRetryLock = new object();
+        private bool _disposed;
 
         private Func<ulong, CancellationToken, Task<bool?>> _isDeviceConnectedChecker;
         private Func<ulong, BluetoothLEDevice> _getCachedBleDevice;
@@ -56,6 +57,11 @@ namespace bluetooth_turnon.Services
             if (_batteryCache.TryGetValue(address, out var entry))
             {
                 entry.FailureCount = 0;
+                if (entry.Outcome == BatteryQueryOutcome.TransientFailure)
+                {
+                    entry.Outcome = BatteryQueryOutcome.Unknown;
+                    entry.NextAllowedRetryUtc = DateTime.MinValue;
+                }
             }
         }
 
@@ -68,6 +74,11 @@ namespace bluetooth_turnon.Services
             foreach (var kvp in _batteryCache)
             {
                 kvp.Value.FailureCount = 0;
+                if (kvp.Value.Outcome == BatteryQueryOutcome.TransientFailure)
+                {
+                    kvp.Value.Outcome = BatteryQueryOutcome.Unknown;
+                    kvp.Value.NextAllowedRetryUtc = DateTime.MinValue;
+                }
             }
         }
 
@@ -78,6 +89,13 @@ namespace bluetooth_turnon.Services
             {
                 _inFlightBatteryQueries.Clear();
             }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            ClearAll();
         }
 
         private static int? ReadPnpBatteryDirect(string instanceId)
@@ -201,8 +219,6 @@ namespace bluetooth_turnon.Services
                             if (instanceId.IndexOf(addrUpper, StringComparison.OrdinalIgnoreCase) < 0)
                                 continue;
 
-                            _pnpInstanceIdCache[addrUpper] = instanceId;
-
                             uint propertyType;
                             byte[] buffer = new byte[4];
                             uint bufferSize = (uint)buffer.Length;
@@ -217,6 +233,7 @@ namespace bluetooth_turnon.Services
                                 byte level = buffer[0];
                                 if (level <= 100)
                                 {
+                                    _pnpInstanceIdCache[addrUpper] = instanceId;
                                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"    Battery PnP: {level}% from '{instanceId}' ({enumerator})");
                                     return (int)level;
                                 }
@@ -270,8 +287,6 @@ namespace bluetooth_turnon.Services
                             if (instanceId.IndexOf(addrUpper, StringComparison.OrdinalIgnoreCase) < 0)
                                 continue;
 
-                            _pnpInstanceIdCache[addrUpper] = instanceId;
-
                             uint propertyType;
                             byte[] buffer = new byte[4];
                             uint bufferSize = (uint)buffer.Length;
@@ -286,6 +301,7 @@ namespace bluetooth_turnon.Services
                                 byte level = buffer[0];
                                 if (level <= 100)
                                 {
+                                    _pnpInstanceIdCache[addrUpper] = instanceId;
                                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"    Battery PnP: {level}% from fallback GUID '{instanceId}'");
                                     return (int)level;
                                 }
@@ -317,6 +333,11 @@ namespace bluetooth_turnon.Services
                 if (existingEntry.Outcome == BatteryQueryOutcome.Unsupported && DateTime.UtcNow < existingEntry.NextAllowedRetryUtc)
                 {
                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"  Battery GATT: '{deviceName}' ({address:X12}) confirmed Unsupported. Leaving alone.");
+                    return;
+                }
+                if (existingEntry.Outcome == BatteryQueryOutcome.TransientFailure && existingEntry.FailureCount >= BatteryPolicy.MaxBatteryRetries)
+                {
+                    AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"  Battery GATT: '{deviceName}' ({address:X12}) exceeded max retries ({existingEntry.FailureCount}/{BatteryPolicy.MaxBatteryRetries}). Suppressing repeated queries until reconnect.");
                     return;
                 }
                 if (existingEntry.Outcome == BatteryQueryOutcome.TransientFailure && DateTime.UtcNow < existingEntry.NextAllowedRetryUtc)
@@ -603,9 +624,16 @@ namespace bluetooth_turnon.Services
                                         using (var reader = DataReader.FromBuffer(readResult.Value))
                                         {
                                             byte level = reader.ReadByte();
-                                            fastBatteryLevel = (int)level;
-                                            fastReadSucceeded = true;
-                                            AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"    Battery GATT [Fast Cached SUCCESS]: {level}% for '{bleDevice.Name}' ({bluetoothAddress:X12}) in {totalSw.ElapsedMilliseconds}ms");
+                                            if (level <= 100)
+                                             {
+                                                fastBatteryLevel = (int)level;
+                                                fastReadSucceeded = true;
+                                                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"    Battery GATT [Fast Cached SUCCESS]: {level}% for '{bleDevice.Name}' ({bluetoothAddress:X12}) in {totalSw.ElapsedMilliseconds}ms");
+                                            }
+                                            else
+                                            {
+                                                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"    Battery GATT [Fast Cached]: Invalid battery level {level}% (>100) for '{bleDevice.Name}' ({bluetoothAddress:X12})");
+                                            }
                                         }
                                     }
                                 }
@@ -723,14 +751,21 @@ namespace bluetooth_turnon.Services
                             using (var reader = DataReader.FromBuffer(readResult.Value))
                             {
                                 byte level = reader.ReadByte();
-                                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"    Battery GATT [Slow Discovery SUCCESS]: {level}% for '{bleDevice.Name}' ({bluetoothAddress:X12}) in {totalSw.ElapsedMilliseconds}ms");
-                                return new BatteryQueryResult
+                                if (level <= 100)
                                 {
-                                    Outcome = BatteryQueryOutcome.Success,
-                                    BatteryLevel = (int)level,
-                                    ElapsedMs = totalSw.ElapsedMilliseconds,
-                                    Details = "Slow uncached discovery"
-                                };
+                                    AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"    Battery GATT [Slow Discovery SUCCESS]: {level}% for '{bleDevice.Name}' ({bluetoothAddress:X12}) in {totalSw.ElapsedMilliseconds}ms");
+                                    return new BatteryQueryResult
+                                    {
+                                        Outcome = BatteryQueryOutcome.Success,
+                                        BatteryLevel = (int)level,
+                                        ElapsedMs = totalSw.ElapsedMilliseconds,
+                                        Details = "Slow uncached discovery"
+                                    };
+                                }
+                                else
+                                {
+                                    AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"    Battery GATT [Slow Discovery]: Invalid battery level {level}% (>100) for '{bleDevice.Name}' ({bluetoothAddress:X12})");
+                                }
                             }
                         }
 

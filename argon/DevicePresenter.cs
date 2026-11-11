@@ -1,11 +1,34 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace bluetooth_turnon
 {
+    public sealed class DeviceOperationRecord
+    {
+        public long OperationId { get; }
+        public ulong Address { get; }
+        public bool UserIntentConnect { get; }
+        public string StatusText { get; set; }
+        public Color StatusColor { get; set; }
+        public DateTime StartTimeUtc { get; }
+        public CancellationTokenSource Cts { get; }
+
+        public DeviceOperationRecord(long operationId, ulong address, bool userIntentConnect, string statusText, Color statusColor, CancellationTokenSource cts)
+        {
+            OperationId = operationId;
+            Address = address;
+            UserIntentConnect = userIntentConnect;
+            StatusText = statusText;
+            StatusColor = statusColor;
+            StartTimeUtc = DateTime.UtcNow;
+            Cts = cts;
+        }
+    }
+
     /// <summary>
     /// Presenter managing device connection/disconnection intent,
     /// in-flight tracking, and cancellation for the UI.
@@ -17,11 +40,12 @@ namespace bluetooth_turnon
         private readonly Func<ulong, CancellationToken, Task<bool?>> _connectionStatusChecker;
         private readonly Func<ulong, CancellationToken, Task<DeviceOperationResult>> _connectRunner;
         private readonly Func<ulong, CancellationToken, Task<DeviceOperationResult>> _disconnectRunner;
-        private readonly ConcurrentDictionary<ulong, (string Text, Color Color)> _inFlightOperations =
-            new ConcurrentDictionary<ulong, (string Text, Color Color)>();
+        private static long _nextOperationId = 0;
+        private readonly ConcurrentDictionary<ulong, DeviceOperationRecord> _activeOperations =
+            new ConcurrentDictionary<ulong, DeviceOperationRecord>();
         private readonly object _ctsLock = new object();
         private CancellationTokenSource _allClicksCts = new CancellationTokenSource();
-        private bool _disposed;
+        private volatile bool _disposed;
 
         public DevicePresenter(BluetoothManager bluetoothManager)
             : this(
@@ -30,6 +54,18 @@ namespace bluetooth_turnon
                 bluetoothManager != null ? (Func<ulong, CancellationToken, Task<DeviceOperationResult>>)bluetoothManager.ConnectDeviceWithResultAsync : null,
                 bluetoothManager != null ? (Func<ulong, CancellationToken, Task<DeviceOperationResult>>)bluetoothManager.DisconnectDeviceWithResultAsync : null)
         {
+        }
+
+        public DevicePresenter(
+            BluetoothManager bluetoothManager,
+            Func<ulong, CancellationToken, Task<bool?>> connectionStatusChecker,
+            Func<ulong, CancellationToken, Task<DeviceOperationResult>> connectRunner,
+            Func<ulong, CancellationToken, Task<DeviceOperationResult>> disconnectRunner)
+        {
+            _bluetoothManager = bluetoothManager;
+            _connectionStatusChecker = connectionStatusChecker ?? (bluetoothManager != null ? bluetoothManager.IsDeviceConnectedAsync : null);
+            _connectRunner = connectRunner ?? (bluetoothManager != null ? bluetoothManager.ConnectDeviceWithResultAsync : null);
+            _disconnectRunner = disconnectRunner ?? (bluetoothManager != null ? bluetoothManager.DisconnectDeviceWithResultAsync : null);
         }
 
         public DevicePresenter(
@@ -57,27 +93,15 @@ namespace bluetooth_turnon
         {
         }
 
-        public DevicePresenter(
-            BluetoothManager bluetoothManager,
-            Func<ulong, CancellationToken, Task<bool?>> connectionStatusChecker,
-            Func<ulong, CancellationToken, Task<DeviceOperationResult>> connectRunner,
-            Func<ulong, CancellationToken, Task<DeviceOperationResult>> disconnectRunner)
-        {
-            _bluetoothManager = bluetoothManager;
-            _connectionStatusChecker = connectionStatusChecker ?? (bluetoothManager != null ? bluetoothManager.IsDeviceConnectedAsync : null);
-            _connectRunner = connectRunner ?? (bluetoothManager != null ? bluetoothManager.ConnectDeviceWithResultAsync : null);
-            _disconnectRunner = disconnectRunner ?? (bluetoothManager != null ? bluetoothManager.DisconnectDeviceWithResultAsync : null);
-        }
-
         /// <summary>
         /// Checks if a device operation is currently in flight and retrieves its status.
         /// </summary>
         public bool TryGetInFlightStatus(ulong address, out string text, out Color color)
         {
-            if (_inFlightOperations.TryGetValue(address, out var val))
+            if (_activeOperations.TryGetValue(address, out var val))
             {
-                text = val.Text;
-                color = val.Color;
+                text = val.StatusText;
+                color = val.StatusColor;
                 return true;
             }
             text = null;
@@ -90,13 +114,26 @@ namespace bluetooth_turnon
         /// </summary>
         public void UpdateInFlightStatus(ulong address, string text, Color color)
         {
-            _inFlightOperations[address] = (text, color);
+            _activeOperations.AddOrUpdate(
+                address,
+                a => new DeviceOperationRecord(0, a, false, text, color, null),
+                (a, existing) =>
+                {
+                    existing.StatusText = text;
+                    existing.StatusColor = color;
+                    return existing;
+                });
         }
 
         /// <summary>
         /// Cancels all active in-flight device operations (e.g. when adapter turns off or form closes).
         /// </summary>
-        public void CancelAllOperations()
+        public void CancelAllOperations() => CancelAllOperations(false);
+
+        /// <summary>
+        /// Cancels all active in-flight device operations (e.g. when adapter turns off or form closes).
+        /// </summary>
+        public void CancelAllOperations(bool userRequestedAdapterOff)
         {
             lock (_ctsLock)
             {
@@ -108,7 +145,13 @@ namespace bluetooth_turnon
                 catch { }
                 _allClicksCts = new CancellationTokenSource();
             }
-            _inFlightOperations.Clear();
+
+            foreach (var kvp in _activeOperations.ToArray())
+            {
+                try { kvp.Value.Cts?.Cancel(); } catch { }
+            }
+            _activeOperations.Clear();
+            _bluetoothManager?.CancelDeviceOperations(userRequestedAdapterOff);
         }
 
         /// <summary>
@@ -128,9 +171,25 @@ namespace bluetooth_turnon
             string pendingText = userIntentConnect ? "Connecting..." : "Disconnecting...";
             Color pendingColor = Color.FromArgb(255, 190, 50);
 
-            // Attempt to claim this address for in-flight operation
-            if (!_inFlightOperations.TryAdd(addr, (pendingText, pendingColor)))
+            long opId = Interlocked.Increment(ref _nextOperationId);
+            CancellationTokenSource opCts = null;
+            CancellationToken linkedToken;
+            lock (_ctsLock)
             {
+                if (_disposed || _allClicksCts.IsCancellationRequested || externalToken.IsCancellationRequested)
+                {
+                    return DeviceOperationResult.Cancelled("Cancelled before start");
+                }
+                opCts = CancellationTokenSource.CreateLinkedTokenSource(externalToken, _allClicksCts.Token);
+                linkedToken = opCts.Token;
+            }
+
+            var record = new DeviceOperationRecord(opId, addr, userIntentConnect, pendingText, pendingColor, opCts);
+
+            // Attempt to claim this address for in-flight operation
+            if (!_activeOperations.TryAdd(addr, record))
+            {
+                try { opCts.Dispose(); } catch { }
                 // Already in flight
                 return DeviceOperationResult.Cancelled("Operation already in flight");
             }
@@ -138,16 +197,6 @@ namespace bluetooth_turnon
             try
             {
                 onProgress?.Invoke(pendingText, pendingColor);
-
-                CancellationToken linkedToken;
-                lock (_ctsLock)
-                {
-                    if (_disposed || _allClicksCts.IsCancellationRequested || externalToken.IsCancellationRequested)
-                    {
-                        return DeviceOperationResult.Cancelled("Cancelled before start");
-                    }
-                    linkedToken = CancellationTokenSource.CreateLinkedTokenSource(externalToken, _allClicksCts.Token).Token;
-                }
 
                 BluetoothManager.Log($"[DevicePresenter] User requested {(userIntentConnect ? "Connect" : "Disconnect")} for '{device.Name}' ({addr:X12})");
 
@@ -157,6 +206,7 @@ namespace bluetooth_turnon
                 {
                     using (var timeoutCts = new CancellationTokenSource())
                     using (var freshCheckCts = CancellationTokenSource.CreateLinkedTokenSource(linkedToken, timeoutCts.Token))
+                    using (var delayCts = new CancellationTokenSource())
                     {
                         Task<bool?> checkTask;
                         if (_connectionStatusChecker != null)
@@ -172,18 +222,27 @@ namespace bluetooth_turnon
                             checkTask = Task.FromResult<bool?>(null);
                         }
 
-                        var delayTask = Task.Delay(1000, linkedToken);
-                        var completed = await Task.WhenAny(checkTask, delayTask).ConfigureAwait(false);
-                        if (completed == checkTask)
+                        var delayTask = Task.Delay(1000, delayCts.Token);
+                        try
                         {
-                            freshConnected = await checkTask.ConfigureAwait(false);
+                            var completed = await Task.WhenAny(checkTask, delayTask).ConfigureAwait(false);
+                            if (completed == checkTask)
+                            {
+                                try { delayCts.Cancel(); } catch { }
+                                freshConnected = await checkTask.ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                // 1-second timeout reached! Cancel ongoing check task
+                                try { timeoutCts.Cancel(); } catch { }
+                                _ = checkTask.ContinueWith(t => { var _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+                                BluetoothManager.Log($"[DevicePresenter] Fresh state check timed out (1s) for '{device.Name}' ({addr:X12}). Proceeding with intended action.");
+                                freshConnected = null;
+                            }
                         }
-                        else
+                        finally
                         {
-                            // 1-second timeout reached! Cancel ongoing check task
-                            try { timeoutCts.Cancel(); } catch { }
-                            BluetoothManager.Log($"[DevicePresenter] Fresh state check timed out (1s) for '{device.Name}' ({addr:X12}). Proceeding with intended action.");
-                            freshConnected = null;
+                            try { delayCts.Cancel(); } catch { }
                         }
                     }
                 }
@@ -259,8 +318,50 @@ namespace bluetooth_turnon
             }
             finally
             {
-                _inFlightOperations.TryRemove(addr, out _);
+                if (_activeOperations.TryGetValue(addr, out var current) && current.OperationId == opId)
+                {
+                    ((ICollection<KeyValuePair<ulong, DeviceOperationRecord>>)_activeOperations).Remove(
+                        new KeyValuePair<ulong, DeviceOperationRecord>(addr, current));
+                }
+                try { opCts?.Dispose(); } catch { }
             }
+        }
+
+        public bool IsRadioBounceInProgress => _bluetoothManager?.IsRadioBounceInProgress ?? false;
+
+        public bool AllowAutomaticRadioBounce
+        {
+            get => BluetoothManager.AllowAutomaticRadioBounce;
+            set => BluetoothManager.AllowAutomaticRadioBounce = value;
+        }
+
+        public bool HasConnectedPeripherals(ulong ignoreAddress, out string hidName, out BluetoothDeviceType hidType)
+        {
+            if (_bluetoothManager != null)
+            {
+                return _bluetoothManager.HasConnectedPeripherals(ignoreAddress, out hidName, out hidType);
+            }
+            hidName = null;
+            hidType = BluetoothDeviceType.Unknown;
+            return false;
+        }
+
+        public async Task<(bool hasPeripherals, string name, BluetoothDeviceType type)> CheckConnectedPeripheralsAsync(ulong ignoreAddress, CancellationToken ct = default)
+        {
+            if (_bluetoothManager != null)
+            {
+                return await _bluetoothManager.CheckConnectedPeripheralsAsync(ignoreAddress, ct).ConfigureAwait(false);
+            }
+            return (false, null, BluetoothDeviceType.Unknown);
+        }
+
+        public async Task<bool> ManualResetBluetoothAsync(CancellationToken ct = default)
+        {
+            if (_bluetoothManager != null)
+            {
+                return await _bluetoothManager.ManualResetBluetoothAsync(ct).ConfigureAwait(false);
+            }
+            return false;
         }
 
         public void Dispose()

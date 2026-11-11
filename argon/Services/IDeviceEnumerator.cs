@@ -14,5 +14,6 @@ namespace bluetooth_turnon.Services
         void StartDeviceWatcher();
         void StopDeviceWatcher();
         bool HasConnectedPeripherals(ulong currentTargetAddress, out string peripheralName, out BluetoothDeviceType peripheralType);
+        Task<(bool hasPeripherals, string name, BluetoothDeviceType type)> CheckConnectedPeripheralsAsync(ulong currentTargetAddress, CancellationToken ct = default);
     }
 }

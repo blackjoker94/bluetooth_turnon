@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using InTheHand.Net.Bluetooth;
 using InTheHand.Net.Sockets;
+using Windows.Devices.Bluetooth;
 
 namespace bluetooth_turnon.Services
 {
@@ -18,6 +19,30 @@ namespace bluetooth_turnon.Services
 
         public bool CanHandle(ConnectionRoute route) => route == ConnectionRoute.ClassicWithHid;
 
+        private async Task<bool> CheckIsBleSupportedAsync(ulong address)
+        {
+            if (_batteryService != null && _batteryService.BatteryCache.TryGetValue(address, out var entry))
+            {
+                if (entry.IsClassicOnly) return false;
+            }
+
+            try
+            {
+                string selector = BluetoothLEDevice.GetDeviceSelectorFromBluetoothAddress(address);
+                var devices = await Windows.Devices.Enumeration.DeviceInformation.FindAllAsync(selector).AsTask().ConfigureAwait(false);
+                if (devices != null && devices.Count > 0)
+                {
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"CheckIsBleSupportedAsync({address:X12}) exception: {ex.Message}");
+            }
+
+            return false;
+        }
+
         public async Task<DeviceOperationResult> ConnectAsync(ulong address, string name, CancellationToken ct)
         {
             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicHidConnectionStrategy.ConnectAsync called for {address:X12}");
@@ -26,6 +51,7 @@ namespace bluetooth_turnon.Services
             {
                 try
                 {
+                    bool isBleSupported = await CheckIsBleSupportedAsync(address).ConfigureAwait(false);
                     using (var client = new BluetoothClient())
                     {
                         var paired = client.PairedDevices;
@@ -71,7 +97,7 @@ namespace bluetooth_turnon.Services
                                 if (device.Connected)
                                 {
                                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  ClassicHid: '{targetName}' connected successfully on attempt {attempt}/5.");
-                                    _batteryService?.ScheduleDeferredBatteryQuery(address, targetName, isClassicOnly: true, immediate: true);
+                                    _batteryService?.ScheduleDeferredBatteryQuery(address, targetName, isClassicOnly: !isBleSupported, immediate: true);
                                     return DeviceOperationResult.Succeeded($"'{targetName}' connected successfully on attempt {attempt}/5.");
                                 }
                             }

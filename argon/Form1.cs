@@ -351,10 +351,7 @@ namespace bluetooth_turnon
             // Queue a fresh refresh once the new handle is established.
             if (_isLoaded && !_cts.IsCancellationRequested && !IsDisposed)
             {
-                SafeBeginInvoke(async () =>
-                {
-                    await RefreshDevicesIfIdleAsync(force: true);
-                });
+                _ = SafeBeginInvokeAsync(() => RefreshDevicesIfIdleAsync(force: true));
             }
         }
 
@@ -411,7 +408,7 @@ namespace bluetooth_turnon
                 int wParam = m.WParam.ToInt32();
                 if (wParam == DBT_DEVNODES_CHANGED || wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE)
                 {
-                    if (_isLoaded && !_isTogglingAdapter && _bluetoothManager != null && !_bluetoothManager.IsRadioBounceInProgress)
+                    if (_isLoaded && !_isTogglingAdapter && (_devicePresenter != null ? !_devicePresenter.IsRadioBounceInProgress : (_bluetoothManager != null && !_bluetoothManager.IsRadioBounceInProgress)))
                     {
                         RestartDeviceChangeDebounceTimer();
                     }
@@ -429,7 +426,7 @@ namespace bluetooth_turnon
                 {
                     _deviceChangeDebounceTimer.Stop();
                     if (IsDisposed || Disposing || _cts.IsCancellationRequested) return;
-                    if (_isTogglingAdapter || (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)) return;
+                    if (_isTogglingAdapter || (_devicePresenter != null ? _devicePresenter.IsRadioBounceInProgress : (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress))) return;
 
                     if (!IsAppVisible)
                     {
@@ -444,6 +441,10 @@ namespace bluetooth_turnon
                         if (previousState == AdapterUiState.NoAdapter && _currentUiState == AdapterUiState.Enabled)
                         {
                             await RefreshDevicesIfIdleAsync(force: true);
+                        }
+                        else if (_currentUiState == AdapterUiState.Enabled)
+                        {
+                            await RefreshDevicesIfIdleAsync(force: false);
                         }
                     }
                     catch (Exception ex)
@@ -475,8 +476,12 @@ namespace bluetooth_turnon
 
                 var autoBounceMenuItem = new ToolStripMenuItem("Allow automatic radio bounce");
                 autoBounceMenuItem.CheckOnClick = true;
-                autoBounceMenuItem.Checked = BluetoothManager.AllowAutomaticRadioBounce;
-                autoBounceMenuItem.CheckedChanged += (s, ev) => BluetoothManager.AllowAutomaticRadioBounce = autoBounceMenuItem.Checked;
+                autoBounceMenuItem.Checked = _devicePresenter != null ? _devicePresenter.AllowAutomaticRadioBounce : BluetoothManager.AllowAutomaticRadioBounce;
+                autoBounceMenuItem.CheckedChanged += (s, ev) =>
+                {
+                    if (_devicePresenter != null) _devicePresenter.AllowAutomaticRadioBounce = autoBounceMenuItem.Checked;
+                    else BluetoothManager.AllowAutomaticRadioBounce = autoBounceMenuItem.Checked;
+                };
                 _trayMenu.Items.Add(autoBounceMenuItem);
 
                 _trayMenu.Items.Add("Reset Bluetooth (disconnects other devices)", null, async (s, ev) =>
@@ -582,13 +587,25 @@ namespace bluetooth_turnon
 
         private async Task ResetBluetoothWithConfirmationAsync()
         {
-            if (_bluetoothManager.IsRadioBounceInProgress)
+            if (_devicePresenter != null && _devicePresenter.IsRadioBounceInProgress)
             {
                 MessageBox.Show("A Bluetooth reset is already in progress.", "Reset Bluetooth", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
-            if (_bluetoothManager.HasConnectedPeripherals(0, out string hidName, out BluetoothDeviceType hidType))
+            bool hasPeripherals = false;
+            string hidName = null;
+            BluetoothDeviceType hidType = BluetoothDeviceType.Unknown;
+
+            if (_devicePresenter != null)
+            {
+                var checkResult = await _devicePresenter.CheckConnectedPeripheralsAsync(0).ConfigureAwait(true);
+                hasPeripherals = checkResult.hasPeripherals;
+                hidName = checkResult.name;
+                hidType = checkResult.type;
+            }
+
+            if (hasPeripherals)
             {
                 var confirm = MessageBox.Show(
                     $"Warning: An active input peripheral '{hidName}' ({hidType}) is currently connected.\n\n" +
@@ -613,9 +630,15 @@ namespace bluetooth_turnon
             }
 
             SetUiState(AdapterUiState.Reconnecting);
-            bool resetOk = await _bluetoothManager.ManualResetBluetoothAsync();
+            bool resetOk = _devicePresenter != null
+                ? await _devicePresenter.ManualResetBluetoothAsync()
+                : (_bluetoothManager != null ? await _bluetoothManager.ManualResetBluetoothAsync() : false);
             if (!this.IsDisposed && this.IsHandleCreated)
             {
+                if (!resetOk)
+                {
+                    MessageBox.Show("Bluetooth reset failed or was cancelled.", "Reset Bluetooth", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
                 await RefreshAdapterStateAsync();
                 await RefreshDevicesIfIdleAsync(force: true);
             }
@@ -630,7 +653,8 @@ namespace bluetooth_turnon
             }
 
             // If a controlled radio bounce is in progress AND user did not explicitly request adapter off, show "Reconnecting..." in the header
-            if (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress && !_bluetoothManager.UserRequestedAdapterOff)
+            bool isBounceInProgress = _devicePresenter != null ? _devicePresenter.IsRadioBounceInProgress : (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress);
+            if (isBounceInProgress && (_bluetoothManager == null || !_bluetoothManager.UserRequestedAdapterOff))
             {
                 SetUiState(AdapterUiState.Reconnecting);
                 if (!_isTogglingAdapter)
@@ -689,8 +713,15 @@ namespace bluetooth_turnon
         {
             SafeBeginInvoke(() =>
             {
-                SetUiState(AdapterUiState.Reconnecting);
-                _devicePresenter.UpdateInFlightStatus(e.Address, e.StatusMessage, Color.FromArgb(255, 190, 50));
+                bool bounceRunning = _devicePresenter != null ? _devicePresenter.IsRadioBounceInProgress : (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress);
+                if (bounceRunning || e.Address == 0)
+                {
+                    SetUiState(AdapterUiState.Reconnecting);
+                }
+                if (e.Address != 0)
+                {
+                    _devicePresenter.UpdateInFlightStatus(e.Address, e.StatusMessage, Color.FromArgb(255, 190, 50));
+                }
                 UpdateOperationFeedback(e.Address, e.StatusMessage, Color.FromArgb(255, 190, 50), null);
             });
         }
@@ -721,7 +752,7 @@ namespace bluetooth_turnon
                     // User explicitly requested Bluetooth OFF:
                     // Cancel any in-flight device operations immediately so they do not keep running
                     // or attempt a radio bounce
-                    _devicePresenter.CancelAllOperations();
+                    _devicePresenter.CancelAllOperations(userRequestedAdapterOff: true);
                 }
 
                 // Temporary visual feedback (Fix Issue #29: typed UI state)
@@ -746,7 +777,7 @@ namespace bluetooth_turnon
                     else
                     {
                         // Adapter turned off — ensure device list is cleared
-                        _devicePresenter.CancelAllOperations();
+                        _devicePresenter.CancelAllOperations(userRequestedAdapterOff: true);
                         BuildDeviceCards(new List<DeviceInfo>(), force: true);
                     }
                 }
@@ -797,7 +828,8 @@ namespace bluetooth_turnon
         {
             if (this.IsDisposed || !this.IsHandleCreated || _cts.IsCancellationRequested) return;
 
-            if (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)
+            bool isBounceRunning = _devicePresenter != null ? _devicePresenter.IsRadioBounceInProgress : (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress);
+            if (isBounceRunning)
             {
                 // Suppress device list refresh while radio bounce is power-cycling the adapter (Fix Issue #6)
                 return;
@@ -827,7 +859,8 @@ namespace bluetooth_turnon
         {
             if (this.IsDisposed || !this.IsHandleCreated || _cts.IsCancellationRequested) return;
 
-            if (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress)
+            bool isBounceRunning = _devicePresenter != null ? _devicePresenter.IsRadioBounceInProgress : (_bluetoothManager != null && _bluetoothManager.IsRadioBounceInProgress);
+            if (isBounceRunning)
             {
                 // Suppress device list refresh while radio bounce is power-cycling the adapter (Fix Issue #6)
                 return;
@@ -900,8 +933,6 @@ namespace bluetooth_turnon
         private void UpdateOperationFeedback(ulong address, string text, Color color, Label originalLabel = null)
         {
             if (this.IsDisposed || !this.IsHandleCreated) return;
-
-            _devicePresenter.UpdateInFlightStatus(address, text, color);
 
             if (originalLabel != null && !originalLabel.IsDisposed)
             {
@@ -1044,6 +1075,8 @@ namespace bluetooth_turnon
                     }
                 }
 
+                int scrollY = panelDeviceList.AutoScrollPosition.Y;
+
                 // 2) Reconcile each device card in order
                 for (int i = 0; i < devices.Count; i++)
                 {
@@ -1051,7 +1084,7 @@ namespace bluetooth_turnon
                     bool isOdd = (i % 2 == 0);
                     Color baseBgColor = isOdd ? RowColorOdd : RowColorEven;
                     Color hoverBgColor = Color.FromArgb(baseBgColor.R + 10, baseBgColor.G + 10, baseBgColor.B + 15);
-                    int targetY = i * cardHeight;
+                    int targetY = (i * cardHeight) + scrollY;
 
                     Color accentColor = GetDeviceAccentColor(device.DeviceType);
                     if (!device.IsConnected)
@@ -1097,7 +1130,10 @@ namespace bluetooth_turnon
                     if (_cardViews.TryGetValue(device.Address, out var view))
                     {
                         DeviceCardFactory.UpdateCardView(view, vm, device, targetY, cardWidth, cardHeight, batteryColX, assetsDir, LoadCachedIcon);
-                        panelDeviceList.Controls.SetChildIndex(view.Card, i);
+                        if (panelDeviceList.Controls.GetChildIndex(view.Card) != i)
+                        {
+                            panelDeviceList.Controls.SetChildIndex(view.Card, i);
+                        }
                     }
                     else
                     {
@@ -1117,7 +1153,10 @@ namespace bluetooth_turnon
 
                         _cardViews[device.Address] = newView;
                         panelDeviceList.Controls.Add(newView.Card);
-                        panelDeviceList.Controls.SetChildIndex(newView.Card, i);
+                        if (panelDeviceList.Controls.GetChildIndex(newView.Card) != i)
+                        {
+                            panelDeviceList.Controls.SetChildIndex(newView.Card, i);
+                        }
                     }
                 }
 

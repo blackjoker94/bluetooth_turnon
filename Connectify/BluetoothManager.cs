@@ -364,14 +364,15 @@ namespace bluetooth_turnon
 
             _radioService.RadioTurnedOff += (reason) =>
             {
+                CancelDeviceOperations(userRequestedAdapterOff: false);
                 _connectionService.ReleaseAllConnectedBleHandles(reason);
                 _batteryService.HandleAdapterTurnedOff();
             };
 
             Task.Run(async () =>
             {
-                ClassicAudioConnectionStrategy.RecoverPendingProfileRestores();
                 await RadioService.CheckAndRecoverIncompleteBounceAsync(_radioService).ConfigureAwait(false);
+                ClassicAudioConnectionStrategy.RecoverPendingProfileRestores();
             });
         }
 
@@ -425,6 +426,11 @@ namespace bluetooth_turnon
             return _deviceEnumerator.HasConnectedPeripherals(currentTargetAddress, out _, out _);
         }
 
+        internal async Task<(bool hasPeripherals, string name, BluetoothDeviceType type)> CheckConnectedPeripheralsAsync(ulong currentTargetAddress, CancellationToken ct = default)
+        {
+            return await _deviceEnumerator.CheckConnectedPeripheralsAsync(currentTargetAddress, ct).ConfigureAwait(false);
+        }
+
         public async Task<bool> ConnectDeviceAsync(ulong address, CancellationToken ct = default)
         {
             return await _connectionService.ConnectDeviceAsync(address, ct).ConfigureAwait(false);
@@ -460,6 +466,7 @@ namespace bluetooth_turnon
             if (_disposed) return;
             _disposed = true;
 
+            try { (_batteryService as IDisposable)?.Dispose(); } catch { }
             try { _deviceEnumerator?.Dispose(); } catch { }
             try { _connectionService?.Dispose(); } catch { }
             try { _radioService?.Dispose(); } catch { }

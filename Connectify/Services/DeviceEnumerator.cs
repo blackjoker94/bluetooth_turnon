@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -21,7 +22,13 @@ namespace bluetooth_turnon.Services
         private volatile bool _classicEnumerationComplete;
         private volatile bool _bleEnumerationComplete;
         private readonly object _watcherDebounceLock = new object();
+        private readonly ConcurrentDictionary<ulong, (string Name, BluetoothDeviceType Type, bool IsConnected)> _cachedDevices =
+            new ConcurrentDictionary<ulong, (string Name, BluetoothDeviceType Type, bool IsConnected)>();
         private System.Threading.Timer _watcherDebounceTimer;
+        private readonly object _snapshotLock = new object();
+        private IReadOnlyList<DeviceInfo> _cachedPairedDevicesSnapshot;
+        private DateTime _lastSnapshotUtc = DateTime.MinValue;
+        private Task<IReadOnlyList<DeviceInfo>> _ongoingSnapshotTask;
         private bool _disposed;
 
         public event EventHandler DeviceConnectionChanged;
@@ -31,6 +38,15 @@ namespace bluetooth_turnon.Services
             _radioService = radioService ?? throw new ArgumentNullException(nameof(radioService));
             _batteryService = batteryService;
             _connectionService = connectionService;
+        }
+
+        public void InvalidateDeviceSnapshotCache()
+        {
+            lock (_snapshotLock)
+            {
+                _lastSnapshotUtc = DateTime.MinValue;
+                _cachedPairedDevicesSnapshot = null;
+            }
         }
 
         private void TriggerDeviceConnectionChangedDebounced()
@@ -44,6 +60,7 @@ namespace bluetooth_turnon.Services
                     {
                         if (!_disposed)
                         {
+                            InvalidateDeviceSnapshotCache();
                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, "DeviceWatcher: Debounce elapsed (500ms). Raising DeviceConnectionChanged.");
                             DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
                         }
@@ -73,8 +90,58 @@ namespace bluetooth_turnon.Services
             if (state != true)
             {
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, "GetPairedDevicesAsync: adapter is off or absent, returning empty list");
+                InvalidateDeviceSnapshotCache();
                 return new List<DeviceInfo>();
             }
+
+            Task<IReadOnlyList<DeviceInfo>> taskToAwait = null;
+            lock (_snapshotLock)
+            {
+                if (_cachedPairedDevicesSnapshot != null && (DateTime.UtcNow - _lastSnapshotUtc).TotalMilliseconds < 750)
+                {
+                    AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, "GetPairedDevicesAsync: Returning cached 750ms snapshot");
+                    return _cachedPairedDevicesSnapshot;
+                }
+
+                if (_ongoingSnapshotTask != null && !_ongoingSnapshotTask.IsCompleted)
+                {
+                    taskToAwait = _ongoingSnapshotTask;
+                }
+                else
+                {
+                    _ongoingSnapshotTask = EnumeratePairedDevicesCoreAsync(ct);
+                    taskToAwait = _ongoingSnapshotTask;
+                }
+            }
+
+            try
+            {
+                var snapshot = await taskToAwait.ConfigureAwait(false);
+                lock (_snapshotLock)
+                {
+                    if (snapshot != null)
+                    {
+                        _cachedPairedDevicesSnapshot = snapshot;
+                        _lastSnapshotUtc = DateTime.UtcNow;
+                    }
+                }
+                return snapshot;
+            }
+            catch (Exception)
+            {
+                lock (_snapshotLock)
+                {
+                    if (_ongoingSnapshotTask == taskToAwait)
+                    {
+                        _ongoingSnapshotTask = null;
+                    }
+                }
+                throw;
+            }
+        }
+
+        private async Task<IReadOnlyList<DeviceInfo>> EnumeratePairedDevicesCoreAsync(CancellationToken ct)
+        {
 
             try
             {
@@ -249,13 +316,25 @@ namespace bluetooth_turnon.Services
 
                                 BluetoothLEDevice bleDevice = null;
                                 bool isCachedHandle = false;
+                                ulong extractedAddr = BatteryPolicy.TryExtractAddressFromBleDeviceId(devInfo.Id);
+                                ulong address = extractedAddr;
                                 try
                                 {
-                                    using (var lookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
-                                    using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, lookupCts.Token))
+                                    if (_connectionService != null && extractedAddr != 0 &&
+                                        _connectionService.ConnectedBleDevices.TryGetValue(extractedAddr, out var existingTracked) &&
+                                        existingTracked != null)
                                     {
-                                        bleDevice = await BluetoothLEDevice.FromIdAsync(devInfo.Id)
-                                            .AsTask(linkedCts.Token).ConfigureAwait(false);
+                                        bleDevice = existingTracked;
+                                        isCachedHandle = true;
+                                    }
+                                    else
+                                    {
+                                        using (var lookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+                                        using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, lookupCts.Token))
+                                        {
+                                            bleDevice = await BluetoothLEDevice.FromIdAsync(devInfo.Id)
+                                                .AsTask(linkedCts.Token).ConfigureAwait(false);
+                                        }
                                     }
 
                                     if (bleDevice == null)
@@ -264,16 +343,23 @@ namespace bluetooth_turnon.Services
                                         continue;
                                     }
 
-                                    ulong address = bleDevice.BluetoothAddress;
+                                    address = bleDevice.BluetoothAddress;
+                                    if (address == 0)
+                                    {
+                                        address = extractedAddr;
+                                    }
                                     if (address == 0)
                                     {
                                         AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"GetPairedDevicesAsync: BLE device '{bleDevice.Name}' address was 0; skipping");
                                         continue;
                                     }
 
-                                    if (_connectionService != null && _connectionService.ConnectedBleDevices.TryGetValue(address, out var cachedHandle))
+                                    if (!isCachedHandle && _connectionService != null && _connectionService.ConnectedBleDevices.TryGetValue(address, out var cachedHandle) && cachedHandle != null)
                                     {
-                                        try { bleDevice.Dispose(); } catch { }
+                                        if (!ReferenceEquals(bleDevice, cachedHandle))
+                                        {
+                                            try { bleDevice.Dispose(); } catch { }
+                                        }
                                         bleDevice = cachedHandle;
                                         isCachedHandle = true;
                                     }
@@ -359,7 +445,7 @@ namespace bluetooth_turnon.Services
                                 }
                                 finally
                                 {
-                                    if (!isCachedHandle)
+                                    if (!isCachedHandle && (_connectionService == null || !_connectionService.ConnectedBleDevices.ContainsKey(address)))
                                     {
                                         try { bleDevice?.Dispose(); } catch { }
                                     }
@@ -380,6 +466,11 @@ namespace bluetooth_turnon.Services
                         {
                             _batteryService?.HandleDeviceDisconnected(addr);
                         }
+                    }
+
+                    foreach (var d in list)
+                    {
+                        _cachedDevices[d.Address] = (d.Name, d.DeviceType, d.IsConnected);
                     }
 
                     return list.OrderByDescending(d => d.IsConnected).ThenBy(d => d.Name).ToList();
@@ -424,29 +515,48 @@ namespace bluetooth_turnon.Services
                 {
                     try
                     {
+                        bool isClassicPaired = false;
                         using (var client = new BluetoothClient())
                         {
                             var paired = client.PairedDevices;
                             var device = paired?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == address);
                             if (device != null)
                             {
+                                isClassicPaired = true;
                                 device.Refresh();
-                                return (bool?)device.Connected;
+                                if (device.Connected) return true;
                             }
                         }
 
-                        using (var lookupCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1500)))
-                        using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, lookupCts.Token))
-                        using (var ble = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
-                            .AsTask(linkedCts.Token).ConfigureAwait(false))
+                        BluetoothLEDevice ble = null;
+                        bool isBlePaired = false;
+                        try
                         {
+                            using (var lookupCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1500)))
+                            using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, lookupCts.Token))
+                            {
+                                ble = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
+                                    .AsTask(linkedCts.Token).ConfigureAwait(false);
+                            }
+
                             if (ble != null)
                             {
-                                return (bool?)(ble.ConnectionStatus == BluetoothConnectionStatus.Connected);
+                                isBlePaired = (ble.DeviceInformation?.Pairing?.IsPaired == true);
+                                if (ble.ConnectionStatus == BluetoothConnectionStatus.Connected)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            if (ble != null && (_connectionService == null || !_connectionService.ConnectedBleDevices.TryGetValue(address, out var tracked) || !ReferenceEquals(tracked, ble)))
+                            {
+                                try { ble.Dispose(); } catch { }
                             }
                         }
 
-                        return null;
+                        return (isClassicPaired || isBlePaired) ? false : (bool?)null;
                     }
                     catch { return null; }
                 }, ct).ConfigureAwait(false);
@@ -500,6 +610,18 @@ namespace bluetooth_turnon.Services
                     }
                 }
 
+                foreach (var kvp in _cachedDevices)
+                {
+                    if (kvp.Key == currentTargetAddress) continue;
+                    if (kvp.Value.IsConnected && (kvp.Value.Type == BluetoothDeviceType.Mouse || kvp.Value.Type == BluetoothDeviceType.Keyboard || kvp.Value.Type == BluetoothDeviceType.Controller))
+                    {
+                        peripheralName = kvp.Value.Name;
+                        peripheralType = kvp.Value.Type;
+                        AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"HasConnectedPeripherals: Active cached peripheral found: '{peripheralName}' ({peripheralType})");
+                        return true;
+                    }
+                }
+
                 using (var client = new BluetoothClient())
                 {
                     var paired = client.PairedDevices;
@@ -536,6 +658,173 @@ namespace bluetooth_turnon.Services
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"HasConnectedPeripherals check exception: {ex.Message}");
             }
             return false;
+        }
+
+        public async Task<(bool hasPeripherals, string name, BluetoothDeviceType type)> CheckConnectedPeripheralsAsync(ulong currentTargetAddress, CancellationToken ct = default)
+        {
+            if (BluetoothManager.ConnectedPeripheralsProbe != null)
+            {
+                var probeResult = BluetoothManager.ConnectedPeripheralsProbe(currentTargetAddress);
+                if (probeResult.hasPeripherals)
+                {
+                    return probeResult;
+                }
+            }
+
+            try
+            {
+                // 1. ConnectionService connected BLE devices
+                if (_connectionService != null)
+                {
+                    foreach (var kvp in _connectionService.ConnectedBleDevices)
+                    {
+                        if (kvp.Key == currentTargetAddress) continue;
+                        var dev = kvp.Value;
+                        if (dev != null && dev.ConnectionStatus == BluetoothConnectionStatus.Connected)
+                        {
+                            var type = DeviceClassifier.ClassifyByAppearance(dev.Appearance.Category, dev.Appearance.SubCategory);
+                            if (type == BluetoothDeviceType.Unknown)
+                            {
+                                type = DeviceClassifier.ClassifyByName(dev.Name);
+                            }
+                            if (type == BluetoothDeviceType.Mouse || type == BluetoothDeviceType.Keyboard || type == BluetoothDeviceType.Controller)
+                            {
+                                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"CheckConnectedPeripheralsAsync: Active BLE peripheral found: '{dev.Name}' ({type})");
+                                return (true, dev.Name, type);
+                            }
+                        }
+                    }
+                }
+
+                // 2. Cached devices
+                foreach (var kvp in _cachedDevices)
+                {
+                    if (kvp.Key == currentTargetAddress) continue;
+                    if (kvp.Value.IsConnected && (kvp.Value.Type == BluetoothDeviceType.Mouse || kvp.Value.Type == BluetoothDeviceType.Keyboard || kvp.Value.Type == BluetoothDeviceType.Controller))
+                    {
+                        AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"CheckConnectedPeripheralsAsync: Active cached peripheral found: '{kvp.Value.Name}' ({kvp.Value.Type})");
+                        return (true, kvp.Value.Name, kvp.Value.Type);
+                    }
+                }
+
+                // 3. WinRT DeviceInformation paired BLE devices (includes Windows boot-connected BLE HID devices)
+                try
+                {
+                    string bleSelector = BluetoothLEDevice.GetDeviceSelectorFromPairingState(true);
+                    var bleCollection = await DeviceInformation.FindAllAsync(
+                        bleSelector,
+                        new string[] { "System.Devices.Aep.IsConnected" }
+                    ).AsTask(ct).ConfigureAwait(false);
+
+                    if (bleCollection != null)
+                    {
+                        foreach (var devInfo in bleCollection)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            ulong parsedAddr = BatteryPolicy.TryExtractAddressFromBleDeviceId(devInfo.Id);
+                            if (parsedAddr != 0 && parsedAddr == currentTargetAddress) continue;
+
+                            bool isConnectedProp = false;
+                            if (devInfo.Properties.TryGetValue("System.Devices.Aep.IsConnected", out var connVal) && connVal is bool bConn)
+                            {
+                                isConnectedProp = bConn;
+                            }
+
+                            if (isConnectedProp)
+                            {
+                                var type = DeviceClassifier.ClassifyByName(devInfo.Name);
+                                if (type == BluetoothDeviceType.Mouse || type == BluetoothDeviceType.Keyboard || type == BluetoothDeviceType.Controller)
+                                {
+                                    AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"CheckConnectedPeripheralsAsync: Connected paired BLE HID found via AEP property: '{devInfo.Name}' ({type})");
+                                    return (true, devInfo.Name, type);
+                                }
+
+                                BluetoothLEDevice bleDev = null;
+                                try
+                                {
+                                    using (var lookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
+                                    using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, lookupCts.Token))
+                                    {
+                                        bleDev = await BluetoothLEDevice.FromIdAsync(devInfo.Id).AsTask(linkedCts.Token).ConfigureAwait(false);
+                                    }
+                                    if (bleDev != null)
+                                    {
+                                        var appType = DeviceClassifier.ClassifyByAppearance(bleDev.Appearance.Category, bleDev.Appearance.SubCategory);
+                                        if (appType == BluetoothDeviceType.Mouse || appType == BluetoothDeviceType.Keyboard || appType == BluetoothDeviceType.Controller)
+                                        {
+                                            AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"CheckConnectedPeripheralsAsync: Connected paired BLE HID found via appearance: '{bleDev.Name}' ({appType})");
+                                            return (true, bleDev.Name, appType);
+                                        }
+                                    }
+                                }
+                                catch { }
+                                finally
+                                {
+                                    try { bleDev?.Dispose(); } catch { }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"CheckConnectedPeripheralsAsync: BLE AEP check note: {ex.Message}");
+                }
+
+                // 4. Classic Bluetooth paired devices on background thread
+                var classicResult = await Task.Run(() =>
+                {
+                    try
+                    {
+                        using (var client = new BluetoothClient())
+                        {
+                            var paired = client.PairedDevices;
+                            if (paired != null)
+                            {
+                                foreach (var d in paired)
+                                {
+                                    if (d.DeviceAddress.ToUInt64() == currentTargetAddress) continue;
+                                    if (d.Connected)
+                                    {
+                                        int cod = (int)d.ClassOfDevice.Value;
+                                        int major = (cod >> 8) & 0x1F;
+                                        int minor = (cod >> 2) & 0x3F;
+                                        var type = DeviceClassifier.ClassifyByCod(major, minor);
+                                        if (type == BluetoothDeviceType.Unknown)
+                                        {
+                                            type = DeviceClassifier.ClassifyByName(d.DeviceName);
+                                        }
+
+                                        if (type == BluetoothDeviceType.Mouse || type == BluetoothDeviceType.Keyboard || type == BluetoothDeviceType.Controller)
+                                        {
+                                            AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"CheckConnectedPeripheralsAsync: Active Classic peripheral found: '{d.DeviceName}' ({type})");
+                                            return (true, d.DeviceName, type);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"CheckConnectedPeripheralsAsync Classic check exception: {ex.Message}");
+                    }
+                    return (false, (string)null, BluetoothDeviceType.Unknown);
+                }, ct).ConfigureAwait(false);
+
+                if (classicResult.Item1)
+                {
+                    return classicResult;
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Error, $"CheckConnectedPeripheralsAsync exception: {ex.Message}");
+            }
+
+            return (false, null, BluetoothDeviceType.Unknown);
         }
 
         public void StartDeviceWatcher()

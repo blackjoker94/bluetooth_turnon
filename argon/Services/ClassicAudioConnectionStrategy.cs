@@ -29,19 +29,43 @@ namespace bluetooth_turnon.Services
         #region Core Audio Watchdog & Circuit Breaker Settings
         public static int CoreAudioWatchdogTimeoutMs = 5000;
         private static int _coreAudioConsecutiveTimeouts = 0;
-        private static bool _coreAudioCircuitBreakerOpen = false;
+        private static volatile bool _coreAudioCircuitBreakerOpen = false;
+        private static DateTime _circuitBreakerTripUtc = DateTime.MinValue;
         private const int CoreAudioMaxConsecutiveTimeouts = 3;
 
         public static bool CoreAudioCircuitBreakerOpen
         {
-            get => _coreAudioCircuitBreakerOpen;
+            get
+            {
+                if (_coreAudioCircuitBreakerOpen)
+                {
+                    if (_circuitBreakerTripUtc != DateTime.MinValue &&
+                        (DateTime.UtcNow - _circuitBreakerTripUtc).TotalSeconds >= 60)
+                    {
+                        AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, "  CoreAudio: Circuit breaker cooldown (60s) elapsed. Transitioning to half-open trial.");
+                        _coreAudioCircuitBreakerOpen = false;
+                        _circuitBreakerTripUtc = DateTime.MinValue;
+                        return false;
+                    }
+                    return true;
+                }
+                return false;
+            }
             set
             {
                 _coreAudioCircuitBreakerOpen = value;
-                if (!value) _coreAudioConsecutiveTimeouts = 0;
+                if (value)
+                {
+                    _circuitBreakerTripUtc = DateTime.UtcNow;
+                }
+                else
+                {
+                    _circuitBreakerTripUtc = DateTime.MinValue;
+                    Interlocked.Exchange(ref _coreAudioConsecutiveTimeouts, 0);
+                }
             }
         }
-        public static int CoreAudioConsecutiveTimeouts => _coreAudioConsecutiveTimeouts;
+        public static int CoreAudioConsecutiveTimeouts => Thread.VolatileRead(ref _coreAudioConsecutiveTimeouts);
         internal static Func<IKsControl, KSIDENTIFIER, int> KsPropertyInvoker { get; set; }
         #endregion
 
@@ -104,6 +128,7 @@ namespace bluetooth_turnon.Services
                         var paired = client.PairedDevices;
                         foreach (string name in names)
                         {
+                            bool shouldDelete = false;
                             try
                             {
                                 var parts = name.Split('_');
@@ -115,17 +140,29 @@ namespace bluetooth_turnon.Services
                                     if (dev != null)
                                     {
                                         dev.SetServiceState(profile, true);
+                                        shouldDelete = true;
                                         AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  Startup recovery: Restored service {profile} on device '{dev.DeviceName}' ({addr:X12})");
                                     }
+                                    else
+                                    {
+                                        shouldDelete = true;
+                                    }
+                                }
+                                else
+                                {
+                                    shouldDelete = true;
                                 }
                             }
                             catch (Exception ex)
                             {
-                                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  Startup recovery recovery exception for {name}: {ex.Message}");
+                                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  Startup recovery exception for {name}: {ex.Message}");
                             }
                             finally
                             {
-                                try { key.DeleteValue(name, false); } catch { }
+                                if (shouldDelete)
+                                {
+                                    try { key.DeleteValue(name, false); } catch { }
+                                }
                             }
                         }
                     }
@@ -242,7 +279,7 @@ namespace bluetooth_turnon.Services
         {
             if (address == 0) return false;
 
-            if (_coreAudioCircuitBreakerOpen)
+            if (CoreAudioCircuitBreakerOpen)
             {
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, "  CoreAudio: Circuit breaker is OPEN (skipping Core Audio for this session due to repeated timeouts).");
                 return false;
@@ -269,6 +306,7 @@ namespace bluetooth_turnon.Services
 
                 string addrHex12 = address.ToString("X12").ToUpperInvariant();
                 bool anyTriggered = false;
+                var triggeredAdapters = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
                 for (uint i = 0; i < count; i++)
                 {
@@ -334,7 +372,7 @@ namespace bluetooth_turnon.Services
                                                 if (!string.IsNullOrEmpty(fn))
                                                 {
                                                     if (string.Equals(fn, deviceName, StringComparison.OrdinalIgnoreCase) ||
-                                                        fn.IndexOf($"({deviceName})", StringComparison.OrdinalIgnoreCase) >= 0)
+                                                        fn.IndexOf($"({deviceName}", StringComparison.OrdinalIgnoreCase) >= 0)
                                                     {
                                                         matchedByName = true;
                                                     }
@@ -445,6 +483,12 @@ namespace bluetooth_turnon.Services
                                             continue;
                                         }
 
+                                        if (triggeredAdapters.Contains(adapterDeviceId))
+                                        {
+                                            AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"  CoreAudio: Skipping already triggered adapter '{adapterDeviceId}' for endpoint '{endpointId}'");
+                                            continue;
+                                        }
+
                                         Guid iidKsControl = typeof(IKsControl).GUID;
                                         object ksControlObj = null;
                                         IKsControl ksControl = null;
@@ -488,6 +532,8 @@ namespace bluetooth_turnon.Services
                                             if (ExecuteKsPropertyWithWatchdog(ksControl, connect, adapterDeviceId))
                                             {
                                                 anyTriggered = true;
+                                                triggeredAdapters.Add(adapterDeviceId);
+                                                break;
                                             }
                                         }
 
@@ -543,7 +589,7 @@ namespace bluetooth_turnon.Services
 
         internal static bool ExecuteKsPropertyWithWatchdog(IKsControl ksControl, bool connect, string adapterDeviceId)
         {
-            if (_coreAudioCircuitBreakerOpen)
+            if (CoreAudioCircuitBreakerOpen)
             {
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  CoreAudio: Circuit breaker is OPEN. Skipping KsProperty({(connect ? "RECONNECT" : "DISCONNECT")}) on adapter '{adapterDeviceId}'.");
                 if (ksControl != null)
@@ -583,7 +629,6 @@ namespace bluetooth_turnon.Services
                 }
                 finally
                 {
-                    doneEvent.Set();
                     try
                     {
                         if (ksControl != null)
@@ -592,6 +637,11 @@ namespace bluetooth_turnon.Services
                         }
                     }
                     catch { }
+                    try
+                    {
+                        doneEvent.Set();
+                    }
+                    catch (ObjectDisposedException) { }
                 }
             })
             {
@@ -604,21 +654,58 @@ namespace bluetooth_turnon.Services
 
             if (timedOut)
             {
-                _coreAudioConsecutiveTimeouts++;
-                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  CoreAudio: KsProperty({(connect ? "RECONNECT" : "DISCONNECT")}) on adapter '{adapterDeviceId}' TIMED OUT after {CoreAudioWatchdogTimeoutMs}ms. Abandoning thread (consecutive={_coreAudioConsecutiveTimeouts}).");
-                if (_coreAudioConsecutiveTimeouts >= CoreAudioMaxConsecutiveTimeouts)
+                int timeouts = Interlocked.Increment(ref _coreAudioConsecutiveTimeouts);
+                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  CoreAudio: KsProperty({(connect ? "RECONNECT" : "DISCONNECT")}) on adapter '{adapterDeviceId}' TIMED OUT after {CoreAudioWatchdogTimeoutMs}ms. Abandoning thread (consecutive={timeouts}).");
+                if (timeouts >= CoreAudioMaxConsecutiveTimeouts)
                 {
                     _coreAudioCircuitBreakerOpen = true;
-                    AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  CoreAudio: Circuit breaker TRIPPED OPEN after {_coreAudioConsecutiveTimeouts} consecutive timeouts.");
+                    _circuitBreakerTripUtc = DateTime.UtcNow;
+                    AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Warning, $"  CoreAudio: Circuit breaker TRIPPED OPEN after {timeouts} consecutive timeouts.");
                 }
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        if (workerThread.Join(30000))
+                        {
+                            doneEvent.Dispose();
+                        }
+                    }
+                    catch { }
+                });
                 return false;
             }
             else
             {
-                _coreAudioConsecutiveTimeouts = 0;
+                Interlocked.Exchange(ref _coreAudioConsecutiveTimeouts, 0);
+                try { doneEvent.Dispose(); } catch { }
                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"  CoreAudio: KsProperty({(connect ? "RECONNECT" : "DISCONNECT")}) on adapter '{adapterDeviceId}' returned hr=0x{ksHr:X8}");
                 return ksHr >= 0;
             }
+        }
+
+        private async Task<bool> CheckIsBleSupportedAsync(ulong address)
+        {
+            if (_batteryService != null && _batteryService.BatteryCache.TryGetValue(address, out var entry))
+            {
+                if (entry.IsClassicOnly) return false;
+            }
+
+            try
+            {
+                string selector = BluetoothLEDevice.GetDeviceSelectorFromBluetoothAddress(address);
+                var devices = await Windows.Devices.Enumeration.DeviceInformation.FindAllAsync(selector).AsTask().ConfigureAwait(false);
+                if (devices != null && devices.Count > 0)
+                {
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Debug, $"CheckIsBleSupportedAsync({address:X12}) exception: {ex.Message}");
+            }
+
+            return false;
         }
 
         public async Task<DeviceOperationResult> ConnectAsync(ulong address, string name, CancellationToken ct)
@@ -629,6 +716,7 @@ namespace bluetooth_turnon.Services
             {
                 try
                 {
+                    bool isBleSupported = await CheckIsBleSupportedAsync(address).ConfigureAwait(false);
                     string targetDeviceName;
                     using (var client = new BluetoothClient())
                     {
@@ -659,7 +747,7 @@ namespace bluetooth_turnon.Services
                             if (device.Connected)
                             {
                                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{targetDeviceName}' connected after baseband wake in {swWake.ElapsedMilliseconds}ms.");
-                                _batteryService?.ScheduleDeferredBatteryQuery(address, targetDeviceName, isClassicOnly: false, immediate: true);
+                                _batteryService?.ScheduleDeferredBatteryQuery(address, targetDeviceName, isClassicOnly: !isBleSupported, immediate: true);
                                 return DeviceOperationResult.Succeeded($"'{targetDeviceName}' connected after baseband wake in {swWake.ElapsedMilliseconds}ms.");
                             }
                         }
@@ -684,7 +772,7 @@ namespace bluetooth_turnon.Services
                                         if (device.Connected)
                                         {
                                             AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{targetDeviceName}' reconnected successfully via CoreAudio in {swCore.ElapsedMilliseconds}ms.");
-                                            _batteryService?.ScheduleDeferredBatteryQuery(address, targetDeviceName, isClassicOnly: false, immediate: true);
+                                            _batteryService?.ScheduleDeferredBatteryQuery(address, targetDeviceName, isClassicOnly: !isBleSupported, immediate: true);
                                             return DeviceOperationResult.Succeeded($"'{targetDeviceName}' reconnected successfully via CoreAudio in {swCore.ElapsedMilliseconds}ms.");
                                         }
                                     }
@@ -806,7 +894,7 @@ namespace bluetooth_turnon.Services
                             if (connected)
                             {
                                 AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{targetDeviceName}' connected successfully via service state cycle in {swCycle.ElapsedMilliseconds}ms.");
-                                _batteryService?.ScheduleDeferredBatteryQuery(address, targetDeviceName, isClassicOnly: false, immediate: true);
+                                _batteryService?.ScheduleDeferredBatteryQuery(address, targetDeviceName, isClassicOnly: !isBleSupported, immediate: true);
                                 return DeviceOperationResult.Succeeded($"'{targetDeviceName}' connected successfully via service state cycle in {swCycle.ElapsedMilliseconds}ms.");
                             }
                         }
@@ -864,7 +952,7 @@ namespace bluetooth_turnon.Services
                                 if (bounceDevice.Connected)
                                 {
                                     AsyncFileLogger.Log(AsyncFileLogger.LogLevel.Info, $"  '{bounceDevice.DeviceName}' connected successfully after radio bounce on attempt {attempt}/8.");
-                                    _batteryService?.ScheduleDeferredBatteryQuery(address, bounceDevice.DeviceName, isClassicOnly: false, immediate: true);
+                                    _batteryService?.ScheduleDeferredBatteryQuery(address, bounceDevice.DeviceName, isClassicOnly: !isBleSupported, immediate: true);
                                     return DeviceOperationResult.Succeeded($"'{bounceDevice.DeviceName}' connected successfully after radio bounce on attempt {attempt}/8.");
                                 }
                             }

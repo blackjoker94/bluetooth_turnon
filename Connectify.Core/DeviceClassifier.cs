@@ -53,6 +53,15 @@ namespace bluetooth_turnon
                         case 4: return BluetoothDeviceType.Speaker;     // Soundbar
                         default: return BluetoothDeviceType.AudioDevice;
                     }
+                case 0x0940: // Audio/Video Wearable Headset
+                    switch (subCategory)
+                    {
+                        case 1: return BluetoothDeviceType.Earbuds;     // In-ear / Earbuds
+                        case 2: return BluetoothDeviceType.Headset;     // Headset with mic
+                        case 3: return BluetoothDeviceType.Headphones;  // Over-ear headphones
+                        case 4: return BluetoothDeviceType.Headphones;  // Neckband
+                        default: return BluetoothDeviceType.Headphones;
+                    }
                 default:
                     return BluetoothDeviceType.Unknown;
             }
@@ -82,6 +91,7 @@ namespace bluetooth_turnon
                         int subType   =  minor       & 0x0F; // bits 3-0
                         if (inputKind == 0x01) return BluetoothDeviceType.Keyboard;
                         if (inputKind == 0x02) return BluetoothDeviceType.Mouse;
+                        if (inputKind == 0x03) return BluetoothDeviceType.Keyboard; // Combo (Keyboard + Mouse)
                         if (subType == 0x01 || subType == 0x02)
                             return BluetoothDeviceType.Controller; // Joystick / Gamepad
                         return BluetoothDeviceType.Mouse; // generic peripheral
@@ -120,7 +130,44 @@ namespace bluetooth_turnon
 
             string n = name.ToLowerInvariant();
 
-            // ── Phones (evaluated early to avoid name collisions) ────────────
+            // ── Earbuds & In-Ear (evaluated before phone brands so "Pixel Buds", "OnePlus Buds", "FreeBuds" don't become Phone)
+            if (n.Contains("airpod")   || n.Contains("galaxy bud") || n.Contains(" buds") || n.Contains("buds ") ||
+                n.Contains("freebuds") || n.Contains("nothing ear")|| n.Contains("earbud")  ||
+                n.Contains("wf-")      || n.Contains("tws"))
+                return BluetoothDeviceType.Earbuds;
+
+            // ── Soundcore resolution (speakers vs earbuds)
+            if (n.Contains("soundcore"))
+            {
+                if (n.Contains("motion") || n.Contains("flare") || n.Contains("mini") ||
+                    n.Contains("rave")   || n.Contains("party") || n.Contains("boom") ||
+                    n.Contains("glow")   || n.Contains("speaker") || n.Contains("select"))
+                    return BluetoothDeviceType.Speaker;
+                return BluetoothDeviceType.Earbuds;
+            }
+
+            // ── Over-ear headphones / headset (Pulse 3D is a headset, not a speaker)
+            if (n.Contains("pulse 3d") || n.Contains("wh-")     || n.Contains("xm4")    ||
+                n.Contains("xm5")      || n.Contains("qc45")    || n.Contains("qc35")   ||
+                n.Contains("qc700")    || n.Contains("momentum")|| n.Contains("arctis") ||
+                ContainsWord(n, "nova") || ContainsWord(n, "void") || ContainsWord(n, "cloud") ||
+                n.Contains("hyperx")   || n.Contains("stealth") || n.Contains("headphone") || n.Contains("headset"))
+                return BluetoothDeviceType.Headphones;
+
+            // ── Speakers (no bare pulse/charge/flip false-positives) ─────────
+            if (n.Contains("speaker")     || n.Contains("soundbar")   || ContainsWord(n, "echo") ||
+                n.Contains("homepod")     || n.Contains("boombox")    || n.Contains("ue boom") ||
+                n.Contains("wonderboom")  || n.Contains("jbl flip")   || n.Contains("jbl charge") ||
+                n.Contains("jbl pulse")   || n.Contains("charge 3")   || n.Contains("charge 4") ||
+                n.Contains("charge 5")    || n.Contains("flip 4")     || n.Contains("flip 5") ||
+                n.Contains("flip 6")      || n.Contains("xtreme"))
+                return BluetoothDeviceType.Speaker;
+
+            // ── Other Earbuds / Headset brands
+            if (n.Contains("liberty") || n.Contains("jabra"))
+                return BluetoothDeviceType.Earbuds;
+
+            // ── Phones (evaluated after audio so phone brand buds don't collide)
             if (n.Contains("iphone")   || n.Contains("galaxy s") || n.Contains("galaxy a") ||
                 n.Contains("galaxy z") || n.Contains("pixel")    || n.Contains("oneplus")  ||
                 n.Contains("redmi")    || n.Contains("poco")     || n.Contains("realme")   ||
@@ -137,7 +184,7 @@ namespace bluetooth_turnon
             // ── Mouse ─────────────────────────────────────────────────────────
             if (n.Contains("mouse")   || n.Contains("mx master") || n.Contains("mx any") ||
                 n.Contains("pro click")|| n.Contains("basilisk") || n.Contains("deathadder") ||
-                n.Contains("pebble")  || n.Contains("trackball"))
+                ContainsWord(n, "pebble") || n.Contains("trackball"))
                 return BluetoothDeviceType.Mouse;
 
             // ── Keyboard ─────────────────────────────────────────────────────
@@ -146,30 +193,6 @@ namespace bluetooth_turnon
                 ContainsWord(n, "k2")  || ContainsWord(n, "k4")   ||
                 ContainsWord(n, "k8")  || ContainsWord(n, "k10"))
                 return BluetoothDeviceType.Keyboard;
-
-            // ── Over-ear headphones / headset (Pulse 3D is a headset, not a speaker)
-            if (n.Contains("pulse 3d") || n.Contains("wh-")     || n.Contains("xm4")    ||
-                n.Contains("xm5")      || n.Contains("qc45")    || n.Contains("qc35")   ||
-                n.Contains("qc700")    || n.Contains("momentum")|| n.Contains("arctis") ||
-                n.Contains("nova")     || n.Contains("void")    || n.Contains("cloud")  ||
-                n.Contains("stealth")  || n.Contains("headphone") || n.Contains("headset"))
-                return BluetoothDeviceType.Headphones;
-
-            // ── Earbuds ──────────────────────────────────────────────────────
-            if (n.Contains("airpod")   || n.Contains("galaxy bud") || n.Contains(" buds") ||
-                n.Contains("freebuds") || n.Contains("nothing ear")|| n.Contains("liberty") ||
-                n.Contains("soundcore")|| n.Contains("jabra")      || n.Contains("earbud") ||
-                n.Contains("wf-")      || n.Contains("tws"))
-                return BluetoothDeviceType.Earbuds;
-
-            // ── Speakers (no bare pulse/charge/flip false-positives) ─────────
-            if (n.Contains("speaker")     || n.Contains("soundbar")   || n.Contains("echo") ||
-                n.Contains("homepod")     || n.Contains("boombox")    || n.Contains("ue boom") ||
-                n.Contains("wonderboom")  || n.Contains("jbl flip")   || n.Contains("jbl charge") ||
-                n.Contains("jbl pulse")   || n.Contains("charge 3")   || n.Contains("charge 4") ||
-                n.Contains("charge 5")    || n.Contains("flip 4")     || n.Contains("flip 5") ||
-                n.Contains("flip 6")      || n.Contains("xtreme"))
-                return BluetoothDeviceType.Speaker;
 
             // ── Computers ────────────────────────────────────────────────────
             if (n.Contains("desktop") || n.Contains("laptop") || n.Contains("macbook") ||
@@ -183,6 +206,13 @@ namespace bluetooth_turnon
                 return BluetoothDeviceType.Smartwatch;
 
             return BluetoothDeviceType.Unknown;
+        }
+
+        public static bool IsPeripheralType(BluetoothDeviceType type)
+        {
+            return type == BluetoothDeviceType.Mouse ||
+                   type == BluetoothDeviceType.Keyboard ||
+                   type == BluetoothDeviceType.Controller;
         }
     }
 }
