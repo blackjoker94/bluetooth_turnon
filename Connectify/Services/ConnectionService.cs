@@ -325,6 +325,7 @@ namespace bluetooth_turnon.Services
                 }
                 finally
                 {
+                    _deviceEnumerator?.InvalidateDeviceSnapshotCache();
                     SafeRelease(sem);
                 }
             }
@@ -479,6 +480,7 @@ namespace bluetooth_turnon.Services
                 }
                 finally
                 {
+                    _deviceEnumerator?.InvalidateDeviceSnapshotCache();
                     SafeRelease(sem);
                 }
             }

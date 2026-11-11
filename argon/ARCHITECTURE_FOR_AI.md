@@ -180,6 +180,13 @@ Classified by `ConnectRoutingPolicy.ClassifyTransportCapability`:
   - Successful devices: Supported for periodic refresh every **5 minutes**.
   - Disconnect: Clears in-flight queries and resets failure count to 0 for immediate retry upon reconnect.
 
+### 4.6 Snapshot Cache & Invalidation Pipeline
+- **750ms Paired Device Snapshot Cache**: Maintained in `DeviceEnumerator.cs` to eliminate UI stutter and redundant WinRT/SetupDi enumeration during rapid event bursts.
+- **Cache Invalidation Triggers (`IDeviceEnumerator.InvalidateDeviceSnapshotCache()`)**:
+  1. *Battery Updates*: `BatteryService.BatteryUpdated` invalidates the snapshot cache before invoking `DeviceConnectionChanged`, ensuring newly read battery percentages render immediately on UI cards without waiting for the 60s refresh timer.
+  2. *Connection/Disconnection Completion*: `ConnectionService` invalidates the snapshot cache in the `finally` blocks of both `ConnectDeviceWithResultAsync` and `DisconnectDeviceWithResultAsync`, ensuring card post-click refreshes reflect fresh hardware states even on sub-750ms toggles.
+- **Race Condition Prevention**: `InvalidateDeviceSnapshotCache()` resets `_ongoingSnapshotTask = null` under `_snapshotLock`. When an awaiting enumeration task finishes, `GetPairedDevicesAsync` only commits `_cachedPairedDevicesSnapshot` if `_ongoingSnapshotTask == taskToAwait`, discarding stale background results that were superseded during invalidation.
+
 ---
 
 ## 5. Test Suite Verification Reference

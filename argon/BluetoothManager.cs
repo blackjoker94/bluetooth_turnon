@@ -359,7 +359,11 @@ namespace bluetooth_turnon
 
             if (_batteryService is BatteryService bs)
             {
-                bs.BatteryUpdated += (addr, lvl) => DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+                bs.BatteryUpdated += (addr, lvl) =>
+                {
+                    _deviceEnumerator?.InvalidateDeviceSnapshotCache();
+                    DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+                };
             }
 
             _radioService.RadioTurnedOff += (reason) =>
@@ -429,6 +433,11 @@ namespace bluetooth_turnon
         internal async Task<(bool hasPeripherals, string name, BluetoothDeviceType type)> CheckConnectedPeripheralsAsync(ulong currentTargetAddress, CancellationToken ct = default)
         {
             return await _deviceEnumerator.CheckConnectedPeripheralsAsync(currentTargetAddress, ct).ConfigureAwait(false);
+        }
+
+        public void InvalidateDeviceSnapshotCache()
+        {
+            _deviceEnumerator?.InvalidateDeviceSnapshotCache();
         }
 
         public async Task<bool> ConnectDeviceAsync(ulong address, CancellationToken ct = default)

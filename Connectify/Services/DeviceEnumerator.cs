@@ -46,6 +46,7 @@ namespace bluetooth_turnon.Services
             {
                 _lastSnapshotUtc = DateTime.MinValue;
                 _cachedPairedDevicesSnapshot = null;
+                _ongoingSnapshotTask = null;
             }
         }
 
@@ -119,7 +120,7 @@ namespace bluetooth_turnon.Services
                 var snapshot = await taskToAwait.ConfigureAwait(false);
                 lock (_snapshotLock)
                 {
-                    if (snapshot != null)
+                    if (snapshot != null && _ongoingSnapshotTask == taskToAwait)
                     {
                         _cachedPairedDevicesSnapshot = snapshot;
                         _lastSnapshotUtc = DateTime.UtcNow;
