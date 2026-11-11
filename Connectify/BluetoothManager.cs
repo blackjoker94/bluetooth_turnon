@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -9,6 +10,7 @@ using System.ServiceProcess;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
 using Windows.Devices.Enumeration;
@@ -260,6 +262,60 @@ namespace bluetooth_turnon
         AudioDevice,  // Generic audio device
     }
 
+    public enum AdapterUiState
+    {
+        NoAdapter,
+        Disabled,
+        Enabled,
+        TurningOn,
+        TurningOff,
+        Reconnecting
+    }
+
+    public enum DeviceTransportCapability
+    {
+        Unknown,
+        ClassicCapable,
+        BleOnly
+    }
+
+    public enum ConnectionRoute
+    {
+        ClassicWithAudio,
+        ClassicWithHid,
+        BleDirect
+    }
+
+    public enum DeviceOperationStatus
+    {
+        Success,
+        Failed,
+        Cancelled,
+        AccessDenied,
+        AlreadyInDesiredState,
+        RadioOff
+    }
+
+    public sealed class DeviceOperationResult
+    {
+        public DeviceOperationStatus Status { get; }
+        public string Message { get; }
+        public bool IsSuccess => Status == DeviceOperationStatus.Success || Status == DeviceOperationStatus.AlreadyInDesiredState;
+
+        public DeviceOperationResult(DeviceOperationStatus status, string message = null)
+        {
+            Status = status;
+            Message = message ?? status.ToString();
+        }
+
+        public static DeviceOperationResult Succeeded(string msg = "Success") => new DeviceOperationResult(DeviceOperationStatus.Success, msg);
+        public static DeviceOperationResult AlreadyConnected(string msg = "Already connected") => new DeviceOperationResult(DeviceOperationStatus.AlreadyInDesiredState, msg);
+        public static DeviceOperationResult AlreadyDisconnected(string msg = "Already disconnected") => new DeviceOperationResult(DeviceOperationStatus.AlreadyInDesiredState, msg);
+        public static DeviceOperationResult Cancelled(string msg = "Cancelled") => new DeviceOperationResult(DeviceOperationStatus.Cancelled, msg);
+        public static DeviceOperationResult Failed(string reason) => new DeviceOperationResult(DeviceOperationStatus.Failed, reason);
+        public static DeviceOperationResult AccessDenied(string reason = "Elevation required") => new DeviceOperationResult(DeviceOperationStatus.AccessDenied, reason);
+    }
+
     /// <summary>
     /// Represents a connected Bluetooth device with type classification and optional battery info.
     /// Battery is nullable — many BLE devices do not expose the battery service.
@@ -283,64 +339,627 @@ namespace bluetooth_turnon
     }
 
     /// <summary>
+    /// Outcome of a battery query attempt.
+    /// </summary>
+    public enum BatteryQueryOutcome
+    {
+        Success,
+        Unsupported,
+        TransientFailure
+    }
+
+    /// <summary>
+    /// Thread-safe cache entry tracking battery level, last-good value, query outcome,
+    /// and backoff retry timings.
+    /// </summary>
+    public sealed class BatteryCacheEntry
+    {
+        public ulong Address { get; set; }
+        public string DeviceName { get; set; }
+        public int? BatteryPercent { get; set; }
+        public int? LastGoodBattery { get; set; }
+        public DateTime? LastGoodUtc { get; set; }
+        public BatteryQueryOutcome Outcome { get; set; }
+        public DateTime LastCheckedUtc { get; set; }
+        public int FailureCount { get; set; }
+        public DateTime NextAllowedRetryUtc { get; set; }
+        public bool IsClassicOnly { get; set; }
+
+        public int? GetEffectiveBattery()
+        {
+            if (BatteryPercent.HasValue) return BatteryPercent;
+            if (LastGoodBattery.HasValue && LastGoodUtc.HasValue &&
+                (DateTime.UtcNow - LastGoodUtc.Value) < BluetoothManager.BatteryLastGoodRetentionDuration)
+            {
+                return LastGoodBattery;
+            }
+            return null;
+        }
+
+        public bool ShouldRetry()
+        {
+            if (Outcome == BatteryQueryOutcome.Unsupported)
+            {
+                return DateTime.UtcNow >= NextAllowedRetryUtc;
+            }
+            if (Outcome == BatteryQueryOutcome.TransientFailure)
+            {
+                return DateTime.UtcNow >= NextAllowedRetryUtc;
+            }
+            return false;
+        }
+
+        public void RecordSuccess(int level, string deviceName)
+        {
+            DeviceName = deviceName;
+            BatteryPercent = level;
+            LastGoodBattery = level;
+            LastGoodUtc = DateTime.UtcNow;
+            Outcome = BatteryQueryOutcome.Success;
+            LastCheckedUtc = DateTime.UtcNow;
+            FailureCount = 0;
+            NextAllowedRetryUtc = DateTime.UtcNow.AddMinutes(5);
+        }
+
+        public void RecordUnsupported(string deviceName, bool isClassicOnly = false)
+        {
+            DeviceName = deviceName;
+            BatteryPercent = null;
+            Outcome = BatteryQueryOutcome.Unsupported;
+            LastCheckedUtc = DateTime.UtcNow;
+            IsClassicOnly = isClassicOnly;
+            NextAllowedRetryUtc = DateTime.UtcNow.Add(BluetoothManager.BatteryUnsupportedCacheDuration);
+        }
+
+        public void RecordTransientFailure(string deviceName)
+        {
+            DeviceName = deviceName;
+            Outcome = BatteryQueryOutcome.TransientFailure;
+            LastCheckedUtc = DateTime.UtcNow;
+            FailureCount++;
+            NextAllowedRetryUtc = DateTime.UtcNow.Add(BluetoothManager.GetTransientBackoff(FailureCount));
+
+            if (LastGoodBattery.HasValue && LastGoodUtc.HasValue &&
+                (DateTime.UtcNow - LastGoodUtc.Value) < BluetoothManager.BatteryLastGoodRetentionDuration)
+            {
+                BatteryPercent = LastGoodBattery;
+            }
+            else
+            {
+                BatteryPercent = null;
+            }
+        }
+    }
+
+    public sealed class BatteryQueryResult
+    {
+        public BatteryQueryOutcome Outcome { get; set; }
+        public int? BatteryLevel { get; set; }
+        public long ElapsedMs { get; set; }
+        public string Details { get; set; }
+    }
+
+    /// <summary>
     /// Single source of truth for all Bluetooth adapter and device operations.
     /// Uses Windows BluetoothAdapter & Radio APIs.
     /// </summary>
     public sealed class BluetoothManager : IDisposable
     {
-        private static readonly object _logLock = new object();
+        public enum LogLevel
+        {
+            Debug,
+            Info,
+            Warning,
+            Error
+        }
+
         private const long MaxLogFileSizeBytes = 1024 * 1024; // 1 MB
         private static readonly string _logPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "Connectify", "app_log.txt");
+        private static readonly BlockingCollection<string> _logQueue = new BlockingCollection<string>(new ConcurrentQueue<string>(), 2000);
+        private static readonly Thread _logWorkerThread;
+        private static volatile bool _logWriterRunning = true;
+        private static readonly Regex _macRegex = new Regex(@"\b([0-9A-Fa-f]{2}[:-]?){5}([0-9A-Fa-f]{2})\b|\b[0-9A-Fa-f]{12}\b", RegexOptions.Compiled);
 
-        public static void Log(string msg)
+        #region Diagnostic Switches (Connect & Disconnect Chain Step Toggles)
+        public static bool EnableStepWake = true;
+        public static bool EnableStepCoreAudio = true;
+        public static bool EnableStepServiceCycle = true;
+        public static bool EnableStepBounce = true;
+        public static bool EnableDisconnectCoreAudio = true;
+        public static bool EnableDisconnectIoctl = true;
+        #endregion
+
+        #region Core Audio Watchdog & Circuit Breaker Settings
+        internal static int CoreAudioWatchdogTimeoutMs = 5000;
+        private static int _coreAudioConsecutiveTimeouts = 0;
+        private static bool _coreAudioCircuitBreakerOpen = false;
+        private const int CoreAudioMaxConsecutiveTimeouts = 3;
+
+        internal static bool CoreAudioCircuitBreakerOpen
         {
+            get => _coreAudioCircuitBreakerOpen;
+            set
+            {
+                _coreAudioCircuitBreakerOpen = value;
+                if (!value) _coreAudioConsecutiveTimeouts = 0;
+            }
+        }
+        internal static int CoreAudioConsecutiveTimeouts => _coreAudioConsecutiveTimeouts;
+        internal static Func<IKsControl, KSIDENTIFIER, int> KsPropertyInvoker { get; set; }
+        #endregion
+
+        static BluetoothManager()
+        {
+            _logWorkerThread = new Thread(ProcessLogQueue)
+            {
+                IsBackground = true,
+                Name = "ConnectifyLogWriter",
+                Priority = ThreadPriority.BelowNormal
+            };
+            _logWorkerThread.Start();
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => ShutdownLogger();
+        }
+
+        public static string MaskAddress(string input)
+        {
+            if (string.IsNullOrEmpty(input)) return input;
+            return _macRegex.Replace(input, m =>
+            {
+                string val = m.Value;
+                if (val.Length == 12)
+                {
+                    // Mask first 8 hex characters: ********ABCD
+                    return "********" + val.Substring(8);
+                }
+                else if (val.Length == 17)
+                {
+                    // Form XX:XX:XX:XX:XX:XX -> **:**:**:**:XX:XX
+                    return "**:**:**:**:" + val.Substring(12);
+                }
+                return val;
+            });
+        }
+
+        public static void Log(string msg) => Log(LogLevel.Info, msg);
+
+        public static void Log(LogLevel level, string msg)
+        {
+            if (string.IsNullOrEmpty(msg) || !_logWriterRunning) return;
+            string masked = MaskAddress(msg);
+            string entry = $"{DateTime.Now:HH:mm:ss.fff} [{level}] {masked}";
+            _logQueue.TryAdd(entry);
+        }
+
+        private static void ProcessLogQueue()
+        {
+            var batch = new List<string>(64);
+            while (_logWriterRunning || _logQueue.Count > 0)
+            {
+                try
+                {
+                    string first;
+                    if (_logQueue.TryTake(out first, 500))
+                    {
+                        batch.Add(first);
+                        while (batch.Count < 100 && _logQueue.TryTake(out string next))
+                        {
+                            batch.Add(next);
+                        }
+
+                        WriteLogBatch(batch);
+                        batch.Clear();
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static void WriteLogBatch(List<string> entries)
+        {
+            if (entries == null || entries.Count == 0) return;
             try
             {
-                lock (_logLock)
+                string dir = Path.GetDirectoryName(_logPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                 {
-                    string dir = Path.GetDirectoryName(_logPath);
-                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                    {
-                        Directory.CreateDirectory(dir);
-                    }
+                    Directory.CreateDirectory(dir);
+                }
 
-                    if (File.Exists(_logPath))
+                if (File.Exists(_logPath))
+                {
+                    var fileInfo = new FileInfo(_logPath);
+                    if (fileInfo.Length >= MaxLogFileSizeBytes)
                     {
-                        var fileInfo = new FileInfo(_logPath);
-                        if (fileInfo.Length >= MaxLogFileSizeBytes)
+                        try
                         {
-                            try
-                            {
-                                string backupPath = Path.Combine(dir, "app_log.old.txt");
-                                if (File.Exists(backupPath))
-                                {
-                                    File.Delete(backupPath);
-                                }
-                                File.Move(_logPath, backupPath);
-                            }
-                            catch
-                            {
-                                // If move fails, truncate the existing file in-place
-                                File.WriteAllText(_logPath, string.Empty);
-                            }
+                            string backupPath = Path.Combine(dir, "app_log.old.txt");
+                            if (File.Exists(backupPath)) File.Delete(backupPath);
+                            File.Move(_logPath, backupPath);
+                        }
+                        catch
+                        {
+                            File.WriteAllText(_logPath, string.Empty);
                         }
                     }
-
-                    File.AppendAllText(_logPath, $"{DateTime.Now:HH:mm:ss.fff}: {msg}\r\n");
                 }
+
+                File.AppendAllLines(_logPath, entries);
+            }
+            catch { }
+        }
+
+        private static void ShutdownLogger()
+        {
+            _logWriterRunning = false;
+            try
+            {
+                _logQueue.CompleteAdding();
+                _logWorkerThread?.Join(500);
             }
             catch { }
         }
 
         private readonly SemaphoreSlim _radioInitSemaphore = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _adapterToggleSemaphore = new SemaphoreSlim(1, 1);
-        private readonly SemaphoreSlim _connectSemaphore = new SemaphoreSlim(1, 1);
-        private readonly HashSet<ulong> _activeBatteryRetries = new HashSet<ulong>();
+        private readonly ConcurrentDictionary<ulong, SemaphoreSlim> _deviceSemaphores = new ConcurrentDictionary<ulong, SemaphoreSlim>();
+
+        private SemaphoreSlim GetDeviceSemaphore(ulong address)
+        {
+            return _deviceSemaphores.GetOrAdd(address, _ => new SemaphoreSlim(1, 1));
+        }
+
+        private const string PendingProfilesRegistryPath = @"SOFTWARE\Connectify\PendingProfileRestores";
+        private const string ConnectifyRegistrySubKey = @"SOFTWARE\Connectify";
+        private const string BounceInProgressValueName = "BounceInProgress";
+        private const string SettingsRegistryPath = @"SOFTWARE\Connectify\Settings";
+        private const string AutoBounceSettingValueName = "AllowAutomaticRadioBounce";
+
+        private static bool _allowAutomaticRadioBounce = LoadAllowAutomaticRadioBounce();
+
+        internal static Func<Task<bool>> IncompleteBounceRadioRestorerHook { get; set; }
+
+        /// <summary>
+        /// Gets or sets whether the connection chain is allowed to automatically bounce (power cycle)
+        /// the Bluetooth radio adapter when pre-bounce steps fail. Off (false) by default.
+        /// Setting is persisted in the registry (HKCU\SOFTWARE\Connectify\Settings) and survives restarts.
+        /// </summary>
+        public static bool AllowAutomaticRadioBounce
+        {
+            get => _allowAutomaticRadioBounce;
+            set
+            {
+                _allowAutomaticRadioBounce = value;
+                try
+                {
+                    using (var key = Registry.CurrentUser.CreateSubKey(SettingsRegistryPath))
+                    {
+                        key?.SetValue(AutoBounceSettingValueName, value ? 1 : 0, RegistryValueKind.DWord);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Save AllowAutomaticRadioBounce exception: {ex.Message}");
+                }
+            }
+        }
+
+        internal static bool LoadAllowAutomaticRadioBounce()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(SettingsRegistryPath, false))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue(AutoBounceSettingValueName);
+                        if (val is int intVal) return intVal == 1;
+                    }
+                }
+            }
+            catch { }
+            return false; // Default: OFF (never bounce automatically)
+        }
+
+        internal static void SetBounceInProgressMarker(bool inProgress)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(ConnectifyRegistrySubKey))
+                {
+                    if (key != null)
+                    {
+                        if (inProgress)
+                        {
+                            key.SetValue(BounceInProgressValueName, 1, RegistryValueKind.DWord);
+                        }
+                        else
+                        {
+                            key.DeleteValue(BounceInProgressValueName, false);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"SetBounceInProgressMarker({inProgress}) exception: {ex.Message}");
+            }
+        }
+
+        internal static bool GetBounceInProgressMarker()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(ConnectifyRegistrySubKey, false))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue(BounceInProgressValueName);
+                        if (val is int intVal) return intVal == 1;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        internal static async Task<bool> CheckAndRecoverIncompleteBounceAsync(BluetoothManager manager = null)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(ConnectifyRegistrySubKey, true))
+                {
+                    if (key == null) return false;
+                    object val = key.GetValue(BounceInProgressValueName);
+                    if (val is int intVal && intVal == 1)
+                    {
+                        Log("Startup: Detected incomplete radio bounce marker from a prior session/crash.");
+                        bool restored = false;
+                        try
+                        {
+                            if (IncompleteBounceRadioRestorerHook != null)
+                            {
+                                restored = await IncompleteBounceRadioRestorerHook().ConfigureAwait(false);
+                                Log($"Startup: Incomplete bounce radio restored via hook: {restored}");
+                            }
+                            else
+                            {
+                                Radio radio = null;
+                                if (manager != null)
+                                {
+                                    radio = await manager.GetBluetoothRadioAsync(CancellationToken.None, forceRefresh: true).ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    var adapter = await BluetoothAdapter.GetDefaultAsync().AsTask().ConfigureAwait(false);
+                                    if (adapter != null)
+                                    {
+                                        radio = await adapter.GetRadioAsync().AsTask().ConfigureAwait(false);
+                                    }
+                                }
+
+                                if (radio != null && radio.State != RadioState.On)
+                                {
+                                    Log("Startup: Bluetooth radio is OFF after incomplete bounce. Restoring radio power to ON...");
+                                    var status = await radio.SetStateAsync(RadioState.On).AsTask(CancellationToken.None).ConfigureAwait(false);
+                                    restored = (status == RadioAccessStatus.Allowed);
+                                    Log($"Startup: Restored radio to ON, status={status}, success={restored}");
+                                }
+                                else
+                                {
+                                    Log("Startup: Radio is already ON or not present.");
+                                    restored = true;
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Startup: Exception while restoring radio: {ex.Message}");
+                        }
+                        finally
+                        {
+                            try
+                            {
+                                key.DeleteValue(BounceInProgressValueName, false);
+                                Log("Startup: Cleared BounceInProgress registry marker.");
+                            }
+                            catch { }
+                        }
+                        return restored;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"CheckAndRecoverIncompleteBounceAsync exception: {ex.Message}");
+            }
+            return false;
+        }
+
+        public BluetoothManager()
+        {
+            // Recover any profile services that were left disabled by an abnormal termination (Fix Issue #11)
+            // and recover radio power if an incomplete radio bounce occurred before abnormal termination (Fix Issue #5)
+            Task.Run(async () =>
+            {
+                RecoverPendingProfileRestores();
+                await CheckAndRecoverIncompleteBounceAsync(this).ConfigureAwait(false);
+            });
+        }
+
+        private static void RecordPendingProfileRestore(ulong address, Guid profile)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(PendingProfilesRegistryPath))
+                {
+                    key?.SetValue($"{address:X12}_{profile}", 1, RegistryValueKind.DWord);
+                }
+            }
+            catch { }
+        }
+
+        private static void ClearPendingProfileRestore(ulong address, Guid profile)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(PendingProfilesRegistryPath, true))
+                {
+                    key?.DeleteValue($"{address:X12}_{profile}", false);
+                }
+            }
+            catch { }
+        }
+
+        private static void RecoverPendingProfileRestores()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(PendingProfilesRegistryPath, true))
+                {
+                    if (key == null) return;
+                    string[] names = key.GetValueNames();
+                    if (names == null || names.Length == 0) return;
+
+                    Log($"Startup: Found {names.Length} pending profile restore marker(s) from previous abnormal shutdown.");
+                    using (var client = new InTheHand.Net.Sockets.BluetoothClient())
+                    {
+                        var paired = client.PairedDevices;
+                        foreach (string name in names)
+                        {
+                            try
+                            {
+                                var parts = name.Split('_');
+                                if (parts.Length == 2 &&
+                                    ulong.TryParse(parts[0], System.Globalization.NumberStyles.HexNumber, null, out ulong addr) &&
+                                    Guid.TryParse(parts[1], out Guid profile))
+                                {
+                                    var dev = paired?.FirstOrDefault(d => d.DeviceAddress.ToUInt64() == addr);
+                                    if (dev != null)
+                                    {
+                                        dev.SetServiceState(profile, true);
+                                        Log($"  Startup recovery: Restored service {profile} on device '{dev.DeviceName}' ({addr:X12})");
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"  Startup recovery exception for {name}: {ex.Message}");
+                            }
+                            finally
+                            {
+                                try { key.DeleteValue(name, false); } catch { }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"RecoverPendingProfileRestores exception: {ex.Message}");
+            }
+        }
+
+        #region Battery GATT Configuration & Budgets
+
+        /// <summary>
+        /// Timeout budget for fast cached GATT queries (services/characteristics from local OS cache).
+        /// Default: 2000ms (2 seconds).
+        /// </summary>
+        public static int BatteryCachedQueryBudgetMs { get; set; } = 2000;
+
+        /// <summary>
+        /// Timeout budget for slow uncached background GATT discovery (over-the-air with peripheral).
+        /// Default: 10000ms (10 seconds) chosen from the slowest measured over-the-air discovery results.
+        /// </summary>
+        public static int BatteryUncachedQueryBudgetMs { get; set; } = 10000;
+
+        /// <summary>
+        /// Maximum bounded retries while connected before capping at the periodic 5-minute interval.
+        /// </summary>
+        public static int MaxBatteryRetries { get; set; } = 5;
+
+        /// <summary>
+        /// Duration to cache devices confirmed to NOT support GATT Battery Service.
+        /// Default: 24 hours (queried once and then left alone).
+        /// </summary>
+        public static TimeSpan BatteryUnsupportedCacheDuration { get; set; } = TimeSpan.FromHours(24);
+
+        /// <summary>
+        /// Duration to retain the last-good battery reading across transient packet drops or timeouts.
+        /// Default: 30 minutes (preserves value instead of blanking out to N/A).
+        /// </summary>
+        public static TimeSpan BatteryLastGoodRetentionDuration { get; set; } = TimeSpan.FromMinutes(30);
+
+        /// <summary>
+        /// Exponential backoff schedule for transient battery query failures.
+        /// Schedule: 30s -> 2m -> 5m (capped at 5m).
+        /// </summary>
+        public static TimeSpan GetTransientBackoff(int failureCount)
+        {
+            switch (failureCount)
+            {
+                case 1: return TimeSpan.FromSeconds(30);
+                case 2: return TimeSpan.FromMinutes(2);
+                default: return TimeSpan.FromMinutes(5);
+            }
+        }
+
+        /// <summary>
+        /// Extracts Bluetooth MAC address (ulong) from Windows WinRT BLE DeviceInformation.Id string.
+        /// </summary>
+        public static ulong TryExtractAddressFromBleDeviceId(string deviceId)
+        {
+            if (string.IsNullOrWhiteSpace(deviceId)) return 0;
+            try
+            {
+                int idx = deviceId.IndexOf("BluetoothLE", StringComparison.OrdinalIgnoreCase);
+                if (idx >= 0)
+                {
+                    string sub = deviceId.Substring(idx + "BluetoothLE".Length);
+                    if (sub.StartsWith("#BluetoothLE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        sub = sub.Substring("#BluetoothLE".Length);
+                    }
+                    int endIdx = sub.IndexOfAny(new[] { '-', '_', '#' });
+                    if (endIdx > 0) sub = sub.Substring(0, endIdx);
+                    sub = sub.Replace(":", "").Replace("-", "").Trim();
+                    if (ulong.TryParse(sub, System.Globalization.NumberStyles.HexNumber, null, out ulong addr))
+                    {
+                        return addr;
+                    }
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        #endregion
+
+        private readonly HashSet<ulong> _inFlightBatteryQueries = new HashSet<ulong>();
         private readonly object _batteryRetryLock = new object();
-        private readonly ConcurrentDictionary<ulong, (int? Battery, DateTime LastCheckedUtc)> _batteryCache =
-            new ConcurrentDictionary<ulong, (int? Battery, DateTime LastCheckedUtc)>();
+        private readonly ConcurrentDictionary<ulong, BatteryCacheEntry> _batteryCache =
+            new ConcurrentDictionary<ulong, BatteryCacheEntry>();
+
+        internal ConcurrentDictionary<ulong, BatteryCacheEntry> BatteryCache => _batteryCache;
+        internal HashSet<ulong> InFlightBatteryQueries => _inFlightBatteryQueries;
+
+        private void HandleDeviceDisconnected(ulong address)
+        {
+            if (address == 0) return;
+            lock (_batteryRetryLock)
+            {
+                _inFlightBatteryQueries.Remove(address);
+            }
+            if (_batteryCache.TryGetValue(address, out var entry))
+            {
+                entry.FailureCount = 0;
+            }
+        }
+
+        private static readonly ConcurrentDictionary<string, string> _pnpInstanceIdCache =
+            new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         // Holds open BluetoothLEDevice handles for actively connected BLE devices so Windows keeps the
         // BLE ACL link alive. The OS drops the link once all process-side handles are released.
@@ -349,6 +968,8 @@ namespace bluetooth_turnon
         // IsDeviceConnectedAsync, and QueryBatteryViaGattAsync.
         private readonly ConcurrentDictionary<ulong, BluetoothLEDevice> _connectedBleDevices =
             new ConcurrentDictionary<ulong, BluetoothLEDevice>();
+        private readonly ConcurrentDictionary<ulong, GattSession> _connectedBleSessions =
+            new ConcurrentDictionary<ulong, GattSession>();
 
         private volatile Radio _bluetoothRadio;
         private volatile bool _radioDiscoveryAttempted;
@@ -356,10 +977,35 @@ namespace bluetooth_turnon
         private DeviceWatcher _bleWatcher;
         private volatile bool _classicEnumerationComplete;
         private volatile bool _bleEnumerationComplete;
+        private readonly object _watcherDebounceLock = new object();
+        private System.Threading.Timer _watcherDebounceTimer;
         private bool _disposed;
         private volatile bool _userRequestedAdapterOff;
         private readonly object _deviceOpCtsLock = new object();
         private CancellationTokenSource _deviceOpCts = new CancellationTokenSource();
+
+        private void TriggerDeviceConnectionChangedDebounced()
+        {
+            if (_disposed) return;
+            lock (_watcherDebounceLock)
+            {
+                if (_watcherDebounceTimer == null)
+                {
+                    _watcherDebounceTimer = new System.Threading.Timer(_ =>
+                    {
+                        if (!_disposed)
+                        {
+                            Log(LogLevel.Debug, "DeviceWatcher: Debounce elapsed (500ms). Raising DeviceConnectionChanged.");
+                            DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+                        }
+                    }, null, 500, Timeout.Infinite);
+                }
+                else
+                {
+                    _watcherDebounceTimer.Change(500, Timeout.Infinite);
+                }
+            }
+        }
 
         /// <summary>
         /// Indicates whether the user explicitly requested the adapter to remain OFF.
@@ -404,11 +1050,21 @@ namespace bluetooth_turnon
         }
 
         /// <summary>
-        /// Removes all entries from _connectedBleDevices and disposes each stored handle, causing Windows
-        /// to drop any BLE ACL links this process was keeping alive. Called on adapter-off and Dispose().
+        /// Removes all entries from _connectedBleDevices and _connectedBleSessions and disposes each stored handle/session,
+        /// causing Windows to drop any BLE ACL links this process was keeping alive. Called on adapter-off and Dispose().
         /// </summary>
         private void ReleaseAllConnectedBleHandles(string reason)
         {
+            var sessionKeys = _connectedBleSessions.Keys.ToArray();
+            foreach (var addr in sessionKeys)
+            {
+                if (_connectedBleSessions.TryRemove(addr, out var session))
+                {
+                    try { session.MaintainConnection = false; session.Dispose(); } catch { }
+                    Log($"  ReleaseAllConnectedBleHandles ({reason}): released GattSession for {addr:X12}");
+                }
+            }
+
             var keys = _connectedBleDevices.Keys.ToArray();
             foreach (var addr in keys)
             {
@@ -421,10 +1077,16 @@ namespace bluetooth_turnon
         }
 
         /// <summary>
-        /// Removes and disposes the tracked BLE handle for a single address (called on disconnect).
+        /// Removes and disposes the tracked BLE handle and GattSession for a single address (called on disconnect).
         /// </summary>
         private void ReleaseConnectedBleHandle(ulong address)
         {
+            if (_connectedBleSessions.TryRemove(address, out var session))
+            {
+                try { session.MaintainConnection = false; session.Dispose(); } catch { }
+                Log($"  ReleaseConnectedBleHandle: released GattSession for {address:X12}");
+            }
+
             if (_connectedBleDevices.TryRemove(address, out var dev))
             {
                 try { dev?.Dispose(); } catch { }
@@ -476,7 +1138,14 @@ namespace bluetooth_turnon
                 }
                 catch (Exception ex)
                 {
-                    Log($"bthserv check note: {ex.Message}");
+                    if (ex.InnerException is System.ComponentModel.Win32Exception w32 && w32.NativeErrorCode == 5)
+                    {
+                        Log(LogLevel.Warning, "Elevation required: Win32 error 5 (Access Denied) when starting bthserv. Run as Administrator if service operations are needed.");
+                    }
+                    else
+                    {
+                        Log($"bthserv check note: {ex.Message}");
+                    }
                 }
             }).ConfigureAwait(false);
         }
@@ -626,12 +1295,37 @@ namespace bluetooth_turnon
                     try { sender.StateChanged -= BluetoothRadio_StateChanged; } catch { }
                     _bluetoothRadio = null;
                     _radioDiscoveryAttempted = false;
+
+                    // Release open BLE handles and purge state on external adapter removal (Fix Issue #7)
+                    ReleaseAllConnectedBleHandles("adapter removed");
+                    _batteryCache.Clear();
+                    lock (_batteryRetryLock) { _inFlightBatteryQueries.Clear(); }
+                    lock (_deviceOpCtsLock)
+                    {
+                        try { _deviceOpCts.Cancel(); } catch { }
+                        _deviceOpCts = new CancellationTokenSource();
+                    }
+
                     AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(null, "No Adapter"));
                     return;
                 }
 
                 bool isEnabled = (sender.State == RadioState.On);
                 Log($"BluetoothRadio_StateChanged: isEnabled={isEnabled}");
+
+                if (!isEnabled)
+                {
+                    // Release open BLE handles and reset retry state on external radio power-off (Fix Issue #7)
+                    ReleaseAllConnectedBleHandles("external radio off");
+                    lock (_batteryRetryLock) { _inFlightBatteryQueries.Clear(); }
+                    foreach (var kvp in _batteryCache) { kvp.Value.FailureCount = 0; }
+                    lock (_deviceOpCtsLock)
+                    {
+                        try { _deviceOpCts.Cancel(); } catch { }
+                        _deviceOpCts = new CancellationTokenSource();
+                    }
+                }
+
                 AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(isEnabled));
             }
             catch (Exception ex)
@@ -680,39 +1374,52 @@ namespace bluetooth_turnon
         /// </summary>
         public async Task<bool> SetAdapterStateAsync(bool enable, CancellationToken ct = default)
         {
-            Log($"SetAdapterStateAsync(enable={enable}) called");
+            return await SetAdapterStateAsync(enable, ct, isUserInitiated: true).ConfigureAwait(false);
+        }
+
+        internal async Task<bool> SetAdapterStateAsync(bool enable, CancellationToken ct, bool isUserInitiated)
+        {
+            Log($"SetAdapterStateAsync(enable={enable}, isUserInitiated={isUserInitiated}) called");
             if (_disposed) return false;
 
             if (enable)
             {
-                _userRequestedAdapterOff = false;
-            }
-            else if (!IsRadioBounceInProgress)
-            {
-                _userRequestedAdapterOff = true;
-
-                // When adapter is being turned OFF by the user (not during an internal radio bounce),
-                // cancel any in-flight connect or disconnect operations immediately.
-                // Replace under lock without disposing old instance to prevent ObjectDisposedException
-                // in concurrent callers using linked tokens.
-                lock (_deviceOpCtsLock)
+                if (isUserInitiated)
                 {
-                    try
-                    {
-                        _deviceOpCts.Cancel();
-                    }
-                    catch { }
-                    _deviceOpCts = new CancellationTokenSource();
+                    _userRequestedAdapterOff = false;
                 }
-
-                // Release all open BLE device handles so Windows can fully drop those ACL links.
-                ReleaseAllConnectedBleHandles("adapter off");
-
-                // Clear battery cache and active battery retry state on adapter turn-off
-                _batteryCache.Clear();
-                lock (_batteryRetryLock)
+            }
+            else
+            {
+                if (isUserInitiated)
                 {
-                    _activeBatteryRetries.Clear();
+                    _userRequestedAdapterOff = true;
+
+                    // When adapter is being turned OFF by the user (even if during an internal radio bounce),
+                    // cancel any in-flight connect or disconnect operations immediately.
+                    // Replace under lock without disposing old instance to prevent ObjectDisposedException
+                    // in concurrent callers using linked tokens.
+                    lock (_deviceOpCtsLock)
+                    {
+                        try
+                        {
+                            _deviceOpCts.Cancel();
+                        }
+                        catch { }
+                        _deviceOpCts = new CancellationTokenSource();
+                    }
+
+                    // If a radio bounce is currently in progress, wait for it to unwind before toggling hardware
+                    if (IsRadioBounceInProgress)
+                    {
+                        Log("SetAdapterStateAsync(OFF): Radio bounce is in progress. Cancelling bounce and awaiting unwind...");
+                        var swUnwind = System.Diagnostics.Stopwatch.StartNew();
+                        while (IsRadioBounceInProgress && swUnwind.ElapsedMilliseconds < 5000)
+                        {
+                            await Task.Delay(50, CancellationToken.None).ConfigureAwait(false);
+                        }
+                        Log($"SetAdapterStateAsync(OFF): Bounce unwind wait finished after {swUnwind.ElapsedMilliseconds}ms (IsRadioBounceInProgress={IsRadioBounceInProgress}).");
+                    }
                 }
             }
 
@@ -724,8 +1431,21 @@ namespace bluetooth_turnon
 
             if (radio == null || radio.State == RadioState.Unknown)
             {
+                if (!enable && isUserInitiated)
+                {
+                    _userRequestedAdapterOff = false;
+                }
                 Log("SetAdapterStateAsync: Radio is null or Unknown, cannot toggle");
                 return false;
+            }
+
+            // If the user requested OFF and the radio is already in Off state (e.g. powered off by the bounce's finally block),
+            // ensure state is synchronized and return success immediately.
+            if (!enable && radio.State == RadioState.Off)
+            {
+                Log("SetAdapterStateAsync(OFF): Radio is already in Off state. Syncing UI event.");
+                AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(false));
+                return true;
             }
 
             await _adapterToggleSemaphore.WaitAsync(ct).ConfigureAwait(false);
@@ -738,10 +1458,39 @@ namespace bluetooth_turnon
                 bool success = (result == RadioAccessStatus.Allowed);
                 Log($"radio.SetStateAsync returned: {result}, success={success}");
 
+                if (success)
+                {
+                    if (!enable && isUserInitiated)
+                    {
+                        // Commit destructive side effects only after the hardware off operation succeeded (Fix Issue #8)
+                        ReleaseAllConnectedBleHandles("adapter off");
+                        lock (_batteryRetryLock)
+                        {
+                            _inFlightBatteryQueries.Clear();
+                        }
+                        foreach (var kvp in _batteryCache)
+                        {
+                            kvp.Value.FailureCount = 0;
+                        }
+                    }
+                }
+                else
+                {
+                    if (!enable && isUserInitiated)
+                    {
+                        // Revert requested state if hardware call was rejected
+                        _userRequestedAdapterOff = false;
+                    }
+                }
+
                 return success;
             }
             catch (Exception ex)
             {
+                if (!enable && isUserInitiated)
+                {
+                    _userRequestedAdapterOff = false;
+                }
                 Log($"SetAdapterStateAsync exception: {ex.Message}");
                 return false;
             }
@@ -762,6 +1511,12 @@ namespace bluetooth_turnon
         public async Task<IReadOnlyList<DeviceInfo>> GetPairedDevicesAsync(CancellationToken ct = default)
         {
             Log("GetPairedDevicesAsync called");
+            if (IsRadioBounceInProgress)
+            {
+                Log("GetPairedDevicesAsync: radio bounce in progress; suppressing device refresh (Fix Issue #6)");
+                return null;
+            }
+
             // Guard: check adapter state.
             // Fast lock-free path: if radio is already cached, read state directly without
             // awaiting or acquiring any initialization semaphore (Bug 12 fix).
@@ -783,6 +1538,34 @@ namespace bluetooth_turnon
                 {
                     var list = new List<DeviceInfo>();
                     var disconnectedClassicAddresses = new HashSet<ulong>();
+
+                    // Pre-scan paired BLE collection to identify dual-mode vs classic-only devices
+                    var pairedBleAddresses = new HashSet<ulong>();
+                    var pairedBleNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    try
+                    {
+                        string preBleSelector = BluetoothLEDevice.GetDeviceSelectorFromPairingState(true);
+                        var preBleCollection = await DeviceInformation.FindAllAsync(
+                            preBleSelector,
+                            new string[] { "System.Devices.Aep.IsConnected" }
+                        ).AsTask(ct).ConfigureAwait(false);
+
+                        if (preBleCollection != null)
+                        {
+                            foreach (var devInfo in preBleCollection)
+                            {
+                                if (!string.IsNullOrEmpty(devInfo.Name))
+                                    pairedBleNames.Add(devInfo.Name);
+                                ulong parsedAddr = TryExtractAddressFromBleDeviceId(devInfo.Id);
+                                if (parsedAddr != 0)
+                                    pairedBleAddresses.Add(parsedAddr);
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"GetPairedDevicesAsync: Pre-scan BLE collection note: {ex.Message}");
+                    }
 
                     // 1. Enumerate Classic Bluetooth paired devices
                     try
@@ -819,47 +1602,70 @@ namespace bluetooth_turnon
 
                                     if (!isConnected)
                                     {
-                                        // Do not purge _batteryCache or _activeBatteryRetries inside the Classic loop
+                                        // Do not purge _batteryCache or in-flight state inside the Classic loop
                                         // because the device might be connected via BLE (dual-mode).
-                                        // Collect the disconnected address to purge only after BLE enumeration finishes.
+                                        // Collect the disconnected address to process only after BLE enumeration finishes.
                                         disconnectedClassicAddresses.Add(address);
                                     }
                                     else
                                     {
+                                        bool isBlePaired = (address != 0 && pairedBleAddresses.Contains(address)) ||
+                                                           (!string.IsNullOrEmpty(name) && pairedBleNames.Contains(name));
+
                                         // Pass 1: PnP device property (fastest, no BLE connection needed)
                                         // Uses the Bluetooth address to locate the HFP/BLE PnP node across enumerators
                                         string addrHex = address.ToString("X12");
                                         battery = QueryBatteryViaPnp(addrHex);
 
+                                        var cacheEntry = _batteryCache.GetOrAdd(address, a => new BatteryCacheEntry { Address = a });
+
                                         if (battery != null)
                                         {
-                                            _batteryCache[address] = (battery, DateTime.UtcNow);
+                                            cacheEntry.RecordSuccess(battery.Value, name);
                                         }
                                         else
                                         {
-                                            // Pass 2: BLE GATT Battery Service fallback (cached 5 minutes to avoid 60s BLE query storms)
-                                            bool hasRecentGattCheck = _batteryCache.TryGetValue(address, out var cachedEntry) &&
-                                                                      (DateTime.UtcNow - cachedEntry.LastCheckedUtc) < TimeSpan.FromMinutes(5);
+                                            battery = cacheEntry.GetEffectiveBattery();
 
-                                            if (hasRecentGattCheck)
+                                            if (!isBlePaired)
                                             {
-                                                battery = cachedEntry.Battery;
+                                                // Skip GATT entirely for devices that are classic-only!
+                                                if (cacheEntry.Outcome != BatteryQueryOutcome.Unsupported)
+                                                {
+                                                    Log($"  Battery GATT: Skipped for '{name}' ({address:X12}) — device is Classic-only (no BLE pairing). Caching as Unsupported.");
+                                                    cacheEntry.RecordUnsupported(name, isClassicOnly: true);
+                                                }
                                             }
                                             else
                                             {
-                                                battery = await QueryBatteryViaGattAsync(address, name, ct).ConfigureAwait(false);
-                                                _batteryCache[address] = (battery, DateTime.UtcNow);
-                                            }
-
-                                            // Schedule deferred battery retry after short delay for freshly connected devices
-                                            if (battery == null)
-                                            {
-                                                ScheduleDeferredBatteryQuery(address, name);
+                                                // Pass 2: Cached battery or asynchronous background GATT hydration (Fix Issue #20)
+                                                if (battery == null || cacheEntry.ShouldRetry())
+                                                {
+                                                    ScheduleDeferredBatteryQuery(address, name, isClassicOnly: false, immediate: true);
+                                                }
                                             }
                                         }
                                     }
 
-                                    Log($"  Paired Classic device: '{name}' ({address:X12}), Connected={isConnected}, Type={deviceType}, Battery={battery?.ToString() ?? "N/A"}");
+                                    int installedCount = 0;
+                                    string installedProfilesStr = "none";
+                                    try
+                                    {
+                                        var installed = device.InstalledServices;
+                                        if (installed != null)
+                                        {
+                                            installedCount = installed.Count;
+                                            installedProfilesStr = installedCount > 0
+                                                ? string.Join(", ", installed.Select(GetProfileName))
+                                                : "empty";
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        installedProfilesStr = $"Error: {ex.Message}";
+                                    }
+
+                                    Log($"  Paired Classic device: '{name}' ({address:X12}), Connected={isConnected}, Type={deviceType}, Battery={battery?.ToString() ?? "N/A"}, InstalledServices count={installedCount} [{installedProfilesStr}]");
                                     list.Add(new DeviceInfo(name, battery, deviceType, isConnected, address));
                                 }
                             }
@@ -947,30 +1753,18 @@ namespace bluetooth_turnon
                                             string addrHex = address.ToString("X12");
                                             mergedBattery = QueryBatteryViaPnp(addrHex);
 
+                                            var cacheEntry = _batteryCache.GetOrAdd(address, a => new BatteryCacheEntry { Address = a });
                                             if (mergedBattery != null)
                                             {
-                                                _batteryCache[address] = (mergedBattery, DateTime.UtcNow);
+                                                cacheEntry.RecordSuccess(mergedBattery.Value, mergedName);
                                             }
                                             else
                                             {
-                                                // Pass 2: BLE GATT Battery Service fallback (cached 5 minutes to avoid 60s BLE query storms)
-                                                bool hasRecentGattCheck = _batteryCache.TryGetValue(address, out var cachedEntry) &&
-                                                                          (DateTime.UtcNow - cachedEntry.LastCheckedUtc) < TimeSpan.FromMinutes(5);
-
-                                                if (hasRecentGattCheck)
+                                                // Pass 2: Cached battery or asynchronous background GATT hydration
+                                                mergedBattery = cacheEntry.GetEffectiveBattery();
+                                                if (mergedBattery == null || cacheEntry.ShouldRetry())
                                                 {
-                                                    mergedBattery = cachedEntry.Battery;
-                                                }
-                                                else
-                                                {
-                                                    mergedBattery = await QueryBatteryViaGattAsync(address, mergedName, ct).ConfigureAwait(false);
-                                                    _batteryCache[address] = (mergedBattery, DateTime.UtcNow);
-                                                }
-
-                                                // Schedule deferred battery retry after short delay for freshly connected devices
-                                                if (mergedBattery == null)
-                                                {
-                                                    ScheduleDeferredBatteryQuery(address, mergedName);
+                                                    ScheduleDeferredBatteryQuery(address, mergedName, isClassicOnly: false, immediate: true);
                                                 }
                                             }
                                         }
@@ -984,39 +1778,25 @@ namespace bluetooth_turnon
                                         int? battery = null;
                                         if (!isConnected)
                                         {
-                                            _batteryCache.TryRemove(address, out _);
-                                            lock (_batteryRetryLock)
-                                            {
-                                                _activeBatteryRetries.Remove(address);
-                                            }
+                                            HandleDeviceDisconnected(address);
                                         }
                                         else
                                         {
                                             string addrHex = address.ToString("X12");
                                             battery = QueryBatteryViaPnp(addrHex);
 
+                                            var cacheEntry = _batteryCache.GetOrAdd(address, a => new BatteryCacheEntry { Address = a });
                                             if (battery != null)
                                             {
-                                                _batteryCache[address] = (battery, DateTime.UtcNow);
+                                                cacheEntry.RecordSuccess(battery.Value, name);
                                             }
                                             else
                                             {
-                                                bool hasRecentGattCheck = _batteryCache.TryGetValue(address, out var cachedEntry) &&
-                                                                          (DateTime.UtcNow - cachedEntry.LastCheckedUtc) < TimeSpan.FromMinutes(5);
-
-                                                if (hasRecentGattCheck)
+                                                // Pass 2: Cached battery or asynchronous background GATT hydration
+                                                battery = cacheEntry.GetEffectiveBattery();
+                                                if (battery == null || cacheEntry.ShouldRetry())
                                                 {
-                                                    battery = cachedEntry.Battery;
-                                                }
-                                                else
-                                                {
-                                                    battery = await QueryBatteryViaGattAsync(address, name, ct).ConfigureAwait(false);
-                                                    _batteryCache[address] = (battery, DateTime.UtcNow);
-                                                }
-
-                                                if (battery == null)
-                                                {
-                                                    ScheduleDeferredBatteryQuery(address, name);
+                                                    ScheduleDeferredBatteryQuery(address, name, isClassicOnly: false, immediate: true);
                                                 }
                                             }
                                         }
@@ -1054,17 +1834,13 @@ namespace bluetooth_turnon
                         Log($"GetPairedDevicesAsync BLE enumeration exception: {ex.Message}");
                     }
 
-                    // Purge battery cache and active retry for devices whose final merged state is disconnected
+                    // Reset retry state for devices whose final merged state is disconnected
                     foreach (var addr in disconnectedClassicAddresses)
                     {
                         var dev = list.FirstOrDefault(d => d.Address == addr);
                         if (dev != null && !dev.IsConnected)
                         {
-                            _batteryCache.TryRemove(addr, out _);
-                            lock (_batteryRetryLock)
-                            {
-                                _activeBatteryRetries.Remove(addr);
-                            }
+                            HandleDeviceDisconnected(addr);
                         }
                     }
 
@@ -1219,7 +1995,7 @@ namespace bluetooth_turnon
         };
 
         /// <summary>
-        /// Requests uncached RFCOMM services for the device with a 4-second timeout.
+        /// Requests uncached RFCOMM services for the device with a 2-second timeout.
         /// Forces Windows to open an active ACL baseband radio link to the paired device.
         /// Properly cancels in-flight WinRT operations and disposes the BluetoothDevice handle on timeout or cancellation.
         /// </summary>
@@ -1229,7 +2005,7 @@ namespace bluetooth_turnon
             try
             {
                 Log($"  Waking baseband link for {address:X12} via WinRT uncached RFCOMM discovery...");
-                using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(4)))
+                using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
                 using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token))
                 {
                     winRtDevice = await BluetoothDevice.FromBluetoothAddressAsync(address)
@@ -1262,7 +2038,7 @@ namespace bluetooth_turnon
             }
             catch (OperationCanceledException)
             {
-                Log("  WinRT baseband link wake timed out (4s) or was cancelled; proceeding with connection.");
+                Log("  WinRT baseband link wake timed out (2s) or was cancelled; proceeding with connection.");
             }
             catch (Exception ex)
             {
@@ -1327,10 +2103,18 @@ namespace bluetooth_turnon
         /// <summary>
         /// Attempts instant reconnection or disconnection for audio endpoints via Windows Core Audio (IKsControl)
         /// using KSPROPSETID_BtAudio and KSPROPERTY_ONESHOT_RECONNECT / KSPROPERTY_ONESHOT_DISCONNECT.
+        /// Uses dedicated watchdog thread and circuit breaker to guard against COM blocking.
         /// </summary>
-        private static bool TrySendCoreAudioBtCommand(ulong address, string deviceName, bool connect)
+        internal static bool TrySendCoreAudioBtCommand(ulong address, string deviceName, bool connect)
         {
             if (address == 0) return false;
+
+            // Circuit breaker check
+            if (_coreAudioCircuitBreakerOpen)
+            {
+                Log("  CoreAudio: Circuit breaker is OPEN (skipping Core Audio for this session due to repeated timeouts).");
+                return false;
+            }
 
             IMMDeviceEnumerator enumerator = null;
             IMMDeviceCollection collection = null;
@@ -1343,6 +2127,7 @@ namespace bluetooth_turnon
                 int hr = enumerator.EnumAudioEndpoints(EDataFlow_eAll, DEVICE_STATEMASK_ALL, out collection);
                 if (hr != 0 || collection == null)
                 {
+                    Log($"  CoreAudio: EnumAudioEndpoints failed with hr=0x{hr:X8}");
                     return false;
                 }
 
@@ -1358,7 +2143,8 @@ namespace bluetooth_turnon
                     IMMDevice endpoint = null;
                     try
                     {
-                        if (collection.Item(i, out endpoint) != 0 || endpoint == null) continue;
+                        int hrItem = collection.Item(i, out endpoint);
+                        if (hrItem != 0 || endpoint == null) continue;
 
                         bool matchedByAddress = false;
                         bool matchedByName = false;
@@ -1445,7 +2231,9 @@ namespace bluetooth_turnon
                         // Get IDeviceTopology
                         Guid iidTopology = typeof(IDeviceTopology).GUID;
                         object topologyObj = null;
-                        if (endpoint.Activate(ref iidTopology, CLSCTX_ALL, IntPtr.Zero, out topologyObj) != 0 || topologyObj == null)
+                        int hrTopology = endpoint.Activate(ref iidTopology, CLSCTX_ALL, IntPtr.Zero, out topologyObj);
+                        Log($"  CoreAudio: endpoint.Activate(IDeviceTopology) returned hr=0x{hrTopology:X8}");
+                        if (hrTopology != 0 || topologyObj == null)
                             continue;
 
                         IDeviceTopology endpointTopology = topologyObj as IDeviceTopology;
@@ -1458,14 +2246,18 @@ namespace bluetooth_turnon
                         try
                         {
                             uint connectorCount = 0;
-                            if (endpointTopology.GetConnectorCount(out connectorCount) != 0 || connectorCount == 0)
+                            int hrConnCount = endpointTopology.GetConnectorCount(out connectorCount);
+                            Log($"  CoreAudio: endpointTopology.GetConnectorCount returned hr=0x{hrConnCount:X8}, count={connectorCount}");
+                            if (hrConnCount != 0 || connectorCount == 0)
                             {
                                 Log($"  CoreAudio: Endpoint '{endpointId}' has 0 connectors; skipping.");
                                 continue;
                             }
 
                             object endpointConnectorObj = null;
-                            if (endpointTopology.GetConnector(0, out endpointConnectorObj) != 0 || endpointConnectorObj == null)
+                            int hrGetConn = endpointTopology.GetConnector(0, out endpointConnectorObj);
+                            Log($"  CoreAudio: endpointTopology.GetConnector(0) returned hr=0x{hrGetConn:X8}");
+                            if (hrGetConn != 0 || endpointConnectorObj == null)
                             {
                                 Log($"  CoreAudio: Endpoint '{endpointId}' GetConnector(0) failed; skipping.");
                                 continue;
@@ -1481,7 +2273,9 @@ namespace bluetooth_turnon
                                 }
 
                                 object adapterConnectorObj = null;
-                                if (endpointConnector.GetConnectedTo(out adapterConnectorObj) != 0 || adapterConnectorObj == null)
+                                int hrGetConnectedTo = endpointConnector.GetConnectedTo(out adapterConnectorObj);
+                                Log($"  CoreAudio: endpointConnector.GetConnectedTo returned hr=0x{hrGetConnectedTo:X8}");
+                                if (hrGetConnectedTo != 0 || adapterConnectorObj == null)
                                 {
                                     Log($"  CoreAudio: Endpoint '{endpointId}' connector is not connected to an adapter; skipping.");
                                     continue;
@@ -1497,7 +2291,9 @@ namespace bluetooth_turnon
                                     }
 
                                     IDeviceTopology adapterTopology = null;
-                                    if (adapterPart.GetTopologyObject(out adapterTopology) != 0 || adapterTopology == null)
+                                    int hrAdapterTopo = adapterPart.GetTopologyObject(out adapterTopology);
+                                    Log($"  CoreAudio: adapterPart.GetTopologyObject returned hr=0x{hrAdapterTopo:X8}");
+                                    if (hrAdapterTopo != 0 || adapterTopology == null)
                                     {
                                         Log($"  CoreAudio: GetTopologyObject failed on adapter part; skipping.");
                                         continue;
@@ -1506,7 +2302,9 @@ namespace bluetooth_turnon
                                     try
                                     {
                                         string adapterDeviceId = null;
-                                        if (adapterTopology.GetDeviceId(out adapterDeviceId) != 0 || string.IsNullOrEmpty(adapterDeviceId))
+                                        int hrDeviceId = adapterTopology.GetDeviceId(out adapterDeviceId);
+                                        Log($"  CoreAudio: adapterTopology.GetDeviceId returned hr=0x{hrDeviceId:X8}, adapterDeviceId='{adapterDeviceId}'");
+                                        if (hrDeviceId != 0 || string.IsNullOrEmpty(adapterDeviceId))
                                             continue;
 
                                         // Verify that the adapter device is a Bluetooth audio adapter or matches the device's address
@@ -1519,63 +2317,57 @@ namespace bluetooth_turnon
                                             continue;
                                         }
 
-                                        IMMDevice adapterDevice = null;
-                                        if (enumerator.GetDevice(adapterDeviceId, out adapterDevice) != 0 || adapterDevice == null)
-                                            continue;
+                                        Guid iidKsControl = typeof(IKsControl).GUID;
+                                        object ksControlObj = null;
+                                        IKsControl ksControl = null;
 
-                                        try
+                                        // 1. Primary: ALWAYS attempt adapterPart.Activate for IKsControl
+                                        int hrPartActivate = adapterPart.Activate(CLSCTX_ALL, ref iidKsControl, out ksControlObj);
+                                        Log($"  CoreAudio: adapterPart.Activate(IKsControl) returned hr=0x{hrPartActivate:X8}");
+                                        if (hrPartActivate == 0 && ksControlObj != null)
                                         {
-                                            Guid iidKsControl = typeof(IKsControl).GUID;
-                                            object ksControlObj = null;
-                                            IKsControl ksControl = null;
-
-                                            if (adapterDevice.Activate(ref iidKsControl, CLSCTX_ALL, IntPtr.Zero, out ksControlObj) == 0 && ksControlObj != null)
+                                            ksControl = ksControlObj as IKsControl;
+                                            if (ksControl == null)
                                             {
-                                                ksControl = ksControlObj as IKsControl;
-                                                if (ksControl == null)
-                                                {
-                                                    Marshal.ReleaseComObject(ksControlObj);
-                                                    ksControlObj = null;
-                                                }
+                                                Marshal.ReleaseComObject(ksControlObj);
+                                                ksControlObj = null;
                                             }
+                                        }
 
-                                            if (ksControl == null && adapterPart.Activate(CLSCTX_ALL, ref iidKsControl, out ksControlObj) == 0 && ksControlObj != null)
+                                        // 2. Optional extra fallback: Attempt GetDevice(adapterDeviceId)
+                                        IMMDevice adapterDevice = null;
+                                        if (ksControl == null)
+                                        {
+                                            Log($"  CoreAudio: Attempting optional GetDevice('{adapterDeviceId}')...");
+                                            int hrGetDevice = enumerator.GetDevice(adapterDeviceId, out adapterDevice);
+                                            Log($"  CoreAudio: enumerator.GetDevice('{adapterDeviceId}') returned hr=0x{hrGetDevice:X8}");
+                                            if (hrGetDevice == 0 && adapterDevice != null)
                                             {
-                                                ksControl = ksControlObj as IKsControl;
-                                                if (ksControl == null)
+                                                int hrDeviceActivate = adapterDevice.Activate(ref iidKsControl, CLSCTX_ALL, IntPtr.Zero, out ksControlObj);
+                                                Log($"  CoreAudio: adapterDevice.Activate(IKsControl) returned hr=0x{hrDeviceActivate:X8}");
+                                                if (hrDeviceActivate == 0 && ksControlObj != null)
                                                 {
-                                                    Marshal.ReleaseComObject(ksControlObj);
-                                                    ksControlObj = null;
-                                                }
-                                            }
-
-                                            if (ksControl != null)
-                                            {
-                                                try
-                                                {
-                                                    var ksProp = new KSIDENTIFIER
+                                                    ksControl = ksControlObj as IKsControl;
+                                                    if (ksControl == null)
                                                     {
-                                                        Set = KSPROPSETID_BtAudio,
-                                                        Id = connect ? KSPROPERTY_ONESHOT_RECONNECT : KSPROPERTY_ONESHOT_DISCONNECT,
-                                                        Flags = KSPROPERTY_TYPE_GET
-                                                    };
-                                                    uint bytesRet = 0;
-                                                    int ksHr = ksControl.KsProperty(ref ksProp, (uint)Marshal.SizeOf(ksProp), IntPtr.Zero, 0, out bytesRet);
-                                                    Log($"  CoreAudio: KsProperty({(connect ? "RECONNECT" : "DISCONNECT")}) on adapter '{adapterDeviceId}' returned hr=0x{ksHr:X8}");
-                                                    if (ksHr >= 0)
-                                                    {
-                                                        anyTriggered = true;
+                                                        Marshal.ReleaseComObject(ksControlObj);
+                                                        ksControlObj = null;
                                                     }
-                                                }
-                                                finally
-                                                {
-                                                    Marshal.ReleaseComObject(ksControl);
                                                 }
                                             }
                                         }
-                                        finally
+
+                                        if (ksControl != null)
                                         {
-                                            if (adapterDevice != null) Marshal.ReleaseComObject(adapterDevice);
+                                            if (ExecuteKsPropertyWithWatchdog(ksControl, connect, adapterDeviceId))
+                                            {
+                                                anyTriggered = true;
+                                            }
+                                        }
+
+                                        if (adapterDevice != null)
+                                        {
+                                            try { Marshal.ReleaseComObject(adapterDevice); } catch { }
                                         }
                                     }
                                     finally
@@ -1624,6 +2416,208 @@ namespace bluetooth_turnon
         }
 
         /// <summary>
+        /// Executes KsProperty (or test KsPropertyInvoker) on a dedicated background watchdog thread
+        /// with timeout and circuit breaker protection.
+        /// Transfers ownership of ksControl to the background thread so abandoned threads do not race.
+        /// </summary>
+        internal static bool ExecuteKsPropertyWithWatchdog(IKsControl ksControl, bool connect, string adapterDeviceId)
+        {
+            if (_coreAudioCircuitBreakerOpen)
+            {
+                Log($"  CoreAudio: Circuit breaker is OPEN. Skipping KsProperty({(connect ? "RECONNECT" : "DISCONNECT")}) on adapter '{adapterDeviceId}'.");
+                if (ksControl != null)
+                {
+                    try { Marshal.ReleaseComObject(ksControl); } catch { }
+                }
+                return false;
+            }
+
+            var ksProp = new KSIDENTIFIER
+            {
+                Set = KSPROPSETID_BtAudio,
+                Id = connect ? KSPROPERTY_ONESHOT_RECONNECT : KSPROPERTY_ONESHOT_DISCONNECT,
+                Flags = KSPROPERTY_TYPE_GET
+            };
+
+            int ksHr = -1;
+            var doneEvent = new ManualResetEventSlim(false);
+
+            // Dedicated background watchdog thread.
+            // Ownership of ksControl is transferred to this thread.
+            // If the thread is abandoned upon timeout, the calling thread
+            // does NOT touch or release ksControl, preventing races and access violations.
+            var workerThread = new Thread(() =>
+            {
+                try
+                {
+                    if (KsPropertyInvoker != null)
+                    {
+                        ksHr = KsPropertyInvoker(ksControl, ksProp);
+                    }
+                    else if (ksControl != null)
+                    {
+                        uint bytesRet = 0;
+                        ksHr = ksControl.KsProperty(ref ksProp, (uint)Marshal.SizeOf(ksProp), IntPtr.Zero, 0, out bytesRet);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"  CoreAudio: KsProperty thread exception: {ex.Message}");
+                }
+                finally
+                {
+                    doneEvent.Set();
+                    try
+                    {
+                        if (ksControl != null)
+                        {
+                            Marshal.ReleaseComObject(ksControl);
+                        }
+                    }
+                    catch { }
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "CoreAudio-KsProperty-Watchdog"
+            };
+
+            workerThread.Start();
+            bool timedOut = !doneEvent.Wait(CoreAudioWatchdogTimeoutMs);
+
+            if (timedOut)
+            {
+                _coreAudioConsecutiveTimeouts++;
+                Log($"  CoreAudio: KsProperty({(connect ? "RECONNECT" : "DISCONNECT")}) on adapter '{adapterDeviceId}' TIMED OUT after {CoreAudioWatchdogTimeoutMs}ms. Abandoning thread (consecutive={_coreAudioConsecutiveTimeouts}).");
+                if (_coreAudioConsecutiveTimeouts >= CoreAudioMaxConsecutiveTimeouts)
+                {
+                    _coreAudioCircuitBreakerOpen = true;
+                    Log($"  CoreAudio: Circuit breaker TRIPPED OPEN after {_coreAudioConsecutiveTimeouts} consecutive timeouts.");
+                }
+                return false;
+            }
+            else
+            {
+                _coreAudioConsecutiveTimeouts = 0;
+                Log($"  CoreAudio: KsProperty({(connect ? "RECONNECT" : "DISCONNECT")}) on adapter '{adapterDeviceId}' returned hr=0x{ksHr:X8}");
+                return ksHr >= 0;
+            }
+        }
+
+        /// <summary>
+        /// Manually resets (bounces) the Bluetooth radio adapter, cycling power OFF and ON.
+        /// Persists a bounce marker in the registry to recover if an abnormal termination occurs.
+        /// </summary>
+        public async Task<bool> ManualResetBluetoothAsync(CancellationToken ct = default)
+        {
+            Log("ManualResetBluetoothAsync: User initiated manual Bluetooth reset.");
+            if (_disposed) return false;
+            if (ct.IsCancellationRequested) return false;
+
+            IsRadioBounceInProgress = true;
+            SetBounceInProgressMarker(true);
+            bool radioTurnedOffByBounce = false;
+            OperationProgressChanged?.Invoke(this, new DeviceOperationProgressEventArgs(0, "Resetting Bluetooth adapter..."));
+
+            try
+            {
+                if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On)
+                {
+                    Log("ManualResetBluetoothAsync: Adapter is OFF or absent. Turning adapter ON...");
+                    return await SetAdapterStateAsync(true, ct, isUserInitiated: true).ConfigureAwait(false);
+                }
+
+                bool offSuccess = await SetAdapterStateAsync(false, ct, isUserInitiated: false).ConfigureAwait(false);
+                Log($"ManualResetBluetoothAsync: adapter turned off (success={offSuccess})");
+                if (!offSuccess)
+                {
+                    Log("ManualResetBluetoothAsync: SetAdapterStateAsync(false) failed, aborting reset.");
+                    return false;
+                }
+                radioTurnedOffByBounce = true;
+
+                // Wait 1000ms for hardware power-down transition
+                await Task.Delay(1000, ct).ConfigureAwait(false);
+
+                // Retry loop to turn adapter back ON
+                bool onSuccess = false;
+                for (int attempt = 1; attempt <= 3; attempt++)
+                {
+                    if (_userRequestedAdapterOff)
+                    {
+                        Log("ManualResetBluetoothAsync: aborted because user requested adapter OFF.");
+                        break;
+                    }
+
+                    onSuccess = await SetAdapterStateAsync(true, CancellationToken.None, isUserInitiated: false).ConfigureAwait(false);
+                    Log($"ManualResetBluetoothAsync: adapter turned on attempt {attempt}/3 (success={onSuccess})");
+                    if (onSuccess) break;
+                    await Task.Delay(1000 * attempt, ct).ConfigureAwait(false);
+                }
+
+                return onSuccess;
+            }
+            catch (OperationCanceledException)
+            {
+                Log("ManualResetBluetoothAsync was cancelled.");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Log($"ManualResetBluetoothAsync exception: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                try
+                {
+                    if (_userRequestedAdapterOff)
+                    {
+                        Log("ManualResetBluetoothAsync finally: user requested adapter OFF; ensuring radio is powered OFF in hardware...");
+                        try
+                        {
+                            var radio = _bluetoothRadio;
+                            if (radio == null || radio.State == RadioState.Unknown)
+                            {
+                                radio = await GetBluetoothRadioAsync(CancellationToken.None, forceRefresh: true).ConfigureAwait(false);
+                            }
+
+                            if (radio != null && radio.State != RadioState.Off)
+                            {
+                                var res = await radio.SetStateAsync(RadioState.Off).AsTask(CancellationToken.None).ConfigureAwait(false);
+                                Log($"ManualResetBluetoothAsync finally: SetStateAsync(Off) returned {res}");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"ManualResetBluetoothAsync finally: power off exception: {ex.Message}");
+                        }
+                    }
+                    else if (radioTurnedOffByBounce &&
+                        (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On) &&
+                        !_disposed)
+                    {
+                        Log("ManualResetBluetoothAsync finally: radio was left OFF; restoring power...");
+                        try { await SetAdapterStateAsync(true, CancellationToken.None, isUserInitiated: false).ConfigureAwait(false); } catch { }
+                    }
+                }
+                catch { }
+
+                SetBounceInProgressMarker(false);
+                IsRadioBounceInProgress = false;
+
+                try
+                {
+                    bool? finalState = _userRequestedAdapterOff
+                        ? false
+                        : ((_bluetoothRadio != null && _bluetoothRadio.State != RadioState.Unknown) ? (_bluetoothRadio.State == RadioState.On) : (bool?)null);
+                    AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(finalState));
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
         /// Attempts to connect to a paired Bluetooth device using WinRT baseband link wake,
         /// Core Audio IKsControl reconnect, profile cycling across supported profiles,
         /// and a controlled radio bounce fallback.
@@ -1650,7 +2644,17 @@ namespace bluetooth_turnon
             using (linkedCts)
             {
                 var token = linkedCts.Token;
-                await _connectSemaphore.WaitAsync(token).ConfigureAwait(false);
+                var sem = GetDeviceSemaphore(address);
+                try
+                {
+                    await sem.WaitAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    Log($"ConnectDeviceAsync: Cancelled while waiting for lock ({address:X12})");
+                    return false;
+                }
+
                 try
                 {
                     return await Task.Run(async () =>
@@ -1695,7 +2699,7 @@ namespace bluetooth_turnon
                                 BluetoothDeviceType bleType = BluetoothDeviceType.Unknown;
                                 try
                                 {
-                                    using (var bleLookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+                                    using (var bleLookupCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1200)))
                                     using (var bleLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, bleLookupCts.Token))
                                     using (var tempBle = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
                                         .AsTask(bleLinkedCts.Token).ConfigureAwait(false))
@@ -1726,28 +2730,48 @@ namespace bluetooth_turnon
                                                        bleType == BluetoothDeviceType.Controller;
                                 bool isPeripheral = isClassicPeripheral || isBlePeripheral;
 
-                                bool hasClassicAudioProfiles = false;
-                                bool hasAnyClassicProfiles = false;
+                                int codMajor = 0;
                                 try
                                 {
-                                    var installed = device.InstalledServices;
-                                    if (installed != null && installed.Count > 0)
-                                    {
-                                        hasAnyClassicProfiles = true;
-                                        hasClassicAudioProfiles = installed.Contains(InTheHand.Net.Bluetooth.BluetoothService.AudioSink) ||
-                                                                  installed.Contains(InTheHand.Net.Bluetooth.BluetoothService.Handsfree) ||
-                                                                  installed.Contains(InTheHand.Net.Bluetooth.BluetoothService.Headset);
-                                    }
+                                    int cod = (int)device.ClassOfDevice.Value;
+                                    codMajor = (cod >> 8) & 0x1F;
                                 }
                                 catch { }
 
-                                // If this device is a BLE peripheral (such as a mouse, keyboard, controller) or has no Classic profiles,
-                                // or is paired via BLE without Classic audio capabilities, running Classic RFCOMM wake, CoreAudio,
-                                // and SetServiceState followed by a disruptive 15-second radio bounce is wrong.
-                                // Route directly to ConnectBleDeviceAsync.
-                                if ((isPeripheral && (isBlePaired || !hasClassicAudioProfiles)) || !hasAnyClassicProfiles || (isBlePaired && !hasClassicAudioProfiles))
+                                IReadOnlyCollection<Guid> installedServices = null;
+                                bool installedReadSuccess = false;
+                                int installedCount = 0;
+                                string installedProfilesStr = "none";
+                                try
                                 {
-                                    Log($"  ConnectDeviceAsync: '{targetDeviceName}' is a BLE peripheral/device (isPeripheral={isPeripheral}, isBlePaired={isBlePaired}, hasClassicAudio={hasClassicAudioProfiles}). Routing directly to BLE connect path.");
+                                    var installed = device.InstalledServices;
+                                    installedReadSuccess = true;
+                                    if (installed != null)
+                                    {
+                                        installedServices = installed.ToArray();
+                                        installedCount = installed.Count;
+                                        installedProfilesStr = installedCount > 0
+                                            ? string.Join(", ", installedServices.Select(GetProfileName))
+                                            : "empty";
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    installedReadSuccess = false;
+                                    installedProfilesStr = $"Read error: {ex.Message}";
+                                    Log($"  Reading InstalledServices for '{targetDeviceName}' note: {ex.Message}");
+                                }
+
+                                Log($"  [InstalledServices] Device '{targetDeviceName}' ({address:X12}, Connected={device.Connected}): count={installedCount}, profiles=[{installedProfilesStr}]");
+
+                                var capability = ClassifyTransportCapability(isBlePaired, installedReadSuccess, installedServices, codMajor);
+                                var route = DetermineConnectionRoute(capability, codMajor, isPeripheral);
+
+                                Log($"  [Routing Decision] Device '{targetDeviceName}' ({address:X12}): Capability={capability}, Route={route}, isBlePaired={isBlePaired}, CoDMajor=0x{codMajor:X2}, isPeripheral={isPeripheral}");
+
+                                if (route == ConnectionRoute.BleDirect)
+                                {
+                                    Log($"  ConnectDeviceAsync: Routing '{targetDeviceName}' directly to BLE connect path.");
                                     return await ConnectBleDeviceAsync(address, token).ConfigureAwait(false);
                                 }
 
@@ -1758,12 +2782,22 @@ namespace bluetooth_turnon
                                 }
 
                                 // Step 2: Wake baseband link via WinRT uncached discovery (with 4s timeout)
-                                await WakeBasebandLinkAsync(address, token).ConfigureAwait(false);
-                                device.Refresh();
-                                if (device.Connected)
+                                if (EnableStepWake)
                                 {
-                                    Log($"  '{targetDeviceName}' connected after baseband wake.");
-                                    return true;
+                                    var swWake = System.Diagnostics.Stopwatch.StartNew();
+                                    await WakeBasebandLinkAsync(address, token).ConfigureAwait(false);
+                                    swWake.Stop();
+                                    device.Refresh();
+                                    Log($"  [Step 2: Wake] elapsed={swWake.ElapsedMilliseconds}ms, Connected={device.Connected}");
+                                    if (device.Connected)
+                                    {
+                                        Log($"  '{targetDeviceName}' connected after baseband wake in {swWake.ElapsedMilliseconds}ms.");
+                                        return true;
+                                    }
+                                }
+                                else
+                                {
+                                    Log("  [Step 2: Wake] SKIPPED via diagnostic switch.");
                                 }
 
                                 if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On)
@@ -1773,38 +2807,47 @@ namespace bluetooth_turnon
                                 }
 
                                 // Step 3: Best-effort Windows Core Audio (IKsControl) Reconnect for Audio Endpoints
-                                try
+                                if (EnableStepCoreAudio)
                                 {
-                                    bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, targetDeviceName, connect: true);
-                                    Log($"  CoreAudio reconnect triggered: {coreAudioTriggered}");
-
-                                    if (coreAudioTriggered)
+                                    try
                                     {
-                                        Log($"  CoreAudio command sent. Polling connection status (5 attempts x 800ms = 4.0s max)...");
-                                        for (int caAttempt = 1; caAttempt <= 5; caAttempt++)
+                                        var swCore = System.Diagnostics.Stopwatch.StartNew();
+                                        bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, targetDeviceName, connect: true);
+                                        swCore.Stop();
+                                        Log($"  [Step 3: CoreAudio] triggered={coreAudioTriggered}, elapsed={swCore.ElapsedMilliseconds}ms");
+
+                                        if (coreAudioTriggered)
                                         {
-                                            await Task.Delay(800, token).ConfigureAwait(false);
-                                            try
+                                            Log($"  CoreAudio command sent. Polling connection status (3 attempts x 500ms = 1.5s max)...");
+                                            for (int caAttempt = 1; caAttempt <= 3; caAttempt++)
                                             {
-                                                device.Refresh();
-                                                Log($"  CoreAudio reconnect verify attempt {caAttempt}/5: Connected={device.Connected}");
-                                                if (device.Connected)
+                                                await Task.Delay(500, token).ConfigureAwait(false);
+                                                try
                                                 {
-                                                    Log($"  '{targetDeviceName}' reconnected successfully via CoreAudio on attempt {caAttempt}/5.");
-                                                    return true;
+                                                    device.Refresh();
+                                                    Log($"  CoreAudio reconnect verify attempt {caAttempt}/5: Connected={device.Connected}");
+                                                    if (device.Connected)
+                                                    {
+                                                        Log($"  '{targetDeviceName}' reconnected successfully via CoreAudio on attempt {caAttempt}/5 in {swCore.ElapsedMilliseconds}ms.");
+                                                        return true;
+                                                    }
                                                 }
-                                            }
-                                            catch (OperationCanceledException) { throw; }
-                                            catch (Exception ex)
-                                            {
-                                                Log($"  CoreAudio verify attempt {caAttempt} exception: {ex.Message}");
+                                                catch (OperationCanceledException) { throw; }
+                                                catch (Exception ex)
+                                                {
+                                                    Log($"  CoreAudio verify attempt {caAttempt} exception: {ex.Message}");
+                                                }
                                             }
                                         }
                                     }
+                                    catch (Exception ex)
+                                    {
+                                        Log($"  CoreAudio reconnect attempt note: {ex.Message}");
+                                    }
                                 }
-                                catch (Exception ex)
+                                else
                                 {
-                                    Log($"  CoreAudio reconnect attempt note: {ex.Message}");
+                                    Log("  [Step 3: CoreAudio] SKIPPED via diagnostic switch.");
                                 }
 
                                 if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On)
@@ -1814,128 +2857,139 @@ namespace bluetooth_turnon
                                 }
 
                                 // Step 4: Primary Strategy — Two-pass Service State Cycle (disable all first, wait 200ms, then enable all)
-                                var deviceType = ClassifyDevice(device);
-                                bool isHidDevice = deviceType == BluetoothDeviceType.Mouse ||
-                                                   deviceType == BluetoothDeviceType.Keyboard ||
-                                                   deviceType == BluetoothDeviceType.Controller;
-
-                                var candidateProfiles = isHidDevice
-                                    ? new[] { InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice }
-                                    : new[]
-                                    {
-                                        InTheHand.Net.Bluetooth.BluetoothService.AudioSink,
-                                        InTheHand.Net.Bluetooth.BluetoothService.Handsfree,
-                                        InTheHand.Net.Bluetooth.BluetoothService.Headset
-                                    };
-
-                                // Only cycle profiles that are actually installed/supported on this device
-                                var profilesToCycle = new List<Guid>();
-                                try
+                                if (EnableStepServiceCycle)
                                 {
-                                    var installed = device.InstalledServices;
-                                    if (installed != null && installed.Count > 0)
+                                    var swCycle = System.Diagnostics.Stopwatch.StartNew();
+                                    bool isHidDevice = (route == ConnectionRoute.ClassicWithHid) ||
+                                                       classicType == BluetoothDeviceType.Mouse ||
+                                                       classicType == BluetoothDeviceType.Keyboard ||
+                                                       classicType == BluetoothDeviceType.Controller;
+
+                                    var candidateProfiles = isHidDevice
+                                        ? new[] { InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice }
+                                        : new[]
+                                        {
+                                            InTheHand.Net.Bluetooth.BluetoothService.AudioSink,
+                                            InTheHand.Net.Bluetooth.BluetoothService.Handsfree,
+                                            InTheHand.Net.Bluetooth.BluetoothService.Headset
+                                        };
+
+                                    // Only cycle profiles that are actually installed/supported on this device
+                                    var profilesToCycle = new List<Guid>();
+                                    if (installedServices != null && installedServices.Count > 0)
                                     {
                                         foreach (var cand in candidateProfiles)
                                         {
-                                            if (installed.Contains(cand))
+                                            if (installedServices.Contains(cand))
                                             {
                                                 profilesToCycle.Add(cand);
                                             }
                                         }
                                     }
-                                }
-                                catch (Exception ex)
-                                {
-                                    Log($"  Reading InstalledServices for '{targetDeviceName}' note: {ex.Message}");
-                                }
 
-                                // Fallback if InstalledServices was empty or not populated
-                                if (profilesToCycle.Count == 0)
-                                {
-                                    profilesToCycle.Add(isHidDevice
-                                        ? InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice
-                                        : InTheHand.Net.Bluetooth.BluetoothService.AudioSink);
-                                }
-
-                                var disabledProfiles = new List<Guid>();
-                                try
-                                {
-                                    foreach (var profile in profilesToCycle)
+                                    // Fallback if InstalledServices was empty or not populated (e.g. disabled profile state)
+                                    if (profilesToCycle.Count == 0)
                                     {
-                                        if (token.IsCancellationRequested) break;
-                                        try
-                                        {
-                                            device.SetServiceState(profile, false);
-                                            disabledProfiles.Add(profile);
-                                            Log($"  SetServiceState({profile}, false) succeeded for '{targetDeviceName}'");
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            Log($"  SetServiceState({profile}, false) note: {ex.Message}");
-                                        }
+                                        var fallbackProfile = isHidDevice
+                                            ? InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice
+                                            : InTheHand.Net.Bluetooth.BluetoothService.AudioSink;
+                                        profilesToCycle.Add(fallbackProfile);
+                                        Log($"  Using fallback profile {GetProfileName(fallbackProfile)} for '{targetDeviceName}'");
                                     }
 
-                                    if (disabledProfiles.Count > 0)
-                                    {
-                                        await Task.Delay(200, token).ConfigureAwait(false);
-                                    }
-                                }
-                                finally
-                                {
-                                    // CRITICAL DRIVER HYGIENE: Always restore all disabled profile drivers to true,
-                                    // even if cancellation was requested (e.g. user toggled Bluetooth off or closed the app)
-                                    // or an exception occurred during the delay. Leaving profiles disabled permanently
-                                    // unbinds the PnP driver in the Windows registry.
-                                    foreach (var profile in disabledProfiles)
-                                    {
-                                        try
-                                        {
-                                            device.SetServiceState(profile, true);
-                                            Log($"  SetServiceState({profile}, true) restored for '{targetDeviceName}'");
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            Log($"  SetServiceState({profile}, true) cleanup note: {ex.Message}");
-                                        }
-                                    }
-                                }
-
-                                token.ThrowIfCancellationRequested();
-
-                                // Step 5: Verify Actual Connection Status Before Returning
-                                // Initial delay of 1s after SetServiceState(true) before starting the poll loop,
-                                // giving Windows time to initiate the baseband connection
-                                await Task.Delay(1000, token).ConfigureAwait(false);
-
-                                bool connected = false;
-                                for (int attempt = 1; attempt <= 8; attempt++)
-                                {
+                                    var disabledProfiles = new List<Guid>();
                                     try
                                     {
-                                        if (attempt > 1)
+                                        foreach (var profile in profilesToCycle)
                                         {
-                                            await Task.Delay(1000, token).ConfigureAwait(false);
+                                            if (token.IsCancellationRequested) break;
+                                            try
+                                            {
+                                                RecordPendingProfileRestore(address, profile);
+                                                device.SetServiceState(profile, false);
+                                                disabledProfiles.Add(profile);
+                                                Log($"  SetServiceState({profile}, false) succeeded for '{targetDeviceName}'");
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                ClearPendingProfileRestore(address, profile);
+                                                Log($"  SetServiceState({profile}, false) note: {ex.Message}");
+                                            }
                                         }
 
-                                        device.Refresh();
-                                        Log($"  Connection verify attempt {attempt}/8: Connected={device.Connected}");
-                                        if (device.Connected)
+                                        if (disabledProfiles.Count > 0)
                                         {
-                                            connected = true;
-                                            break;
+                                            await Task.Delay(200, token).ConfigureAwait(false);
                                         }
                                     }
-                                    catch (OperationCanceledException) { throw; }
-                                    catch (Exception ex)
+                                    finally
                                     {
-                                        Log($"  Connection verify attempt {attempt} exception: {ex.Message}");
+                                        // CRITICAL DRIVER HYGIENE: Always restore all disabled profile drivers to true,
+                                        // even if cancellation was requested (e.g. user toggled Bluetooth off or closed the app)
+                                        // or an exception occurred during the delay. Leaving profiles disabled permanently
+                                        // unbinds the PnP driver in the Windows registry (Fix Issue #11).
+                                        foreach (var profile in disabledProfiles)
+                                        {
+                                            try
+                                            {
+                                                device.SetServiceState(profile, true);
+                                                Log($"  SetServiceState({profile}, true) restored for '{targetDeviceName}'");
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                Log($"  SetServiceState({profile}, true) cleanup note: {ex.Message}");
+                                            }
+                                            finally
+                                            {
+                                                ClearPendingProfileRestore(address, profile);
+                                            }
+                                        }
+                                    }
+
+                                    token.ThrowIfCancellationRequested();
+
+                                    // Step 5: Verify Actual Connection Status Before Returning
+                                    // Initial delay of 500ms after SetServiceState(true) before starting the poll loop,
+                                    // giving Windows time to initiate the baseband connection
+                                    await Task.Delay(500, token).ConfigureAwait(false);
+
+                                    bool connected = false;
+                                    for (int attempt = 1; attempt <= 5; attempt++)
+                                    {
+                                        try
+                                        {
+                                            if (attempt > 1)
+                                            {
+                                                await Task.Delay(500, token).ConfigureAwait(false);
+                                            }
+
+                                            device.Refresh();
+                                            Log($"  Connection verify attempt {attempt}/5: Connected={device.Connected}");
+                                            if (device.Connected)
+                                            {
+                                                connected = true;
+                                                break;
+                                            }
+                                        }
+                                        catch (OperationCanceledException) { throw; }
+                                        catch (Exception ex)
+                                        {
+                                            Log($"  Connection verify attempt {attempt} exception: {ex.Message}");
+                                        }
+                                    }
+
+                                    swCycle.Stop();
+                                    Log($"  [Step 4: ServiceCycle] elapsed={swCycle.ElapsedMilliseconds}ms, Connected={connected}");
+
+                                    if (connected)
+                                    {
+                                        Log($"  '{targetDeviceName}' connected successfully via service state cycle in {swCycle.ElapsedMilliseconds}ms.");
+                                        return true;
                                     }
                                 }
-
-                                if (connected)
+                                else
                                 {
-                                    Log($"  '{targetDeviceName}' connected successfully via service state cycle.");
-                                    return true;
+                                    Log("  [Step 4: ServiceCycle] SKIPPED via diagnostic switch.");
                                 }
                             }
 
@@ -1953,20 +3007,42 @@ namespace bluetooth_turnon
                             // Step 6: Controlled Radio Bounce
                             // ONLY perform radio bounce if adapter is currently ON and operation was NOT canceled.
                             // If the user turned off Bluetooth, DO NOT bounce or turn Bluetooth back on!
-                            if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On || token.IsCancellationRequested)
+                            if (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On || token.IsCancellationRequested || _userRequestedAdapterOff)
                             {
                                 Log($"  ConnectDeviceAsync: Adapter is OFF or operation was cancelled. Skipping Step 6 (Radio Bounce).");
                                 return false;
                             }
 
+                            // 1. By default, never bounce automatically. Offer manual action instead.
+                            if (!AllowAutomaticRadioBounce)
+                            {
+                                Log($"  ConnectDeviceAsync: Automatic radio bounce is disabled by default. Skipping Step 6 (Radio Bounce). Use 'Reset Bluetooth' to bounce manually.");
+                                return false;
+                            }
+
+                            // 2. Guard: Even with setting on, skip when any HID device is connected (mouse/keyboard/controller)
+                            if (HasConnectedPeripherals(address, out string hidName, out BluetoothDeviceType hidType))
+                            {
+                                Log($"  ConnectDeviceAsync: Connected input peripheral '{hidName}' ({hidType}) detected. Skipping destructive Step 6 (Radio Bounce) to prevent input disconnect.");
+                                return false;
+                            }
+
+                            if (!EnableStepBounce)
+                            {
+                                Log($"  ConnectDeviceAsync: Step 6 (Radio Bounce) SKIPPED via diagnostic switch.");
+                                return false;
+                            }
+
                             Log($"  Steps 1-5 failed to connect '{targetDeviceName}'. Initiating Step 6: Controlled Radio Bounce...");
+                            var swBounce = System.Diagnostics.Stopwatch.StartNew();
                             IsRadioBounceInProgress = true;
-                            _userRequestedAdapterOff = false;
+                            SetBounceInProgressMarker(true);
+                            // DO NOT reset _userRequestedAdapterOff here (Fix Issue #4/5)
                             bool radioTurnedOffByBounce = false;
                             OperationProgressChanged?.Invoke(this, new DeviceOperationProgressEventArgs(address, "Reconnecting Bluetooth..."));
                             try
                             {
-                                bool offSuccess = await SetAdapterStateAsync(false, token).ConfigureAwait(false);
+                                bool offSuccess = await SetAdapterStateAsync(false, token, isUserInitiated: false).ConfigureAwait(false);
                                 Log($"  Radio bounce: adapter turned off (success={offSuccess})");
                                 if (!offSuccess)
                                 {
@@ -1978,22 +3054,51 @@ namespace bluetooth_turnon
                                 // Wait 1000ms for USB/PCIe hardware power-down transition
                                 await Task.Delay(1000, token).ConfigureAwait(false);
 
+                                if (_userRequestedAdapterOff)
+                                {
+                                    Log("  Radio bounce: user requested adapter OFF during power-down; aborting radio bounce.");
+                                    return false;
+                                }
+
                                 // Retry loop to ensure adapter successfully powers back on
                                 bool onSuccess = false;
                                 for (int onAttempt = 1; onAttempt <= 3; onAttempt++)
                                 {
-                                    // Use CancellationToken.None so turning the adapter back on is never aborted if caller token is canceled
-                                    onSuccess = await SetAdapterStateAsync(true, CancellationToken.None).ConfigureAwait(false);
-                                    Log($"  Radio bounce: adapter turned on attempt {onAttempt}/3 (success={onSuccess})");
+                                    if (_userRequestedAdapterOff)
+                                    {
+                                        Log("  Radio bounce power-on aborted: user requested adapter OFF.");
+                                        break;
+                                    }
+
+                                    // Use CancellationToken.None so turning the adapter back on is never aborted if caller token is canceled,
+                                    // but respect explicit user adapter OFF request
+                                    onSuccess = await SetAdapterStateAsync(true, CancellationToken.None, isUserInitiated: false).ConfigureAwait(false);
+                                    Log($"  Radio bounce: adapter turned on attempt {onAttempt}/3 (success={onSuccess}, userRequestedOff={_userRequestedAdapterOff})");
+                                    if (_userRequestedAdapterOff)
+                                    {
+                                        Log("  Radio bounce power-on aborted after attempt: user requested adapter OFF.");
+                                        break;
+                                    }
                                     if (onSuccess) break;
+                                    if (_userRequestedAdapterOff)
+                                    {
+                                        Log("  Radio bounce power-on aborted before retry delay: user requested adapter OFF.");
+                                        break;
+                                    }
                                     await Task.Delay(1000 * onAttempt, token).ConfigureAwait(false);
+                                }
+
+                                if (_userRequestedAdapterOff)
+                                {
+                                    Log("  Radio bounce: user requested adapter OFF; skipping recovery & verification.");
+                                    return false;
                                 }
 
                                 if (!onSuccess)
                                 {
                                     Log("  Radio bounce: standard SetAdapterStateAsync(true) failed after 3 attempts. Attempting forced radio refresh...");
                                     var freshRadio = await GetBluetoothRadioAsync(CancellationToken.None, forceRefresh: true).ConfigureAwait(false);
-                                    if (freshRadio != null)
+                                    if (freshRadio != null && !_userRequestedAdapterOff)
                                     {
                                         try
                                         {
@@ -2020,6 +3125,12 @@ namespace bluetooth_turnon
                                 // Poll device.Connected up to 8 times at 1-second intervals (8 seconds total)
                                 for (int attempt = 1; attempt <= 8; attempt++)
                                 {
+                                    if (_userRequestedAdapterOff)
+                                    {
+                                        Log("  Radio bounce verify aborted: user requested adapter OFF.");
+                                        return false;
+                                    }
+
                                     await Task.Delay(1000, token).ConfigureAwait(false);
                                     try
                                     {
@@ -2058,15 +3169,36 @@ namespace bluetooth_turnon
                             {
                                 try
                                 {
-                                    if (radioTurnedOffByBounce &&
+                                    if (_userRequestedAdapterOff)
+                                    {
+                                        Log("  Radio bounce finally: user requested adapter OFF mid-bounce; ensuring radio is powered OFF in hardware...");
+                                        try
+                                        {
+                                            var radio = _bluetoothRadio;
+                                            if (radio == null || radio.State == RadioState.Unknown)
+                                            {
+                                                radio = await GetBluetoothRadioAsync(CancellationToken.None, forceRefresh: true).ConfigureAwait(false);
+                                            }
+
+                                            if (radio != null && radio.State != RadioState.Off)
+                                            {
+                                                var res = await radio.SetStateAsync(RadioState.Off).AsTask(CancellationToken.None).ConfigureAwait(false);
+                                                Log($"  Radio bounce finally: SetStateAsync(Off) returned {res}");
+                                            }
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Log($"  Radio bounce finally: power off exception: {ex.Message}");
+                                        }
+                                    }
+                                    else if (radioTurnedOffByBounce &&
                                         (_bluetoothRadio == null || _bluetoothRadio.State != RadioState.On) &&
-                                        !_disposed &&
-                                        !_userRequestedAdapterOff)
+                                        !_disposed)
                                     {
                                         Log("  Radio bounce finally: radio was left OFF by bounce; restoring power (SetAdapterStateAsync(true))...");
                                         try
                                         {
-                                            await SetAdapterStateAsync(true, CancellationToken.None).ConfigureAwait(false);
+                                            await SetAdapterStateAsync(true, CancellationToken.None, isUserInitiated: false).ConfigureAwait(false);
                                         }
                                         catch (Exception ex)
                                         {
@@ -2076,18 +3208,30 @@ namespace bluetooth_turnon
                                 }
                                 catch { }
 
+                                SetBounceInProgressMarker(false);
                                 IsRadioBounceInProgress = false;
                                 // Raise AdapterStateChanged with the verified current state so Form1 restores
-                                // labelStatus from "Reconnecting..." to "Enabled" and updates the toggle switch.
+                                // labelStatus from "Reconnecting..." to "Enabled" or "Disabled" and updates the toggle switch.
                                 try
                                 {
-                                    bool? finalState = (_bluetoothRadio != null && _bluetoothRadio.State != RadioState.Unknown) ? (_bluetoothRadio.State == RadioState.On) : (bool?)null;
+                                    bool? finalState = _userRequestedAdapterOff
+                                        ? false
+                                        : ((_bluetoothRadio != null && _bluetoothRadio.State != RadioState.Unknown) ? (_bluetoothRadio.State == RadioState.On) : (bool?)null);
                                     AdapterStateChanged?.Invoke(this, new AdapterStateChangedEventArgs(finalState));
                                 }
                                 catch { }
                             }
 
                             Log($"  ConnectDeviceAsync failed for '{targetDeviceName}' after all 6 steps.");
+                            if (isBlePaired && !token.IsCancellationRequested && !_userRequestedAdapterOff)
+                            {
+                                Log($"  Classic connect chain did not establish connection for dual-mode device '{targetDeviceName}'. Attempting BLE fallback...");
+                                if (await ConnectBleDeviceAsync(address, token).ConfigureAwait(false))
+                                {
+                                    Log($"  '{targetDeviceName}' connected successfully via BLE fallback.");
+                                    return true;
+                                }
+                            }
                             return false;
                         }
                         catch (OperationCanceledException)
@@ -2108,7 +3252,7 @@ namespace bluetooth_turnon
                 }
                 finally
                 {
-                    SafeRelease(_connectSemaphore);
+                    SafeRelease(sem);
                 }
             }
         }
@@ -2125,12 +3269,7 @@ namespace bluetooth_turnon
             Log($"DisconnectDeviceAsync called for {address:X12}");
             if (_disposed) return false;
 
-            // Immediately purge battery cache and cancel any pending deferred battery retry for this device
-            _batteryCache.TryRemove(address, out _);
-            lock (_batteryRetryLock)
-            {
-                _activeBatteryRetries.Remove(address);
-            }
+            // Note: Defer battery cache purge until disconnection actually succeeds (Fix Issue #17)
 
             CancellationTokenSource linkedCts;
             lock (_deviceOpCtsLock)
@@ -2141,7 +3280,17 @@ namespace bluetooth_turnon
             using (linkedCts)
             {
                 var token = linkedCts.Token;
-                await _connectSemaphore.WaitAsync(token).ConfigureAwait(false);
+                var sem = GetDeviceSemaphore(address);
+                try
+                {
+                    await sem.WaitAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    Log($"DisconnectDeviceAsync: Cancelled while waiting for lock ({address:X12})");
+                    return false;
+                }
+
                 try
                 {
                     return await Task.Run(async () =>
@@ -2182,7 +3331,7 @@ namespace bluetooth_turnon
                                         // No tracked handle — do a live check
                                         try
                                         {
-                                            using (var bleLookupCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+                                            using (var bleLookupCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1200)))
                                             using (var bleLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, bleLookupCts.Token))
                                             using (var checkDev = await BluetoothLEDevice.FromBluetoothAddressAsync(address)
                                                 .AsTask(bleLinkedCts.Token).ConfigureAwait(false))
@@ -2200,37 +3349,49 @@ namespace bluetooth_turnon
                                         return await DisconnectBleDeviceAsync(address, token).ConfigureAwait(false);
                                     }
 
-                                    _batteryCache.TryRemove(address, out _);
-                                    lock (_batteryRetryLock)
-                                    {
-                                        _activeBatteryRetries.Remove(address);
-                                    }
+                                    HandleDeviceDisconnected(address);
                                     Log($"  '{targetName}' is already disconnected (Classic and BLE).");
                                     return true;
                                 }
 
                                 // Step 2: Core Audio disconnect (best-effort for audio endpoints)
-                                try
+                                if (EnableDisconnectCoreAudio)
                                 {
-                                    bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, targetName, connect: false);
-                                    Log($"  CoreAudio disconnect triggered: {coreAudioTriggered}");
+                                    try
+                                    {
+                                        var swCad = System.Diagnostics.Stopwatch.StartNew();
+                                        bool coreAudioTriggered = TrySendCoreAudioBtCommand(address, targetName, connect: false);
+                                        swCad.Stop();
+                                        Log($"  [Disconnect Step 2: CoreAudio] triggered={coreAudioTriggered}, elapsed={swCad.ElapsedMilliseconds}ms");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Log($"  CoreAudio disconnect note: {ex.Message}");
+                                    }
                                 }
-                                catch (Exception ex)
+                                else
                                 {
-                                    Log($"  CoreAudio disconnect note: {ex.Message}");
+                                    Log("  [Disconnect Step 2: CoreAudio] SKIPPED via diagnostic switch.");
                                 }
 
                                 // Step 3: Native Bluetooth Port Driver ACL Link Disconnect (IOCTL_BTH_DISCONNECT_DEVICE)
-                                // Instructs bthport.sys to cleanly teardown the baseband ACL connection without disabling
-                                // or unbinding the device's PnP profile drivers (AudioSink, Handsfree, Headset, HID) in the registry.
-                                try
+                                if (EnableDisconnectIoctl)
                                 {
-                                    bool ioctlSuccess = DisconnectDeviceViaIoctl(address);
-                                    Log($"  Native IOCTL_BTH_DISCONNECT_DEVICE called for {address:X12}: {ioctlSuccess}");
+                                    try
+                                    {
+                                        var swIoctl = System.Diagnostics.Stopwatch.StartNew();
+                                        bool ioctlSuccess = DisconnectDeviceViaIoctl(address);
+                                        swIoctl.Stop();
+                                        Log($"  [Disconnect Step 3: IOCTL] result={ioctlSuccess}, elapsed={swIoctl.ElapsedMilliseconds}ms");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Log($"  Native IOCTL disconnect note: {ex.Message}");
+                                    }
                                 }
-                                catch (Exception ex)
+                                else
                                 {
-                                    Log($"  Native IOCTL disconnect note: {ex.Message}");
+                                    Log("  [Disconnect Step 3: IOCTL] SKIPPED via diagnostic switch.");
                                 }
 
                                 // Step 4: Extended Polling Window (5 x 800ms = 4s total)
@@ -2266,11 +3427,7 @@ namespace bluetooth_turnon
                                     // Dual-mode cleanup: also release any tracked BLE handle
                                     ReleaseConnectedBleHandle(address);
 
-                                    _batteryCache.TryRemove(address, out _);
-                                    lock (_batteryRetryLock)
-                                    {
-                                        _activeBatteryRetries.Remove(address);
-                                    }
+                                    HandleDeviceDisconnected(address);
                                     Log($"  '{targetName}' disconnected successfully without disabling profile drivers.");
                                     return true;
                                 }
@@ -2300,7 +3457,7 @@ namespace bluetooth_turnon
                 }
                 finally
                 {
-                    SafeRelease(_connectSemaphore);
+                    SafeRelease(sem);
                 }
             }
         }
@@ -2485,6 +3642,27 @@ namespace bluetooth_turnon
                             if (!ReferenceEquals(prev, bleDevice)) { try { prev.Dispose(); } catch { } }
                             return bleDevice;
                         });
+
+                        // Issue #18: Establish GattSession with MaintainConnection = true
+                        try
+                        {
+                            var session = await GattSession.FromDeviceIdAsync(bleDevice.BluetoothDeviceId).AsTask(token).ConfigureAwait(false);
+                            if (session != null)
+                            {
+                                session.MaintainConnection = true;
+                                _connectedBleSessions.AddOrUpdate(address, session, (_, prev) =>
+                                {
+                                    try { prev.MaintainConnection = false; prev.Dispose(); } catch { }
+                                    return session;
+                                });
+                                Log($"  ConnectBleDeviceAsync: GattSession MaintainConnection set for '{bleName}'");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"  ConnectBleDeviceAsync: GattSession initialization note: {ex.Message}");
+                        }
+
                         success = true;
                         return true;
                     }
@@ -2553,11 +3731,7 @@ namespace bluetooth_turnon
 
                 if (bleDevice.ConnectionStatus == BluetoothConnectionStatus.Disconnected)
                 {
-                    _batteryCache.TryRemove(address, out _);
-                    lock (_batteryRetryLock)
-                    {
-                        _activeBatteryRetries.Remove(address);
-                    }
+                    HandleDeviceDisconnected(address);
                     Log($"  DisconnectBleDeviceAsync: '{bleName}' is already disconnected.");
                     return true;
                 }
@@ -2597,11 +3771,7 @@ namespace bluetooth_turnon
                             {
                                 if (checkDev == null || checkDev.ConnectionStatus == BluetoothConnectionStatus.Disconnected)
                                 {
-                                    _batteryCache.TryRemove(address, out _);
-                                    lock (_batteryRetryLock)
-                                    {
-                                        _activeBatteryRetries.Remove(address);
-                                    }
+                                    HandleDeviceDisconnected(address);
                                     Log($"  DisconnectBleDeviceAsync: '{bleName}' disconnected on attempt {attempt}/5.");
                                     return true;
                                 }
@@ -2636,6 +3806,55 @@ namespace bluetooth_turnon
 
         // ── Battery Reading ───────────────────────────────────────────────────
 
+        private static int? ReadPnpBatteryDirect(string instanceId)
+        {
+            if (string.IsNullOrEmpty(instanceId)) return null;
+            IntPtr devInfoSet = IntPtr.Zero;
+            try
+            {
+                devInfoSet = NativeMethods.SetupDiCreateDeviceInfoList(IntPtr.Zero, IntPtr.Zero);
+                if (devInfoSet == (IntPtr)(-1) || devInfoSet == IntPtr.Zero) return null;
+
+                var devInfoData = new NativeMethods.SP_DEVINFO_DATA();
+                devInfoData.cbSize = (uint)Marshal.SizeOf(devInfoData);
+                if (!NativeMethods.SetupDiOpenDeviceInfo(devInfoSet, instanceId, IntPtr.Zero, 0, ref devInfoData))
+                    return null;
+
+                var batteryPropertyKey = new NativeMethods.DEVPROPKEY
+                {
+                    fmtid = new Guid("104EA319-6EE2-4701-BD47-8DDBF425BBE5"),
+                    pid = 2
+                };
+
+                uint propertyType;
+                byte[] buffer = new byte[4];
+                uint bufferSize = (uint)buffer.Length;
+                if (NativeMethods.SetupDiGetDevicePropertyW(
+                        devInfoSet, ref devInfoData, ref batteryPropertyKey,
+                        out propertyType, buffer, bufferSize, out bufferSize, 0))
+                {
+                    if (propertyType == NativeMethods.DEVPROP_TYPE_BYTE && bufferSize >= 1)
+                    {
+                        byte level = buffer[0];
+                        if (level <= 100)
+                        {
+                            Log($"    Battery PnP (cached instance): {level}% from '{instanceId}'");
+                            return (int)level;
+                        }
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                if (devInfoSet != IntPtr.Zero && devInfoSet != (IntPtr)(-1))
+                {
+                    NativeMethods.SetupDiDestroyDeviceInfoList(devInfoSet);
+                }
+            }
+            return null;
+        }
+
         /// <summary>
         /// Pass 1: Reads battery from the Windows PnP device property store.
         ///
@@ -2659,6 +3878,16 @@ namespace bluetooth_turnon
                 if (addrUpper.Length > 0 && addrUpper.Length < 12)
                 {
                     addrUpper = addrUpper.PadLeft(12, '0');
+                }
+
+                // Check cached instance ID first (O(1) direct device property read without enumerating, Fix Issue #24)
+                if (_pnpInstanceIdCache.TryGetValue(addrUpper, out string cachedInstanceId) && !string.IsNullOrEmpty(cachedInstanceId))
+                {
+                    int? directBattery = ReadPnpBatteryDirect(cachedInstanceId);
+                    if (directBattery != null)
+                    {
+                        return directBattery;
+                    }
                 }
 
                 Log($"    Battery PnP: searching for address '{addrUpper}'");
@@ -2714,6 +3943,8 @@ namespace bluetooth_turnon
                             string instanceId = new string(instanceIdBuf, 0, (int)requiredSize - 1);
                             if (instanceId.IndexOf(addrUpper, StringComparison.OrdinalIgnoreCase) < 0)
                                 continue;
+
+                            _pnpInstanceIdCache[addrUpper] = instanceId;
 
                             uint propertyType;
                             byte[] buffer = new byte[4];
@@ -2782,6 +4013,8 @@ namespace bluetooth_turnon
                             string instanceId = new string(instanceIdBuf, 0, (int)requiredSize - 1);
                             if (instanceId.IndexOf(addrUpper, StringComparison.OrdinalIgnoreCase) < 0)
                                 continue;
+
+                            _pnpInstanceIdCache[addrUpper] = instanceId;
 
                             uint propertyType;
                             byte[] buffer = new byte[4];
@@ -2868,6 +4101,13 @@ namespace bluetooth_turnon
                 ref DEVPROPKEY PropertyKey, out uint PropertyType,
                 [System.Runtime.InteropServices.Out] byte[] PropertyBuffer,
                 uint PropertyBufferSize, out uint RequiredSize, uint Flags);
+
+            [System.Runtime.InteropServices.DllImport("setupapi.dll", SetLastError = true)]
+            public static extern IntPtr SetupDiCreateDeviceInfoList(IntPtr ClassGuid, IntPtr hwndParent);
+
+            [System.Runtime.InteropServices.DllImport("setupapi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+            public static extern bool SetupDiOpenDeviceInfo(
+                IntPtr DeviceInfoSet, string DeviceInstanceId, IntPtr hwndParent, uint OpenFlags, ref SP_DEVINFO_DATA DeviceInfoData);
 
             [System.Runtime.InteropServices.DllImport("setupapi.dll", SetLastError = true)]
             public static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
@@ -3017,7 +4257,7 @@ namespace bluetooth_turnon
             }
         }
 
-        [StructLayout(LayoutKind.Explicit)]
+        [StructLayout(LayoutKind.Explicit, Size = 24)]
         internal struct PROPVARIANT
         {
             [FieldOffset(0)] public ushort vt;
@@ -3028,6 +4268,7 @@ namespace bluetooth_turnon
             [FieldOffset(8)] public uint uintVal;
             [FieldOffset(8)] public byte byteVal;
             [FieldOffset(8)] public long longVal;
+            [FieldOffset(16)] private long _padding64;
         }
 
         [ComImport]
@@ -3167,18 +4408,33 @@ namespace bluetooth_turnon
         #endregion
 
         /// <summary>
-        /// Schedules a deferred battery query after a short delay (3s) for newly connected devices.
-        /// Solves the race condition where Windows has not yet created the HFP PnP battery device node
-        /// or completed BLE GATT service discovery at the moment of initial connection.
+        /// Schedules a deferred battery query after a short delay (or immediately if requested) for connected devices.
+        /// Performs fast cached read first, and if cold/absent, performs slow background discovery with bounded backoff retries.
+        /// Caches outcome (Success, Unsupported, TransientFailure) and preserves last-good values on transient failures.
         /// If a valid battery value is found on retry, fires DeviceConnectionChanged to trigger a UI refresh.
         /// </summary>
-        private void ScheduleDeferredBatteryQuery(ulong address, string deviceName)
+        private void ScheduleDeferredBatteryQuery(ulong address, string deviceName, bool isClassicOnly = false, bool immediate = false)
         {
-            if (address == 0) return;
+            if (address == 0 || _disposed) return;
+
+            // Check cache entry status
+            if (_batteryCache.TryGetValue(address, out var existingEntry))
+            {
+                if (existingEntry.Outcome == BatteryQueryOutcome.Unsupported && DateTime.UtcNow < existingEntry.NextAllowedRetryUtc)
+                {
+                    Log($"  Battery GATT: '{deviceName}' ({address:X12}) confirmed Unsupported. Leaving alone.");
+                    return;
+                }
+                if (existingEntry.Outcome == BatteryQueryOutcome.TransientFailure && DateTime.UtcNow < existingEntry.NextAllowedRetryUtc)
+                {
+                    Log($"  Battery GATT: '{deviceName}' ({address:X12}) in transient backoff until {existingEntry.NextAllowedRetryUtc:HH:mm:ss} UTC (failure #{existingEntry.FailureCount}). Skipping.");
+                    return;
+                }
+            }
 
             lock (_batteryRetryLock)
             {
-                if (!_activeBatteryRetries.Add(address))
+                if (!_inFlightBatteryQueries.Add(address))
                 {
                     return;
                 }
@@ -3190,99 +4446,105 @@ namespace bluetooth_turnon
                 opToken = _deviceOpCts.Token;
             }
 
-            Log($"  Scheduling deferred battery query (3s) for '{deviceName}' ({address:X12})...");
+            Log($"  Scheduling {(immediate ? "immediate" : "deferred (3s)")} battery query for '{deviceName}' ({address:X12})...");
 
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    await Task.Delay(3000, opToken).ConfigureAwait(false);
+                    if (!immediate)
+                    {
+                        await Task.Delay(3000, opToken).ConfigureAwait(false);
+                    }
 
                     if (_disposed || opToken.IsCancellationRequested) return;
 
-                    // Guard 1: Verify retry is still registered (removed by disconnect or device removal)
+                    // Verify device is still registered and connected
                     lock (_batteryRetryLock)
                     {
-                        if (!_activeBatteryRetries.Contains(address))
+                        if (!_inFlightBatteryQueries.Contains(address))
                         {
                             Log($"  Deferred battery query aborted: '{deviceName}' ({address:X12}) was cancelled or disconnected.");
                             return;
                         }
                     }
 
-                    // Guard 2: Verify device is actually connected before querying
                     bool? isConnected = await IsDeviceConnectedAsync(address, opToken).ConfigureAwait(false);
                     if (isConnected != true)
                     {
                         Log($"  Deferred battery query aborted: '{deviceName}' ({address:X12}) is not connected.");
-                        lock (_batteryRetryLock)
-                        {
-                            _activeBatteryRetries.Remove(address);
-                        }
-                        _batteryCache.TryRemove(address, out _);
+                        HandleDeviceDisconnected(address);
                         return;
                     }
 
-                    Log($"  Running deferred battery query for '{deviceName}' ({address:X12})...");
                     string addrHex = address.ToString("X12");
                     int? retriedBattery = QueryBatteryViaPnp(addrHex);
 
-                    if (retriedBattery == null)
+                    var cacheEntry = _batteryCache.GetOrAdd(address, a => new BatteryCacheEntry { Address = a });
+
+                    if (retriedBattery != null)
                     {
-                        // Guard 3: Double-check connection before opening over-the-air BLE connection
-                        lock (_batteryRetryLock)
-                        {
-                            if (!_activeBatteryRetries.Contains(address))
-                            {
-                                Log($"  Deferred battery query aborted before GATT: '{deviceName}' ({address:X12}) was cancelled or disconnected.");
-                                return;
-                            }
-                        }
-
-                        isConnected = await IsDeviceConnectedAsync(address, opToken).ConfigureAwait(false);
-                        if (isConnected != true)
-                        {
-                            Log($"  Deferred battery query aborted before GATT: '{deviceName}' ({address:X12}) is not connected.");
-                            lock (_batteryRetryLock)
-                            {
-                                _activeBatteryRetries.Remove(address);
-                            }
-                            _batteryCache.TryRemove(address, out _);
-                            return;
-                        }
-
-                        retriedBattery = await QueryBatteryViaGattAsync(address, deviceName, opToken).ConfigureAwait(false);
+                        cacheEntry.RecordSuccess(retriedBattery.Value, deviceName);
+                        Log($"  Battery query SUCCESS via PnP for '{deviceName}': {retriedBattery}%. Firing DeviceConnectionChanged.");
+                        DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+                        return;
                     }
 
-                    // Guard 4: Verify device wasn't disconnected while query was running before updating cache
+                    // Skip GATT entirely for devices that are classic-only!
+                    if (isClassicOnly)
+                    {
+                        Log($"  Battery: '{deviceName}' ({address:X12}) is Classic-only and PnP returned null. Skipping GATT and caching as Unsupported.");
+                        cacheEntry.RecordUnsupported(deviceName, isClassicOnly: true);
+                        return;
+                    }
+
+                    // Guard: verify connection before running GATT query
+                    isConnected = await IsDeviceConnectedAsync(address, opToken).ConfigureAwait(false);
+                    if (isConnected != true)
+                    {
+                        Log($"  Deferred battery query aborted before GATT: '{deviceName}' ({address:X12}) is not connected.");
+                        HandleDeviceDisconnected(address);
+                        return;
+                    }
+
+                    var gattResult = await QueryBatteryViaGattAsync(address, deviceName, opToken).ConfigureAwait(false);
+
+                    // Check if disconnected during query
                     lock (_batteryRetryLock)
                     {
-                        if (!_activeBatteryRetries.Contains(address))
+                        if (!_inFlightBatteryQueries.Contains(address))
                         {
                             Log($"  Deferred battery query result discarded: '{deviceName}' ({address:X12}) was disconnected during query.");
                             return;
                         }
                     }
 
-                    if (retriedBattery != null)
+                    if (gattResult.Outcome == BatteryQueryOutcome.Success && gattResult.BatteryLevel.HasValue)
                     {
-                        _batteryCache[address] = (retriedBattery, DateTime.UtcNow);
-                        Log($"  Deferred battery query SUCCESS for '{deviceName}': {retriedBattery}%. Firing DeviceConnectionChanged.");
+                        cacheEntry.RecordSuccess(gattResult.BatteryLevel.Value, deviceName);
+                        Log($"  Deferred battery query SUCCESS via GATT for '{deviceName}': {gattResult.BatteryLevel.Value}%. Firing DeviceConnectionChanged.");
                         DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+                    }
+                    else if (gattResult.Outcome == BatteryQueryOutcome.Unsupported)
+                    {
+                        cacheEntry.RecordUnsupported(deviceName, isClassicOnly: false);
+                        Log($"  Deferred battery query: '{deviceName}' confirmed Unsupported (cached for {BatteryUnsupportedCacheDuration.TotalHours}h). Leaving alone.");
                     }
                     else
                     {
-                        _batteryCache[address] = (null, DateTime.UtcNow);
-                        Log($"  Deferred battery query: battery still unavailable for '{deviceName}'.");
+                        cacheEntry.RecordTransientFailure(deviceName);
+                        Log($"  Deferred battery query: Transient failure #{cacheEntry.FailureCount} for '{deviceName}'. Preserving last good value ({cacheEntry.GetEffectiveBattery()?.ToString() ?? "N/A"}). Next retry at {cacheEntry.NextAllowedRetryUtc:HH:mm:ss} UTC.");
+
+                        // Bounded retry while connected
+                        if (cacheEntry.FailureCount <= MaxBatteryRetries)
+                        {
+                            ScheduleBoundedRetryAfterBackoff(address, deviceName, cacheEntry.FailureCount, opToken);
+                        }
                     }
                 }
                 catch (OperationCanceledException)
                 {
                     Log($"  Deferred battery query cancelled for '{deviceName}' ({address:X12}).");
-                    lock (_batteryRetryLock)
-                    {
-                        _activeBatteryRetries.Remove(address);
-                    }
                 }
                 catch (Exception ex)
                 {
@@ -3290,206 +4552,385 @@ namespace bluetooth_turnon
                 }
                 finally
                 {
-                    // Note: Address remains in _activeBatteryRetries while the device is connected
-                    // so unsupported devices are only queried once per connection session.
-                    // It is removed when the device disconnects in GetPairedDevicesAsync / DisconnectDeviceAsync.
+                    lock (_batteryRetryLock)
+                    {
+                        _inFlightBatteryQueries.Remove(address);
+                    }
                 }
             });
         }
 
-        /// <summary>
-        /// Pass 2: Reads battery via BLE GATT Battery Service (UUID 0x180F / characteristic 0x2A19).
-        /// Used as a fallback when the Windows property approach returns null.
-        /// Reuses a cached BluetoothLEDevice from _connectedBleDevices when available to avoid
-        /// allocating a temporary handle that could disrupt an already-connected BLE session.
-        /// Matches paired BLE devices by name via DeviceInformation before falling back to Classic address.
-        /// Returns null if the device is unreachable, the service is absent, or any error occurs.
-        /// </summary>
-        private async Task<int?> QueryBatteryViaGattAsync(ulong bluetoothAddress, string deviceName, CancellationToken ct)
+        private void ScheduleBoundedRetryAfterBackoff(ulong address, string deviceName, int failureCount, CancellationToken opToken)
         {
+            var backoff = GetTransientBackoff(failureCount);
+            Log($"  Battery GATT: Scheduling bounded retry #{failureCount + 1} for '{deviceName}' in {backoff.TotalSeconds}s...");
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(backoff, opToken).ConfigureAwait(false);
+                    if (!opToken.IsCancellationRequested && !_disposed)
+                    {
+                        bool? stillConnected = await IsDeviceConnectedAsync(address, opToken).ConfigureAwait(false);
+                        if (stillConnected == true)
+                        {
+                            ScheduleDeferredBatteryQuery(address, deviceName, isClassicOnly: false, immediate: true);
+                        }
+                    }
+                }
+                catch { }
+            });
+        }
+
+        /// <summary>
+        /// Reads battery via BLE GATT Battery Service (UUID 0x180F / characteristic 0x2A19).
+        /// Split into two phases:
+        /// 1. Fast Cached Read (BatteryCachedQueryBudgetMs, default 2000ms): uses cached service/characteristic layout.
+        /// 2. Slow Background Discovery (BatteryUncachedQueryBudgetMs, default 10000ms): over-the-air discovery if cache is cold or absent.
+        /// Logs elapsed-ms and status for every step.
+        /// Caches outcome separately: Success, Unsupported (service confirmed absent), or TransientFailure (timeout/error).
+        /// Disposes DataReader using deterministic using statements.
+        /// </summary>
+        private async Task<BatteryQueryResult> QueryBatteryViaGattAsync(ulong bluetoothAddress, string deviceName, CancellationToken ct)
+        {
+            var totalSw = Stopwatch.StartNew();
+            BluetoothLEDevice bleDevice = null;
+            bool isCachedHandle = false;
+
             try
             {
-                using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
-                using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token))
+                // 0. Fast path: reuse an existing tracked handle from _connectedBleDevices
+                if (bluetoothAddress != 0 && _connectedBleDevices.TryGetValue(bluetoothAddress, out var cachedDev))
                 {
-                    var token = linkedCts.Token;
-                    BluetoothLEDevice bleDevice = null;
-                    bool isCachedHandle = false;
+                    bleDevice = cachedDev;
+                    isCachedHandle = true;
+                    Log($"    Battery GATT: Reusing tracked handle for {bluetoothAddress:X12} ('{bleDevice.Name}')");
+                }
+
+                // 1. Look up by Bluetooth address first (exact match)
+                if (bleDevice == null && bluetoothAddress != 0)
+                {
                     try
                     {
-                        // 0. Fast path: reuse an existing tracked handle (keeps the BLE link alive and avoids
-                        //    disposing a shared WinRT RCW that another code path is relying on).
-                        if (bluetoothAddress != 0 && _connectedBleDevices.TryGetValue(bluetoothAddress, out var cachedDev))
-                        {
-                            bleDevice = cachedDev;
-                            isCachedHandle = true;
-                            Log($"    Battery GATT: Reusing tracked handle for {bluetoothAddress:X12} ('{bleDevice.Name}')");
-                        }
-
-                        // 1. Look up by Bluetooth address first (exact match)
-                        if (bleDevice == null && bluetoothAddress != 0)
+                        using (var lookupCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1500)))
+                        using (var linkedLookup = CancellationTokenSource.CreateLinkedTokenSource(ct, lookupCts.Token))
                         {
                             bleDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
-                                .AsTask(token).ConfigureAwait(false);
+                                .AsTask(linkedLookup.Token).ConfigureAwait(false);
                         }
+                    }
+                    catch { }
+                }
 
-                        // 2. If address lookup returned null, fall back to name matching via DeviceInformation
-                        if (bleDevice == null && !string.IsNullOrWhiteSpace(deviceName))
+                // 2. If address lookup returned null, fall back to name matching via DeviceInformation
+                if (bleDevice == null && !string.IsNullOrWhiteSpace(deviceName))
+                {
+                    try
+                    {
+                        using (var findCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1500)))
+                        using (var linkedFind = CancellationTokenSource.CreateLinkedTokenSource(ct, findCts.Token))
                         {
-                            try
+                            string selector = BluetoothLEDevice.GetDeviceSelectorFromPairingState(true);
+                            var pairedBleDevices = await DeviceInformation.FindAllAsync(selector).AsTask(linkedFind.Token).ConfigureAwait(false);
+                            if (pairedBleDevices != null)
                             {
-                                string selector = BluetoothLEDevice.GetDeviceSelectorFromPairingState(true);
-                                var pairedBleDevices = await DeviceInformation.FindAllAsync(selector).AsTask(token).ConfigureAwait(false);
-                                if (pairedBleDevices != null)
+                                var match = pairedBleDevices.FirstOrDefault(d =>
+                                    !string.IsNullOrEmpty(d.Name) &&
+                                    string.Equals(d.Name, deviceName, StringComparison.OrdinalIgnoreCase));
+
+                                if (match == null && deviceName.Length >= 4)
                                 {
-                                    // Match exact name first; only fall back to substring/prefix if name is at least 4 characters
-                                    var match = pairedBleDevices.FirstOrDefault(d =>
+                                    match = pairedBleDevices.FirstOrDefault(d =>
                                         !string.IsNullOrEmpty(d.Name) &&
-                                        string.Equals(d.Name, deviceName, StringComparison.OrdinalIgnoreCase));
-
-                                    if (match == null && deviceName.Length >= 4)
-                                    {
-                                        match = pairedBleDevices.FirstOrDefault(d =>
-                                            !string.IsNullOrEmpty(d.Name) &&
-                                            d.Name.Length >= 4 &&
-                                            (d.Name.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                             deviceName.IndexOf(d.Name, StringComparison.OrdinalIgnoreCase) >= 0));
-                                    }
-
-                                    if (match != null)
-                                    {
-                                        Log($"    Battery GATT: Matched paired BLE device '{match.Name}' (Id={match.Id}) for '{deviceName}'");
-                                        bleDevice = await BluetoothLEDevice.FromIdAsync(match.Id).AsTask(token).ConfigureAwait(false);
-                                    }
+                                        d.Name.Length >= 4 &&
+                                        (d.Name.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                         deviceName.IndexOf(d.Name, StringComparison.OrdinalIgnoreCase) >= 0));
                                 }
-                            }
-                            catch (Exception ex)
-                            {
-                                Log($"    Battery GATT: DeviceInformation.FindAllAsync lookup note: {ex.Message}");
-                            }
-                        }
 
-                        if (bleDevice == null)
-                        {
-                            Log($"    Battery GATT: BLE device not found for '{deviceName}' (address {bluetoothAddress:X12})");
-                            return null;
-                        }
-
-                        // Query services and characteristics with BluetoothCacheMode.Cached (layout is static),
-                        // and only use BluetoothCacheMode.Uncached on ReadValueAsync so query takes ~100ms instead of ~2.5s.
-                        var servicesResult = await bleDevice
-                            .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Cached)
-                            .AsTask(token).ConfigureAwait(false);
-
-                        // Cold cache fallback: If cached query returned no services or failed (e.g. right after pairing),
-                        // query uncached from device over-the-air to populate Windows GATT cache.
-                        if (servicesResult == null ||
-                            servicesResult.Status != GattCommunicationStatus.Success ||
-                            servicesResult.Services == null ||
-                            servicesResult.Services.Count == 0)
-                        {
-                            try
-                            {
-                                if (servicesResult?.Services != null)
+                                if (match != null)
                                 {
-                                    foreach (var svc in servicesResult.Services) { try { svc.Dispose(); } catch { } }
-                                }
-                            }
-                            catch { }
-
-                            Log($"    Battery GATT: Cached services query returned 0 services or {servicesResult?.Status}. Trying Uncached query on '{bleDevice.Name}'...");
-                            servicesResult = await bleDevice
-                                .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Uncached)
-                                .AsTask(token).ConfigureAwait(false);
-                        }
-
-                        try
-                        {
-                            if (servicesResult == null
-                                || servicesResult.Status != GattCommunicationStatus.Success
-                                || servicesResult.Services == null
-                                || servicesResult.Services.Count == 0)
-                            {
-                                Log($"    Battery GATT: Battery service not found on '{bleDevice.Name}' (status={servicesResult?.Status})");
-                                return null;
-                            }
-
-                            var service = servicesResult.Services[0];
-                            var charsResult = await service
-                                .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Cached)
-                                .AsTask(token).ConfigureAwait(false);
-
-                            // Cold cache fallback for characteristic
-                            if (charsResult == null
-                                || charsResult.Status != GattCommunicationStatus.Success
-                                || charsResult.Characteristics == null
-                                || charsResult.Characteristics.Count == 0)
-                            {
-                                Log($"    Battery GATT: Cached characteristic query returned 0 characteristics. Trying Uncached query on '{bleDevice.Name}'...");
-                                charsResult = await service
-                                    .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Uncached)
-                                    .AsTask(token).ConfigureAwait(false);
-                            }
-
-                            if (charsResult == null
-                                || charsResult.Status != GattCommunicationStatus.Success
-                                || charsResult.Characteristics == null
-                                || charsResult.Characteristics.Count == 0)
-                            {
-                                Log($"    Battery GATT: BatteryLevel characteristic not found on '{bleDevice.Name}' (status={charsResult?.Status})");
-                                return null;
-                            }
-
-                            var readResult = await charsResult.Characteristics[0]
-                                .ReadValueAsync(BluetoothCacheMode.Uncached)
-                                .AsTask(token).ConfigureAwait(false);
-
-                            if (readResult.Status != GattCommunicationStatus.Success)
-                            {
-                                Log($"    Battery GATT: ReadValueAsync failed on '{bleDevice.Name}' (status={readResult.Status})");
-                                return null;
-                            }
-
-                            // BatteryLevel is a single byte, 0-100
-                            var reader = DataReader.FromBuffer(readResult.Value);
-                            byte level = reader.ReadByte();
-                            Log($"    Battery GATT: {level}% for '{bleDevice.Name}' ({bluetoothAddress:X12})");
-                            return (int)level;
-                        }
-                        finally
-                        {
-                            if (servicesResult?.Services != null)
-                            {
-                                foreach (var svc in servicesResult.Services)
-                                {
-                                    try { svc.Dispose(); } catch { }
+                                    Log($"    Battery GATT: Matched paired BLE device '{match.Name}' (Id={match.Id}) for '{deviceName}'");
+                                    bleDevice = await BluetoothLEDevice.FromIdAsync(match.Id).AsTask(linkedFind.Token).ConfigureAwait(false);
                                 }
                             }
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        Log($"    Battery GATT: DeviceInformation.FindAllAsync lookup note: {ex.Message}");
+                    }
+                }
+
+                if (bleDevice == null)
+                {
+                    Log($"    Battery GATT: BLE device not found for '{deviceName}' (address {bluetoothAddress:X12}) in {totalSw.ElapsedMilliseconds}ms");
+                    return new BatteryQueryResult
+                    {
+                        Outcome = BatteryQueryOutcome.TransientFailure,
+                        ElapsedMs = totalSw.ElapsedMilliseconds,
+                        Details = "BLE device not found"
+                    };
+                }
+
+                // =========================================================================
+                // Phase 1: Fast Cached Read (Budget: BatteryCachedQueryBudgetMs, e.g. 2000ms)
+                // =========================================================================
+                bool fastReadSucceeded = false;
+                int fastBatteryLevel = -1;
+
+                try
+                {
+                    using (var fastCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(BatteryCachedQueryBudgetMs)))
+                    using (var linkedFastCts = CancellationTokenSource.CreateLinkedTokenSource(ct, fastCts.Token))
+                    {
+                        var fastToken = linkedFastCts.Token;
+                        var swCachedServices = Stopwatch.StartNew();
+                        var cachedServicesResult = await bleDevice
+                            .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Cached)
+                            .AsTask(fastToken).ConfigureAwait(false);
+                        long cachedServicesMs = swCachedServices.ElapsedMilliseconds;
+
+                        Log($"    Battery GATT [Fast Cached]: GetGattServices took {cachedServicesMs}ms, status={cachedServicesResult?.Status}, count={cachedServicesResult?.Services?.Count ?? 0}");
+
+                        if (cachedServicesResult != null &&
+                            cachedServicesResult.Status == GattCommunicationStatus.Success &&
+                            cachedServicesResult.Services != null &&
+                            cachedServicesResult.Services.Count > 0)
+                        {
+                            try
+                            {
+                                var service = cachedServicesResult.Services[0];
+                                var swCachedChars = Stopwatch.StartNew();
+                                var cachedCharsResult = await service
+                                    .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Cached)
+                                    .AsTask(fastToken).ConfigureAwait(false);
+                                long cachedCharsMs = swCachedChars.ElapsedMilliseconds;
+
+                                Log($"    Battery GATT [Fast Cached]: GetCharacteristics took {cachedCharsMs}ms, status={cachedCharsResult?.Status}, count={cachedCharsResult?.Characteristics?.Count ?? 0}");
+
+                                if (cachedCharsResult != null &&
+                                    cachedCharsResult.Status == GattCommunicationStatus.Success &&
+                                    cachedCharsResult.Characteristics != null &&
+                                    cachedCharsResult.Characteristics.Count > 0)
+                                {
+                                    var charac = cachedCharsResult.Characteristics[0];
+                                    var swCachedRead = Stopwatch.StartNew();
+                                    var readResult = await charac.ReadValueAsync(BluetoothCacheMode.Uncached)
+                                        .AsTask(fastToken).ConfigureAwait(false);
+                                    long cachedReadMs = swCachedRead.ElapsedMilliseconds;
+
+                                    Log($"    Battery GATT [Fast Cached]: ReadValueAsync took {cachedReadMs}ms, status={readResult?.Status}");
+
+                                    if (readResult != null && readResult.Status == GattCommunicationStatus.Success && readResult.Value != null)
+                                    {
+                                        using (var reader = DataReader.FromBuffer(readResult.Value))
+                                        {
+                                            byte level = reader.ReadByte();
+                                            fastBatteryLevel = (int)level;
+                                            fastReadSucceeded = true;
+                                            Log($"    Battery GATT [Fast Cached SUCCESS]: {level}% for '{bleDevice.Name}' ({bluetoothAddress:X12}) in {totalSw.ElapsedMilliseconds}ms");
+                                        }
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                if (cachedServicesResult?.Services != null)
+                                {
+                                    foreach (var svc in cachedServicesResult.Services) { try { svc.Dispose(); } catch { } }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"    Battery GATT [Fast Cached]: Cache lookup did not complete: {ex.Message} ({totalSw.ElapsedMilliseconds}ms)");
+                }
+
+                if (fastReadSucceeded && fastBatteryLevel >= 0)
+                {
+                    return new BatteryQueryResult
+                    {
+                        Outcome = BatteryQueryOutcome.Success,
+                        BatteryLevel = fastBatteryLevel,
+                        ElapsedMs = totalSw.ElapsedMilliseconds,
+                        Details = "Fast cached read"
+                    };
+                }
+
+                // =========================================================================
+                // Phase 2: Slow Background Discovery (Budget: BatteryUncachedQueryBudgetMs, e.g. 10000ms)
+                // =========================================================================
+                Log($"    Battery GATT: Transitioning to Slow Background Discovery for '{bleDevice.Name}' ({BatteryUncachedQueryBudgetMs}ms budget)...");
+
+                using (var slowCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(BatteryUncachedQueryBudgetMs)))
+                using (var linkedSlowCts = CancellationTokenSource.CreateLinkedTokenSource(ct, slowCts.Token))
+                {
+                    var slowToken = linkedSlowCts.Token;
+                    var swUncachedServices = Stopwatch.StartNew();
+                    var uncachedServicesResult = await bleDevice
+                        .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Uncached)
+                        .AsTask(slowToken).ConfigureAwait(false);
+                    long uncachedServicesMs = swUncachedServices.ElapsedMilliseconds;
+
+                    Log($"    Battery GATT [Slow Discovery]: GetGattServices (Uncached) took {uncachedServicesMs}ms, status={uncachedServicesResult?.Status}, count={uncachedServicesResult?.Services?.Count ?? 0}");
+
+                    // Outcome: Unsupported (Service confirmed absent)
+                    if (uncachedServicesResult != null &&
+                        uncachedServicesResult.Status == GattCommunicationStatus.Success &&
+                        (uncachedServicesResult.Services == null || uncachedServicesResult.Services.Count == 0))
+                    {
+                        Log($"    Battery GATT [Unsupported]: Device '{bleDevice.Name}' confirmed absent Battery Service in {totalSw.ElapsedMilliseconds}ms.");
+                        return new BatteryQueryResult
+                        {
+                            Outcome = BatteryQueryOutcome.Unsupported,
+                            ElapsedMs = totalSw.ElapsedMilliseconds,
+                            Details = "Battery Service absent"
+                        };
+                    }
+
+                    if (uncachedServicesResult == null || uncachedServicesResult.Status != GattCommunicationStatus.Success)
+                    {
+                        Log($"    Battery GATT [Transient Failure]: Services discovery status={uncachedServicesResult?.Status} in {totalSw.ElapsedMilliseconds}ms.");
+                        return new BatteryQueryResult
+                        {
+                            Outcome = BatteryQueryOutcome.TransientFailure,
+                            ElapsedMs = totalSw.ElapsedMilliseconds,
+                            Details = $"Services status: {uncachedServicesResult?.Status}"
+                        };
+                    }
+
+                    try
+                    {
+                        var service = uncachedServicesResult.Services[0];
+                        var swUncachedChars = Stopwatch.StartNew();
+                        var uncachedCharsResult = await service
+                            .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Uncached)
+                            .AsTask(slowToken).ConfigureAwait(false);
+                        long uncachedCharsMs = swUncachedChars.ElapsedMilliseconds;
+
+                        Log($"    Battery GATT [Slow Discovery]: GetCharacteristics (Uncached) took {uncachedCharsMs}ms, status={uncachedCharsResult?.Status}, count={uncachedCharsResult?.Characteristics?.Count ?? 0}");
+
+                        if (uncachedCharsResult != null &&
+                            uncachedCharsResult.Status == GattCommunicationStatus.Success &&
+                            (uncachedCharsResult.Characteristics == null || uncachedCharsResult.Characteristics.Count == 0))
+                        {
+                            Log($"    Battery GATT [Unsupported]: BatteryLevel characteristic absent on '{bleDevice.Name}' in {totalSw.ElapsedMilliseconds}ms.");
+                            return new BatteryQueryResult
+                            {
+                                Outcome = BatteryQueryOutcome.Unsupported,
+                                ElapsedMs = totalSw.ElapsedMilliseconds,
+                                Details = "BatteryLevel characteristic absent"
+                            };
+                        }
+
+                        if (uncachedCharsResult == null || uncachedCharsResult.Status != GattCommunicationStatus.Success)
+                        {
+                            Log($"    Battery GATT [Transient Failure]: Characteristics query status={uncachedCharsResult?.Status} in {totalSw.ElapsedMilliseconds}ms.");
+                            return new BatteryQueryResult
+                            {
+                                Outcome = BatteryQueryOutcome.TransientFailure,
+                                ElapsedMs = totalSw.ElapsedMilliseconds,
+                                Details = $"Chars status: {uncachedCharsResult?.Status}"
+                            };
+                        }
+
+                        var charac = uncachedCharsResult.Characteristics[0];
+                        var swUncachedRead = Stopwatch.StartNew();
+                        var readResult = await charac.ReadValueAsync(BluetoothCacheMode.Uncached)
+                            .AsTask(slowToken).ConfigureAwait(false);
+                        long uncachedReadMs = swUncachedRead.ElapsedMilliseconds;
+
+                        Log($"    Battery GATT [Slow Discovery]: ReadValueAsync took {uncachedReadMs}ms, status={readResult?.Status}");
+
+                        if (readResult != null && readResult.Status == GattCommunicationStatus.Success && readResult.Value != null)
+                        {
+                            using (var reader = DataReader.FromBuffer(readResult.Value))
+                            {
+                                byte level = reader.ReadByte();
+                                Log($"    Battery GATT [Slow Discovery SUCCESS]: {level}% for '{bleDevice.Name}' ({bluetoothAddress:X12}) in {totalSw.ElapsedMilliseconds}ms");
+                                return new BatteryQueryResult
+                                {
+                                    Outcome = BatteryQueryOutcome.Success,
+                                    BatteryLevel = (int)level,
+                                    ElapsedMs = totalSw.ElapsedMilliseconds,
+                                    Details = "Slow uncached discovery"
+                                };
+                            }
+                        }
+
+                        return new BatteryQueryResult
+                        {
+                            Outcome = BatteryQueryOutcome.TransientFailure,
+                            ElapsedMs = totalSw.ElapsedMilliseconds,
+                            Details = $"Read status: {readResult?.Status}"
+                        };
+                    }
                     finally
                     {
-                        // Never dispose a cached handle — it is owned by _connectedBleDevices.
-                        if (!isCachedHandle)
+                        if (uncachedServicesResult?.Services != null)
                         {
-                            try { bleDevice?.Dispose(); } catch { }
+                            foreach (var svc in uncachedServicesResult.Services) { try { svc.Dispose(); } catch { } }
                         }
                     }
                 }
             }
             catch (OperationCanceledException)
             {
-                Log($"    Battery GATT: Read timed out (3s) or cancelled for {bluetoothAddress:X12}");
-                return null;
+                Log($"    Battery GATT [Timeout/Cancelled]: Operation timed out or cancelled in {totalSw.ElapsedMilliseconds}ms for '{deviceName}' ({bluetoothAddress:X12})");
+                return new BatteryQueryResult
+                {
+                    Outcome = BatteryQueryOutcome.TransientFailure,
+                    ElapsedMs = totalSw.ElapsedMilliseconds,
+                    Details = "Timed out or cancelled"
+                };
             }
             catch (Exception ex)
             {
-                Log($"    QueryBatteryViaGattAsync exception for {bluetoothAddress:X12}: {ex.Message}");
-                return null;
+                Log($"    Battery GATT [Exception]: Error querying '{deviceName}' ({bluetoothAddress:X12}): {ex.Message} ({totalSw.ElapsedMilliseconds}ms)");
+                return new BatteryQueryResult
+                {
+                    Outcome = BatteryQueryOutcome.TransientFailure,
+                    ElapsedMs = totalSw.ElapsedMilliseconds,
+                    Details = ex.Message
+                };
+            }
+            finally
+            {
+                if (!isCachedHandle)
+                {
+                    try { bleDevice?.Dispose(); } catch { }
+                }
             }
         }
 
         // ── Device Classification ─────────────────────────────────────────────
+
+        private static BluetoothDeviceType GetDeviceClassificationOverride(ulong address)
+        {
+            if (address == 0) return BluetoothDeviceType.Unknown;
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Connectify\DeviceOverrides"))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue(address.ToString("X12"));
+                        if (val is string str && Enum.TryParse<BluetoothDeviceType>(str, true, out var parsed))
+                        {
+                            return parsed;
+                        }
+                        if (val is int intVal && Enum.IsDefined(typeof(BluetoothDeviceType), intVal))
+                        {
+                            return (BluetoothDeviceType)intVal;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return BluetoothDeviceType.Unknown;
+        }
 
         /// <summary>
         /// Classifies a Bluetooth LE device using its BluetoothLEAppearance or name-based heuristics.
@@ -3498,6 +4939,11 @@ namespace bluetooth_turnon
         {
             if (bleDevice == null) return BluetoothDeviceType.Unknown;
 
+            // 1. User per-address override from registry (highest precedence, Fix Issue #32)
+            var userOverride = GetDeviceClassificationOverride(bleDevice.BluetoothAddress);
+            if (userOverride != BluetoothDeviceType.Unknown) return userOverride;
+
+            // 2. Bluetooth SIG Appearance
             try
             {
                 var appearance = bleDevice.Appearance;
@@ -3513,11 +4959,12 @@ namespace bluetooth_turnon
                 Log($"  ClassifyBleDevice appearance exception: {ex.Message}");
             }
 
+            // 3. Name-based heuristics (last resort)
             string name = bleDevice.Name ?? string.Empty;
             return ClassifyByName(name);
         }
 
-        private static BluetoothDeviceType ClassifyByAppearance(ushort category, ushort subCategory)
+        public static BluetoothDeviceType ClassifyByAppearance(ushort category, ushort subCategory)
         {
             switch (category)
             {
@@ -3532,8 +4979,15 @@ namespace bluetooth_turnon
                     return BluetoothDeviceType.Computer;
                 case 0x00C0: // Watch / Wearable
                     return BluetoothDeviceType.Smartwatch;
-                case 0x0840: // Media Player / Audio
-                    return BluetoothDeviceType.AudioDevice;
+                case 0x0840: // Media Player / Audio (subcategories, Fix Issue #32)
+                    switch (subCategory)
+                    {
+                        case 1: return BluetoothDeviceType.Earbuds;     // Wearable Audio / In-ear
+                        case 2: return BluetoothDeviceType.Headphones;  // Over-ear headphones
+                        case 3: return BluetoothDeviceType.Speaker;     // Loudspeaker
+                        case 4: return BluetoothDeviceType.Speaker;     // Soundbar
+                        default: return BluetoothDeviceType.AudioDevice;
+                    }
                 default:
                     return BluetoothDeviceType.Unknown;
             }
@@ -3545,6 +4999,14 @@ namespace bluetooth_turnon
         /// </summary>
         private static BluetoothDeviceType ClassifyDevice(InTheHand.Net.Sockets.BluetoothDeviceInfo device)
         {
+            ulong address = 0;
+            try { address = device.DeviceAddress.ToUInt64(); } catch { }
+
+            // 1. User per-address override from registry (highest precedence, Fix Issue #32)
+            var userOverride = GetDeviceClassificationOverride(address);
+            if (userOverride != BluetoothDeviceType.Unknown) return userOverride;
+
+            // 2. Class of Device (CoD) bitmask
             try
             {
                 // CoD is a 24-bit value packed as:
@@ -3565,12 +5027,86 @@ namespace bluetooth_turnon
                 Log($"  ClassifyDevice CoD exception: {ex.Message}");
             }
 
-            // CoD was Unknown or unavailable — try name-based heuristics
+            // 3. Name-based heuristics (last resort)
             string name = device.DeviceName ?? string.Empty;
             return ClassifyByName(name);
         }
 
-        private static BluetoothDeviceType ClassifyByCod(int major, int minor)
+        internal static Func<ulong, (bool hasPeripherals, string name, BluetoothDeviceType type)> ConnectedPeripheralsProbe { get; set; }
+
+        internal bool HasConnectedPeripherals(ulong currentTargetAddress, out string peripheralName, out BluetoothDeviceType peripheralType)
+        {
+            peripheralName = null;
+            peripheralType = BluetoothDeviceType.Unknown;
+
+            if (ConnectedPeripheralsProbe != null)
+            {
+                var probeResult = ConnectedPeripheralsProbe(currentTargetAddress);
+                if (probeResult.hasPeripherals)
+                {
+                    peripheralName = probeResult.name;
+                    peripheralType = probeResult.type;
+                    return true;
+                }
+            }
+
+            try
+            {
+                // 1. Check actively connected BLE peripherals
+                foreach (var kvp in _connectedBleDevices)
+                {
+                    if (kvp.Key == currentTargetAddress) continue;
+                    var dev = kvp.Value;
+                    if (dev != null && dev.ConnectionStatus == BluetoothConnectionStatus.Connected)
+                    {
+                        var type = ClassifyBleDevice(dev);
+                        if (type == BluetoothDeviceType.Mouse || type == BluetoothDeviceType.Keyboard || type == BluetoothDeviceType.Controller)
+                        {
+                            peripheralName = dev.Name;
+                            peripheralType = type;
+                            Log($"HasConnectedPeripherals: Active BLE peripheral found: '{dev.Name}' ({type})");
+                            return true;
+                        }
+                    }
+                }
+
+                // 2. Check actively connected Classic peripherals
+                using (var client = new InTheHand.Net.Sockets.BluetoothClient())
+                {
+                    var paired = client.PairedDevices;
+                    if (paired != null)
+                    {
+                        foreach (var d in paired)
+                        {
+                            if (d.DeviceAddress.ToUInt64() == currentTargetAddress) continue;
+                            if (d.Connected)
+                            {
+                                var type = ClassifyDevice(d);
+                                if (type == BluetoothDeviceType.Mouse || type == BluetoothDeviceType.Keyboard || type == BluetoothDeviceType.Controller)
+                                {
+                                    peripheralName = d.DeviceName;
+                                    peripheralType = type;
+                                    Log($"HasConnectedPeripherals: Active Classic peripheral found: '{d.DeviceName}' ({type})");
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"HasConnectedPeripherals check exception: {ex.Message}");
+            }
+            return false;
+        }
+
+        internal bool HasConnectedPeripherals(ulong currentTargetAddress)
+        {
+            return HasConnectedPeripherals(currentTargetAddress, out _, out _);
+        }
+
+        public static BluetoothDeviceType ClassifyByCod(int major, int minor)
         {
             switch (major)
             {
@@ -3622,54 +5158,23 @@ namespace bluetooth_turnon
         /// <summary>
         /// Name-pattern fallback for devices whose CoD is Uncategorized or 0.
         /// Matches common brand/model keywords case-insensitively.
-        /// Uses word boundaries for short tokens ("p3", "k2", "k4", "k8", "band") to prevent false positives.
+        /// Uses word boundaries for short tokens to prevent false positives.
+        /// Evaluates phone before keyboard (prevents "Joanne's iPhone" -> Keyboard, Fix Issue #32).
         /// </summary>
-        private static BluetoothDeviceType ClassifyByName(string name)
+        public static BluetoothDeviceType ClassifyByName(string name)
         {
             if (string.IsNullOrWhiteSpace(name))
                 return BluetoothDeviceType.Unknown;
 
             string n = name.ToLowerInvariant();
 
-            // ── Earbuds ──────────────────────────────────────────────────────
-            if (n.Contains("airpod")   || n.Contains("galaxy bud") || n.Contains(" buds") ||
-                n.Contains("freebuds") || n.Contains("nothing ear")|| n.Contains("liberty") ||
-                n.Contains("soundcore")|| n.Contains("jabra")      || n.Contains("earbud") ||
-                n.Contains("wf-")      || n.Contains("tws")        ||
-                n.Contains("soundcore p3") || n.Contains("life p3") ||
-                ContainsWord(n, "p3")  || ContainsWord(n, "r50")   ||
-                ContainsWord(n, "r30") || ContainsWord(n, "a3i"))
-                return BluetoothDeviceType.Earbuds;
-
-            // ── Over-ear headphones / headset ─────────────────────────────────
-            if (n.Contains("wh-")     || n.Contains("xm4")    || n.Contains("xm5") ||
-                n.Contains("qc45")    || n.Contains("qc35")   || n.Contains("qc700") ||
-                n.Contains("momentum")|| n.Contains("arctis") || n.Contains("nova") ||
-                n.Contains("void")    || n.Contains("cloud")  || n.Contains("stealth") ||
-                n.Contains("studio")  || n.Contains("headphone") || n.Contains("headset"))
-                return BluetoothDeviceType.Headphones;
-
-            // ── Speakers ─────────────────────────────────────────────────────
-            if (n.Contains("jbl")     || n.Contains("charge")  || n.Contains("flip") ||
-                n.Contains("pulse")   || n.Contains("xtreme")  || n.Contains("boombox") ||
-                n.Contains("ue boom") || n.Contains("wonderboom") || n.Contains("homepod") ||
-                n.Contains("speaker") || n.Contains("soundbar") || n.Contains("echo"))
-                return BluetoothDeviceType.Speaker;
-
-            // ── Mouse ─────────────────────────────────────────────────────────
-            if (n.Contains("mouse")   || n.Contains("mx master") || n.Contains("mx any") ||
-                n.Contains("pro click")|| n.Contains("basilisk") || n.Contains("deathadder") ||
-                n.Contains("pebble")  || n.Contains("anywhere"))
-                return BluetoothDeviceType.Mouse;
-
-            // ── Keyboard ─────────────────────────────────────────────────────
-            if (n.Contains("keyboard")|| n.Contains("keychron") || n.Contains("mx keys") ||
-                n.Contains("anne")    || n.Contains("ducky")    ||
-                n.Contains("keychron k2") || n.Contains("keychron k4") ||
-                n.Contains("keychron k8") || n.Contains("keychron k10")||
-                ContainsWord(n, "k2") || ContainsWord(n, "k4")  ||
-                ContainsWord(n, "k8") || ContainsWord(n, "k10"))
-                return BluetoothDeviceType.Keyboard;
+            // ── Phones (evaluated early to avoid name collisions) ────────────
+            if (n.Contains("iphone")   || n.Contains("galaxy s") || n.Contains("galaxy a") ||
+                n.Contains("galaxy z") || n.Contains("pixel")    || n.Contains("oneplus")  ||
+                n.Contains("redmi")    || n.Contains("poco")     || n.Contains("realme")   ||
+                n.Contains("huawei")   || n.Contains("honor")    || n.Contains("xperia")   ||
+                n.Contains("smartphone"))
+                return BluetoothDeviceType.Phone;
 
             // ── Controllers ───────────────────────────────────────────────────
             if (n.Contains("dualsense") || n.Contains("dualshock") || n.Contains("xbox") ||
@@ -3677,13 +5182,47 @@ namespace bluetooth_turnon
                 n.Contains("joycon")    || n.Contains("pro con"))
                 return BluetoothDeviceType.Controller;
 
-            // ── Phones ────────────────────────────────────────────────────────
-            if (n.Contains("iphone")   || n.Contains("galaxy s") || n.Contains("galaxy a") ||
-                n.Contains("pixel")    || n.Contains("oneplus")  ||
-                n.Contains("redmi")    || n.Contains("poco")     || n.Contains("realme") ||
-                n.Contains("huawei")   || n.Contains("honor")    || n.Contains("note ") ||
-                ContainsWord(n, "m31"))
-                return BluetoothDeviceType.Phone;
+            // ── Mouse ─────────────────────────────────────────────────────────
+            if (n.Contains("mouse")   || n.Contains("mx master") || n.Contains("mx any") ||
+                n.Contains("pro click")|| n.Contains("basilisk") || n.Contains("deathadder") ||
+                n.Contains("pebble")  || n.Contains("trackball"))
+                return BluetoothDeviceType.Mouse;
+
+            // ── Keyboard ─────────────────────────────────────────────────────
+            if (n.Contains("keyboard") || n.Contains("keychron") || n.Contains("mx keys") ||
+                ContainsWord(n, "anne pro") || n.Contains("ducky")    ||
+                ContainsWord(n, "k2")  || ContainsWord(n, "k4")   ||
+                ContainsWord(n, "k8")  || ContainsWord(n, "k10"))
+                return BluetoothDeviceType.Keyboard;
+
+            // ── Over-ear headphones / headset (Pulse 3D is a headset, not a speaker)
+            if (n.Contains("pulse 3d") || n.Contains("wh-")     || n.Contains("xm4")    ||
+                n.Contains("xm5")      || n.Contains("qc45")    || n.Contains("qc35")   ||
+                n.Contains("qc700")    || n.Contains("momentum")|| n.Contains("arctis") ||
+                n.Contains("nova")     || n.Contains("void")    || n.Contains("cloud")  ||
+                n.Contains("stealth")  || n.Contains("headphone") || n.Contains("headset"))
+                return BluetoothDeviceType.Headphones;
+
+            // ── Earbuds ──────────────────────────────────────────────────────
+            if (n.Contains("airpod")   || n.Contains("galaxy bud") || n.Contains(" buds") ||
+                n.Contains("freebuds") || n.Contains("nothing ear")|| n.Contains("liberty") ||
+                n.Contains("soundcore")|| n.Contains("jabra")      || n.Contains("earbud") ||
+                n.Contains("wf-")      || n.Contains("tws"))
+                return BluetoothDeviceType.Earbuds;
+
+            // ── Speakers (no bare pulse/charge/flip false-positives) ─────────
+            if (n.Contains("speaker")     || n.Contains("soundbar")   || n.Contains("echo") ||
+                n.Contains("homepod")     || n.Contains("boombox")    || n.Contains("ue boom") ||
+                n.Contains("wonderboom")  || n.Contains("jbl flip")   || n.Contains("jbl charge") ||
+                n.Contains("jbl pulse")   || n.Contains("charge 3")   || n.Contains("charge 4") ||
+                n.Contains("charge 5")    || n.Contains("flip 4")     || n.Contains("flip 5") ||
+                n.Contains("flip 6")      || n.Contains("xtreme"))
+                return BluetoothDeviceType.Speaker;
+
+            // ── Computers ────────────────────────────────────────────────────
+            if (n.Contains("desktop") || n.Contains("laptop") || n.Contains("macbook") ||
+                n.Contains("surface") || n.Contains("pc "))
+                return BluetoothDeviceType.Computer;
 
             // ── Smartwatch ────────────────────────────────────────────────────
             if (n.Contains("watch")    || n.Contains("galaxy watch") || n.Contains("gear") ||
@@ -3692,6 +5231,123 @@ namespace bluetooth_turnon
                 return BluetoothDeviceType.Smartwatch;
 
             return BluetoothDeviceType.Unknown;
+        }
+
+        /// <summary>
+        /// Returns a human-readable service name for a standard Bluetooth profile GUID.
+        /// </summary>
+        public static string GetProfileName(Guid guid)
+        {
+            if (guid == InTheHand.Net.Bluetooth.BluetoothService.AudioSink) return "AudioSink (A2DP)";
+            if (guid == InTheHand.Net.Bluetooth.BluetoothService.Handsfree) return "Handsfree (HFP)";
+            if (guid == InTheHand.Net.Bluetooth.BluetoothService.Headset) return "Headset (HSP)";
+            if (guid == InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice) return "HID";
+            if (guid == InTheHand.Net.Bluetooth.BluetoothService.AudioSource) return "AudioSource";
+            if (guid == InTheHand.Net.Bluetooth.BluetoothService.AdvancedAudioDistribution) return "A2DP";
+            if (guid == InTheHand.Net.Bluetooth.BluetoothService.GenericAudio) return "GenericAudio";
+            return guid.ToString();
+        }
+
+        /// <summary>
+        /// Three-state transport capability classification for Bluetooth devices.
+        /// Classic-capable: Audio or HID profiles are present.
+        /// BLE-only: Requires positive evidence (BLE paired, successful read with no classic profiles, not Classic CoD).
+        /// Unknown: Empty or exception.
+        /// Pure function for unit-testing without hardware.
+        /// </summary>
+        public static DeviceTransportCapability ClassifyTransportCapability(
+            bool isBlePaired,
+            bool installedServicesReadSuccess,
+            IReadOnlyCollection<Guid> installedServices,
+            int codMajor)
+        {
+            // Empty or exception means Unknown
+            if (!installedServicesReadSuccess || installedServices == null)
+            {
+                return DeviceTransportCapability.Unknown;
+            }
+
+            bool hasClassicAudio = false;
+            bool hasClassicHid = false;
+
+            foreach (var profile in installedServices)
+            {
+                if (profile == InTheHand.Net.Bluetooth.BluetoothService.AudioSink ||
+                    profile == InTheHand.Net.Bluetooth.BluetoothService.Handsfree ||
+                    profile == InTheHand.Net.Bluetooth.BluetoothService.Headset ||
+                    profile == InTheHand.Net.Bluetooth.BluetoothService.AudioSource ||
+                    profile == InTheHand.Net.Bluetooth.BluetoothService.AdvancedAudioDistribution)
+                {
+                    hasClassicAudio = true;
+                }
+                else if (profile == InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice)
+                {
+                    hasClassicHid = true;
+                }
+            }
+
+            // 1. Classic-capable: Audio or HID profiles are present
+            if (hasClassicAudio || hasClassicHid)
+            {
+                return DeviceTransportCapability.ClassicCapable;
+            }
+
+            // 2. Empty installed services: if read succeeded but count is 0,
+            // if CoD indicates Classic Audio (0x04) or Peripheral (0x05),
+            // empty profiles may just mean profiles are disabled (SetServiceState(false)) or unpopulated.
+            // Therefore, do NOT declare it BleOnly.
+            if (installedServices.Count == 0)
+            {
+                if (codMajor == 0x04 || codMajor == 0x05)
+                {
+                    return DeviceTransportCapability.Unknown;
+                }
+            }
+
+            // 3. BLE-only requires positive evidence:
+            // BLE paired, successful read with NO classic profiles, and not a Classic CoD.
+            if (isBlePaired && installedServices.Count == 0 && codMajor != 0x04 && codMajor != 0x05)
+            {
+                return DeviceTransportCapability.BleOnly;
+            }
+
+            return DeviceTransportCapability.Unknown;
+        }
+
+        /// <summary>
+        /// Maps transport capability, CoD major class, and peripheral flags to a connection route.
+        /// Pure function with a truth table.
+        /// </summary>
+        public static ConnectionRoute DetermineConnectionRoute(
+            DeviceTransportCapability capability,
+            int codMajor,
+            bool isPeripheral)
+        {
+            // 1. BLE-only routes directly to BLE
+            if (capability == DeviceTransportCapability.BleOnly)
+            {
+                return ConnectionRoute.BleDirect;
+            }
+
+            // 2. Classic-capable: route to Classic HID if peripheral, else Classic Audio
+            if (capability == DeviceTransportCapability.ClassicCapable)
+            {
+                if (codMajor == 0x05 || isPeripheral)
+                {
+                    return ConnectionRoute.ClassicWithHid;
+                }
+                return ConnectionRoute.ClassicWithAudio;
+            }
+
+            // 3. Unknown: Fall back to Class of Device (audio or peripheral major class),
+            // then to the classic path with the existing fallback profile list.
+            if (codMajor == 0x05 || isPeripheral)
+            {
+                return ConnectionRoute.ClassicWithHid;
+            }
+
+            // Audio (0x04) or unclassified -> ClassicWithAudio fallback
+            return ConnectionRoute.ClassicWithAudio;
         }
 
         // ── Device Watcher (real-time connect/disconnect for Classic and BLE) ─
@@ -3724,8 +5380,8 @@ namespace bluetooth_turnon
 
             try
             {
-                // Watch all paired Classic Bluetooth devices
-                string classicSelector = Windows.Devices.Bluetooth.BluetoothDevice.GetDeviceSelector();
+                // Watch all paired Classic Bluetooth devices (Fix Issue #25: only paired devices)
+                string classicSelector = Windows.Devices.Bluetooth.BluetoothDevice.GetDeviceSelectorFromPairingState(true);
                 _classicWatcher = DeviceInformation.CreateWatcher(
                     classicSelector,
                     new string[] { "System.Devices.Aep.IsConnected" },
@@ -3840,14 +5496,14 @@ namespace bluetooth_turnon
         {
             if (!_classicEnumerationComplete) return;
             Log($"DeviceWatcher (Classic): Device connected/paired: '{args.Name}'");
-            DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+            TriggerDeviceConnectionChangedDebounced();
         }
 
         private void ClassicWatcher_Removed(DeviceWatcher sender, DeviceInformationUpdate args)
         {
             if (!_classicEnumerationComplete) return;
             Log($"DeviceWatcher (Classic): Device disconnected/unpaired: {args.Id}");
-            DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+            TriggerDeviceConnectionChangedDebounced();
         }
 
         private void ClassicWatcher_Updated(DeviceWatcher sender, DeviceInformationUpdate args)
@@ -3855,7 +5511,7 @@ namespace bluetooth_turnon
             if (!_classicEnumerationComplete) return;
             if (!args.Properties.ContainsKey("System.Devices.Aep.IsConnected")) return;
             Log($"DeviceWatcher (Classic): IsConnected changed for {args.Id}");
-            DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+            TriggerDeviceConnectionChangedDebounced();
         }
 
         private void BleWatcher_EnumerationCompleted(DeviceWatcher sender, object args)
@@ -3868,14 +5524,14 @@ namespace bluetooth_turnon
         {
             if (!_bleEnumerationComplete) return;
             Log($"DeviceWatcher (BLE): Device connected/paired: '{args.Name}'");
-            DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+            TriggerDeviceConnectionChangedDebounced();
         }
 
         private void BleWatcher_Removed(DeviceWatcher sender, DeviceInformationUpdate args)
         {
             if (!_bleEnumerationComplete) return;
             Log($"DeviceWatcher (BLE): Device disconnected/unpaired: {args.Id}");
-            DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+            TriggerDeviceConnectionChangedDebounced();
         }
 
         private void BleWatcher_Updated(DeviceWatcher sender, DeviceInformationUpdate args)
@@ -3883,7 +5539,7 @@ namespace bluetooth_turnon
             if (!_bleEnumerationComplete) return;
             if (!args.Properties.ContainsKey("System.Devices.Aep.IsConnected")) return;
             Log($"DeviceWatcher (BLE): IsConnected changed for {args.Id}");
-            DeviceConnectionChanged?.Invoke(this, EventArgs.Empty);
+            TriggerDeviceConnectionChangedDebounced();
         }
 
         // ── Disposal ─────────────────────────────────────────────────────────
@@ -3894,6 +5550,11 @@ namespace bluetooth_turnon
             _disposed = true;
 
             StopDeviceWatcher();
+
+            lock (_watcherDebounceLock)
+            {
+                try { _watcherDebounceTimer?.Dispose(); _watcherDebounceTimer = null; } catch { }
+            }
 
             if (_bluetoothRadio != null)
             {
@@ -3912,13 +5573,15 @@ namespace bluetooth_turnon
             _batteryCache.Clear();
             lock (_batteryRetryLock)
             {
-                _activeBatteryRetries.Clear();
+                _inFlightBatteryQueries.Clear();
             }
 
             lock (_deviceOpCtsLock)
             {
                 try { _deviceOpCts?.Cancel(); _deviceOpCts?.Dispose(); } catch { }
             }
+
+            _deviceSemaphores.Clear();
 
             // Note on semaphores (_radioInitSemaphore, _adapterToggleSemaphore, _connectSemaphore):
             // We do NOT call .Dispose() on the semaphores here to eliminate race conditions where background
