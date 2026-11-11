@@ -242,26 +242,6 @@ namespace bluetooth_turnon
         }
     }
 
-    /// <summary>
-    /// Categorizes a connected Bluetooth device so the UI can show the right icon.
-    /// </summary>
-    public enum BluetoothDeviceType
-    {
-        Unknown = 0,
-        Earbuds,      // Wireless earbuds — AirPods, Galaxy Buds, Nothing Ear, Soundcore
-        Headphones,   // Over-ear / on-ear — Sony WH, Bose QC, SteelSeries
-        Headset,      // Headset with mic (hands-free)
-        Speaker,      // Bluetooth speaker — JBL, Sony, Anker
-        Microphone,   // Standalone BT mic
-        Mouse,        // Bluetooth mouse
-        Keyboard,     // Bluetooth keyboard
-        Controller,   // Game controller — PS5 DualSense, Xbox, 8BitDo
-        Phone,        // Smartphone
-        Smartwatch,   // Wearable / smartwatch
-        Computer,     // PC, laptop, tablet
-        AudioDevice,  // Generic audio device
-    }
-
     public enum AdapterUiState
     {
         NoAdapter,
@@ -270,20 +250,6 @@ namespace bluetooth_turnon
         TurningOn,
         TurningOff,
         Reconnecting
-    }
-
-    public enum DeviceTransportCapability
-    {
-        Unknown,
-        ClassicCapable,
-        BleOnly
-    }
-
-    public enum ConnectionRoute
-    {
-        ClassicWithAudio,
-        ClassicWithHid,
-        BleDirect
     }
 
     public enum DeviceOperationStatus
@@ -336,107 +302,6 @@ namespace bluetooth_turnon
             IsConnected = isConnected;
             Address = address;
         }
-    }
-
-    /// <summary>
-    /// Outcome of a battery query attempt.
-    /// </summary>
-    public enum BatteryQueryOutcome
-    {
-        Success,
-        Unsupported,
-        TransientFailure
-    }
-
-    /// <summary>
-    /// Thread-safe cache entry tracking battery level, last-good value, query outcome,
-    /// and backoff retry timings.
-    /// </summary>
-    public sealed class BatteryCacheEntry
-    {
-        public ulong Address { get; set; }
-        public string DeviceName { get; set; }
-        public int? BatteryPercent { get; set; }
-        public int? LastGoodBattery { get; set; }
-        public DateTime? LastGoodUtc { get; set; }
-        public BatteryQueryOutcome Outcome { get; set; }
-        public DateTime LastCheckedUtc { get; set; }
-        public int FailureCount { get; set; }
-        public DateTime NextAllowedRetryUtc { get; set; }
-        public bool IsClassicOnly { get; set; }
-
-        public int? GetEffectiveBattery()
-        {
-            if (BatteryPercent.HasValue) return BatteryPercent;
-            if (LastGoodBattery.HasValue && LastGoodUtc.HasValue &&
-                (DateTime.UtcNow - LastGoodUtc.Value) < BluetoothManager.BatteryLastGoodRetentionDuration)
-            {
-                return LastGoodBattery;
-            }
-            return null;
-        }
-
-        public bool ShouldRetry()
-        {
-            if (Outcome == BatteryQueryOutcome.Unsupported)
-            {
-                return DateTime.UtcNow >= NextAllowedRetryUtc;
-            }
-            if (Outcome == BatteryQueryOutcome.TransientFailure)
-            {
-                return DateTime.UtcNow >= NextAllowedRetryUtc;
-            }
-            return false;
-        }
-
-        public void RecordSuccess(int level, string deviceName)
-        {
-            DeviceName = deviceName;
-            BatteryPercent = level;
-            LastGoodBattery = level;
-            LastGoodUtc = DateTime.UtcNow;
-            Outcome = BatteryQueryOutcome.Success;
-            LastCheckedUtc = DateTime.UtcNow;
-            FailureCount = 0;
-            NextAllowedRetryUtc = DateTime.UtcNow.AddMinutes(5);
-        }
-
-        public void RecordUnsupported(string deviceName, bool isClassicOnly = false)
-        {
-            DeviceName = deviceName;
-            BatteryPercent = null;
-            Outcome = BatteryQueryOutcome.Unsupported;
-            LastCheckedUtc = DateTime.UtcNow;
-            IsClassicOnly = isClassicOnly;
-            NextAllowedRetryUtc = DateTime.UtcNow.Add(BluetoothManager.BatteryUnsupportedCacheDuration);
-        }
-
-        public void RecordTransientFailure(string deviceName)
-        {
-            DeviceName = deviceName;
-            Outcome = BatteryQueryOutcome.TransientFailure;
-            LastCheckedUtc = DateTime.UtcNow;
-            FailureCount++;
-            NextAllowedRetryUtc = DateTime.UtcNow.Add(BluetoothManager.GetTransientBackoff(FailureCount));
-
-            if (LastGoodBattery.HasValue && LastGoodUtc.HasValue &&
-                (DateTime.UtcNow - LastGoodUtc.Value) < BluetoothManager.BatteryLastGoodRetentionDuration)
-            {
-                BatteryPercent = LastGoodBattery;
-            }
-            else
-            {
-                BatteryPercent = null;
-            }
-        }
-    }
-
-    public sealed class BatteryQueryResult
-    {
-        public BatteryQueryOutcome Outcome { get; set; }
-        public int? BatteryLevel { get; set; }
-        public long ElapsedMs { get; set; }
-        public string Details { get; set; }
     }
 
     /// <summary>
@@ -867,30 +732,50 @@ namespace bluetooth_turnon
         /// Timeout budget for fast cached GATT queries (services/characteristics from local OS cache).
         /// Default: 2000ms (2 seconds).
         /// </summary>
-        public static int BatteryCachedQueryBudgetMs { get; set; } = 2000;
+        public static int BatteryCachedQueryBudgetMs
+        {
+            get => BatteryPolicy.BatteryCachedQueryBudgetMs;
+            set => BatteryPolicy.BatteryCachedQueryBudgetMs = value;
+        }
 
         /// <summary>
         /// Timeout budget for slow uncached background GATT discovery (over-the-air with peripheral).
         /// Default: 10000ms (10 seconds) chosen from the slowest measured over-the-air discovery results.
         /// </summary>
-        public static int BatteryUncachedQueryBudgetMs { get; set; } = 10000;
+        public static int BatteryUncachedQueryBudgetMs
+        {
+            get => BatteryPolicy.BatteryUncachedQueryBudgetMs;
+            set => BatteryPolicy.BatteryUncachedQueryBudgetMs = value;
+        }
 
         /// <summary>
         /// Maximum bounded retries while connected before capping at the periodic 5-minute interval.
         /// </summary>
-        public static int MaxBatteryRetries { get; set; } = 5;
+        public static int MaxBatteryRetries
+        {
+            get => BatteryPolicy.MaxBatteryRetries;
+            set => BatteryPolicy.MaxBatteryRetries = value;
+        }
 
         /// <summary>
         /// Duration to cache devices confirmed to NOT support GATT Battery Service.
         /// Default: 24 hours (queried once and then left alone).
         /// </summary>
-        public static TimeSpan BatteryUnsupportedCacheDuration { get; set; } = TimeSpan.FromHours(24);
+        public static TimeSpan BatteryUnsupportedCacheDuration
+        {
+            get => BatteryPolicy.BatteryUnsupportedCacheDuration;
+            set => BatteryPolicy.BatteryUnsupportedCacheDuration = value;
+        }
 
         /// <summary>
         /// Duration to retain the last-good battery reading across transient packet drops or timeouts.
         /// Default: 30 minutes (preserves value instead of blanking out to N/A).
         /// </summary>
-        public static TimeSpan BatteryLastGoodRetentionDuration { get; set; } = TimeSpan.FromMinutes(30);
+        public static TimeSpan BatteryLastGoodRetentionDuration
+        {
+            get => BatteryPolicy.BatteryLastGoodRetentionDuration;
+            set => BatteryPolicy.BatteryLastGoodRetentionDuration = value;
+        }
 
         /// <summary>
         /// Exponential backoff schedule for transient battery query failures.
@@ -898,12 +783,7 @@ namespace bluetooth_turnon
         /// </summary>
         public static TimeSpan GetTransientBackoff(int failureCount)
         {
-            switch (failureCount)
-            {
-                case 1: return TimeSpan.FromSeconds(30);
-                case 2: return TimeSpan.FromMinutes(2);
-                default: return TimeSpan.FromMinutes(5);
-            }
+            return BatteryPolicy.GetTransientBackoff(failureCount);
         }
 
         /// <summary>
@@ -911,28 +791,7 @@ namespace bluetooth_turnon
         /// </summary>
         public static ulong TryExtractAddressFromBleDeviceId(string deviceId)
         {
-            if (string.IsNullOrWhiteSpace(deviceId)) return 0;
-            try
-            {
-                int idx = deviceId.IndexOf("BluetoothLE", StringComparison.OrdinalIgnoreCase);
-                if (idx >= 0)
-                {
-                    string sub = deviceId.Substring(idx + "BluetoothLE".Length);
-                    if (sub.StartsWith("#BluetoothLE", StringComparison.OrdinalIgnoreCase))
-                    {
-                        sub = sub.Substring("#BluetoothLE".Length);
-                    }
-                    int endIdx = sub.IndexOfAny(new[] { '-', '_', '#' });
-                    if (endIdx > 0) sub = sub.Substring(0, endIdx);
-                    sub = sub.Replace(":", "").Replace("-", "").Trim();
-                    if (ulong.TryParse(sub, System.Globalization.NumberStyles.HexNumber, null, out ulong addr))
-                    {
-                        return addr;
-                    }
-                }
-            }
-            catch { }
-            return 0;
+            return BatteryPolicy.TryExtractAddressFromBleDeviceId(deviceId);
         }
 
         #endregion
@@ -4966,31 +4825,7 @@ namespace bluetooth_turnon
 
         public static BluetoothDeviceType ClassifyByAppearance(ushort category, ushort subCategory)
         {
-            switch (category)
-            {
-                case 0x03C0: // Human Interface Device
-                    if (subCategory == 1) return BluetoothDeviceType.Keyboard;
-                    if (subCategory == 2) return BluetoothDeviceType.Mouse;
-                    if (subCategory == 3 || subCategory == 4) return BluetoothDeviceType.Controller;
-                    return BluetoothDeviceType.Mouse;
-                case 0x0040: // Phone
-                    return BluetoothDeviceType.Phone;
-                case 0x0080: // Computer
-                    return BluetoothDeviceType.Computer;
-                case 0x00C0: // Watch / Wearable
-                    return BluetoothDeviceType.Smartwatch;
-                case 0x0840: // Media Player / Audio (subcategories, Fix Issue #32)
-                    switch (subCategory)
-                    {
-                        case 1: return BluetoothDeviceType.Earbuds;     // Wearable Audio / In-ear
-                        case 2: return BluetoothDeviceType.Headphones;  // Over-ear headphones
-                        case 3: return BluetoothDeviceType.Speaker;     // Loudspeaker
-                        case 4: return BluetoothDeviceType.Speaker;     // Soundbar
-                        default: return BluetoothDeviceType.AudioDevice;
-                    }
-                default:
-                    return BluetoothDeviceType.Unknown;
-            }
+            return DeviceClassifier.ClassifyByAppearance(category, subCategory);
         }
 
         /// <summary>
@@ -5108,129 +4943,12 @@ namespace bluetooth_turnon
 
         public static BluetoothDeviceType ClassifyByCod(int major, int minor)
         {
-            switch (major)
-            {
-                case 0x04: // Audio / Video
-                    switch (minor)
-                    {
-                        case 0x01: return BluetoothDeviceType.Earbuds;     // Wearable headset (earbuds / AirPod style)
-                        case 0x02: return BluetoothDeviceType.Headset;     // Hands-free device
-                        case 0x04: return BluetoothDeviceType.Microphone;  // Microphone
-                        case 0x05: return BluetoothDeviceType.Speaker;     // Loudspeaker
-                        case 0x06: return BluetoothDeviceType.Headphones;  // Headphones (over-ear)
-                        case 0x07: return BluetoothDeviceType.AudioDevice; // Portable audio
-                        case 0x08: return BluetoothDeviceType.AudioDevice; // Car audio
-                        case 0x0A: return BluetoothDeviceType.AudioDevice; // HiFi audio
-                        default:   return BluetoothDeviceType.AudioDevice;
-                    }
-
-                case 0x05: // Peripheral (mouse / keyboard / controller)
-                    {
-                        int inputKind = (minor >> 4) & 0x03; // bits 5-4
-                        int subType   =  minor       & 0x0F; // bits 3-0
-                        if (inputKind == 0x01) return BluetoothDeviceType.Keyboard;
-                        if (inputKind == 0x02) return BluetoothDeviceType.Mouse;
-                        if (subType == 0x01 || subType == 0x02)
-                            return BluetoothDeviceType.Controller; // Joystick / Gamepad
-                        return BluetoothDeviceType.Mouse; // generic peripheral
-                    }
-
-                case 0x02: return BluetoothDeviceType.Phone;
-                case 0x01: return BluetoothDeviceType.Computer;
-                case 0x07: return BluetoothDeviceType.Smartwatch; // Wearable
-                case 0x08: return BluetoothDeviceType.Controller; // Toy (8BitDo etc. may use this)
-                default:   return BluetoothDeviceType.Unknown;
-            }
+            return DeviceClassifier.ClassifyByCod(major, minor);
         }
 
-        /// <summary>
-        /// Checks whether a specific word or token exists in text matching word boundaries (\b).
-        /// Prevents false positives where short substrings match unrelated models (e.g. "mp3" or "mk2").
-        /// </summary>
-        private static bool ContainsWord(string text, string word)
-        {
-            if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(word))
-                return false;
-
-            return Regex.IsMatch(text, $@"\b{Regex.Escape(word)}\b", RegexOptions.IgnoreCase);
-        }
-
-        /// <summary>
-        /// Name-pattern fallback for devices whose CoD is Uncategorized or 0.
-        /// Matches common brand/model keywords case-insensitively.
-        /// Uses word boundaries for short tokens to prevent false positives.
-        /// Evaluates phone before keyboard (prevents "Joanne's iPhone" -> Keyboard, Fix Issue #32).
-        /// </summary>
         public static BluetoothDeviceType ClassifyByName(string name)
         {
-            if (string.IsNullOrWhiteSpace(name))
-                return BluetoothDeviceType.Unknown;
-
-            string n = name.ToLowerInvariant();
-
-            // ── Phones (evaluated early to avoid name collisions) ────────────
-            if (n.Contains("iphone")   || n.Contains("galaxy s") || n.Contains("galaxy a") ||
-                n.Contains("galaxy z") || n.Contains("pixel")    || n.Contains("oneplus")  ||
-                n.Contains("redmi")    || n.Contains("poco")     || n.Contains("realme")   ||
-                n.Contains("huawei")   || n.Contains("honor")    || n.Contains("xperia")   ||
-                n.Contains("smartphone"))
-                return BluetoothDeviceType.Phone;
-
-            // ── Controllers ───────────────────────────────────────────────────
-            if (n.Contains("dualsense") || n.Contains("dualshock") || n.Contains("xbox") ||
-                n.Contains("8bitdo")    || n.Contains("controller") || n.Contains("gamepad") ||
-                n.Contains("joycon")    || n.Contains("pro con"))
-                return BluetoothDeviceType.Controller;
-
-            // ── Mouse ─────────────────────────────────────────────────────────
-            if (n.Contains("mouse")   || n.Contains("mx master") || n.Contains("mx any") ||
-                n.Contains("pro click")|| n.Contains("basilisk") || n.Contains("deathadder") ||
-                n.Contains("pebble")  || n.Contains("trackball"))
-                return BluetoothDeviceType.Mouse;
-
-            // ── Keyboard ─────────────────────────────────────────────────────
-            if (n.Contains("keyboard") || n.Contains("keychron") || n.Contains("mx keys") ||
-                ContainsWord(n, "anne pro") || n.Contains("ducky")    ||
-                ContainsWord(n, "k2")  || ContainsWord(n, "k4")   ||
-                ContainsWord(n, "k8")  || ContainsWord(n, "k10"))
-                return BluetoothDeviceType.Keyboard;
-
-            // ── Over-ear headphones / headset (Pulse 3D is a headset, not a speaker)
-            if (n.Contains("pulse 3d") || n.Contains("wh-")     || n.Contains("xm4")    ||
-                n.Contains("xm5")      || n.Contains("qc45")    || n.Contains("qc35")   ||
-                n.Contains("qc700")    || n.Contains("momentum")|| n.Contains("arctis") ||
-                n.Contains("nova")     || n.Contains("void")    || n.Contains("cloud")  ||
-                n.Contains("stealth")  || n.Contains("headphone") || n.Contains("headset"))
-                return BluetoothDeviceType.Headphones;
-
-            // ── Earbuds ──────────────────────────────────────────────────────
-            if (n.Contains("airpod")   || n.Contains("galaxy bud") || n.Contains(" buds") ||
-                n.Contains("freebuds") || n.Contains("nothing ear")|| n.Contains("liberty") ||
-                n.Contains("soundcore")|| n.Contains("jabra")      || n.Contains("earbud") ||
-                n.Contains("wf-")      || n.Contains("tws"))
-                return BluetoothDeviceType.Earbuds;
-
-            // ── Speakers (no bare pulse/charge/flip false-positives) ─────────
-            if (n.Contains("speaker")     || n.Contains("soundbar")   || n.Contains("echo") ||
-                n.Contains("homepod")     || n.Contains("boombox")    || n.Contains("ue boom") ||
-                n.Contains("wonderboom")  || n.Contains("jbl flip")   || n.Contains("jbl charge") ||
-                n.Contains("jbl pulse")   || n.Contains("charge 3")   || n.Contains("charge 4") ||
-                n.Contains("charge 5")    || n.Contains("flip 4")     || n.Contains("flip 5") ||
-                n.Contains("flip 6")      || n.Contains("xtreme"))
-                return BluetoothDeviceType.Speaker;
-
-            // ── Computers ────────────────────────────────────────────────────
-            if (n.Contains("desktop") || n.Contains("laptop") || n.Contains("macbook") ||
-                n.Contains("surface") || n.Contains("pc "))
-                return BluetoothDeviceType.Computer;
-
-            // ── Smartwatch ────────────────────────────────────────────────────
-            if (n.Contains("watch")    || n.Contains("galaxy watch") || n.Contains("gear") ||
-                n.Contains("mi band")  || n.Contains("smart band")   || n.Contains("fitbit") ||
-                n.Contains("garmin")   || n.Contains("vivosmart")    || ContainsWord(n, "band"))
-                return BluetoothDeviceType.Smartwatch;
-
-            return BluetoothDeviceType.Unknown;
+            return DeviceClassifier.ClassifyByName(name);
         }
 
         /// <summary>
@@ -5261,57 +4979,7 @@ namespace bluetooth_turnon
             IReadOnlyCollection<Guid> installedServices,
             int codMajor)
         {
-            // Empty or exception means Unknown
-            if (!installedServicesReadSuccess || installedServices == null)
-            {
-                return DeviceTransportCapability.Unknown;
-            }
-
-            bool hasClassicAudio = false;
-            bool hasClassicHid = false;
-
-            foreach (var profile in installedServices)
-            {
-                if (profile == InTheHand.Net.Bluetooth.BluetoothService.AudioSink ||
-                    profile == InTheHand.Net.Bluetooth.BluetoothService.Handsfree ||
-                    profile == InTheHand.Net.Bluetooth.BluetoothService.Headset ||
-                    profile == InTheHand.Net.Bluetooth.BluetoothService.AudioSource ||
-                    profile == InTheHand.Net.Bluetooth.BluetoothService.AdvancedAudioDistribution)
-                {
-                    hasClassicAudio = true;
-                }
-                else if (profile == InTheHand.Net.Bluetooth.BluetoothService.HumanInterfaceDevice)
-                {
-                    hasClassicHid = true;
-                }
-            }
-
-            // 1. Classic-capable: Audio or HID profiles are present
-            if (hasClassicAudio || hasClassicHid)
-            {
-                return DeviceTransportCapability.ClassicCapable;
-            }
-
-            // 2. Empty installed services: if read succeeded but count is 0,
-            // if CoD indicates Classic Audio (0x04) or Peripheral (0x05),
-            // empty profiles may just mean profiles are disabled (SetServiceState(false)) or unpopulated.
-            // Therefore, do NOT declare it BleOnly.
-            if (installedServices.Count == 0)
-            {
-                if (codMajor == 0x04 || codMajor == 0x05)
-                {
-                    return DeviceTransportCapability.Unknown;
-                }
-            }
-
-            // 3. BLE-only requires positive evidence:
-            // BLE paired, successful read with NO classic profiles, and not a Classic CoD.
-            if (isBlePaired && installedServices.Count == 0 && codMajor != 0x04 && codMajor != 0x05)
-            {
-                return DeviceTransportCapability.BleOnly;
-            }
-
-            return DeviceTransportCapability.Unknown;
+            return ConnectRoutingPolicy.ClassifyTransportCapability(isBlePaired, installedServicesReadSuccess, installedServices, codMajor);
         }
 
         /// <summary>
@@ -5323,31 +4991,7 @@ namespace bluetooth_turnon
             int codMajor,
             bool isPeripheral)
         {
-            // 1. BLE-only routes directly to BLE
-            if (capability == DeviceTransportCapability.BleOnly)
-            {
-                return ConnectionRoute.BleDirect;
-            }
-
-            // 2. Classic-capable: route to Classic HID if peripheral, else Classic Audio
-            if (capability == DeviceTransportCapability.ClassicCapable)
-            {
-                if (codMajor == 0x05 || isPeripheral)
-                {
-                    return ConnectionRoute.ClassicWithHid;
-                }
-                return ConnectionRoute.ClassicWithAudio;
-            }
-
-            // 3. Unknown: Fall back to Class of Device (audio or peripheral major class),
-            // then to the classic path with the existing fallback profile list.
-            if (codMajor == 0x05 || isPeripheral)
-            {
-                return ConnectionRoute.ClassicWithHid;
-            }
-
-            // Audio (0x04) or unclassified -> ClassicWithAudio fallback
-            return ConnectionRoute.ClassicWithAudio;
+            return ConnectRoutingPolicy.DetermineConnectionRoute(capability, codMajor, isPeripheral);
         }
 
         // ── Device Watcher (real-time connect/disconnect for Classic and BLE) ─
