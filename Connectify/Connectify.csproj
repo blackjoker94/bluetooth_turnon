@@ -180,6 +180,9 @@
     </Compile>
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="Logging\AsyncFileLogger.cs" />
+    <Compile Include="Native\BluetoothNativeMethods.cs" />
+    <Compile Include="Native\CoreAudioInterop.cs" />
     <EmbeddedResource Include="Form1.resx">
       <DependentUpon>Form1.cs</DependentUpon>
     </EmbeddedResource>
