@@ -172,6 +172,8 @@
   <ItemGroup>
     <Compile Include="BluetoothManager.cs" />
     <Compile Include="DevicePresenter.cs" />
+    <Compile Include="DeviceViewModel.cs" />
+    <Compile Include="DeviceCardFactory.cs" />
     <Compile Include="Form1.cs">
       <SubType>Form</SubType>
     </Compile>

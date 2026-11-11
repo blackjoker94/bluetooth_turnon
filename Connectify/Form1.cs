@@ -938,22 +938,7 @@ namespace bluetooth_turnon
             }
         }
 
-        private sealed class DeviceCardView
-        {
-            public ulong Address;
-            public DeviceInfo BoundDevice;
-            public Panel Card;
-            public Panel IconPanel;
-            public PictureBox IconBox;
-            public Label NameLabel;
-            public Label TypeLabel;
-            public PictureBox BatteryBox;
-            public Label BatteryLabel;
-            public Color AccentColor;
-            public Color BaseBgColor;
-            public Color HoverBgColor;
-            public bool IsHovered;
-        }
+
 
         /// <summary>
         /// Reconciles panelDeviceList in-place diffing by address, updating labels, icons,
@@ -1074,78 +1059,62 @@ namespace bluetooth_turnon
                         accentColor = Color.FromArgb(70, 70, 80);
                     }
 
+                    Color nameColor = device.IsConnected ? Color.FromArgb(220, 220, 235) : Color.FromArgb(140, 140, 150);
+                    string inFlightText = null;
+                    Color inFlightColor = Color.Empty;
+                    if (_devicePresenter.TryGetInFlightStatus(device.Address, out string ifText, out Color ifColor) && !string.IsNullOrEmpty(ifText))
+                    {
+                        inFlightText = ifText;
+                        inFlightColor = ifColor;
+                    }
+
+                    string typeLabelText = GetDeviceTypeLabel(device.DeviceType);
+                    Color typeLabelColor = device.IsConnected
+                        ? Color.FromArgb(120, accentColor.R, accentColor.G, accentColor.B)
+                        : Color.FromArgb(100, 100, 110);
+
+                    string batteryText = device.BatteryPercent.HasValue ? $"{device.BatteryPercent.Value}%" : "";
+                    Color batteryColor = GetBatteryColor(device.BatteryPercent);
+                    string batteryIcon = GetBatteryIconFileName(device.BatteryPercent);
+                    string iconFile = GetDeviceIconFileName(device.DeviceType);
+
+                    var vm = new DeviceViewModel(
+                        device,
+                        i,
+                        inFlightText,
+                        inFlightColor,
+                        baseBgColor,
+                        hoverBgColor,
+                        accentColor,
+                        nameColor,
+                        typeLabelText,
+                        typeLabelColor,
+                        batteryText,
+                        batteryColor,
+                        batteryIcon,
+                        iconFile);
+
                     if (_cardViews.TryGetValue(device.Address, out var view))
                     {
-                        // Update existing card in-place
-                        view.BoundDevice = device;
-                        view.BaseBgColor = baseBgColor;
-                        view.HoverBgColor = hoverBgColor;
-                        view.AccentColor = accentColor;
-
-                        if (view.Card.Location.Y != targetY || view.Card.Location.X != 0)
-                        {
-                            view.Card.Location = new Point(0, targetY);
-                        }
-                        if (view.Card.Width != cardWidth || view.Card.Height != cardHeight)
-                        {
-                            view.Card.Size = new Size(cardWidth, cardHeight);
-                            view.NameLabel.Width = batteryColX - 74 - 6;
-                            view.TypeLabel.Width = batteryColX - 74 - 6;
-                            view.BatteryBox.Location = new Point(batteryColX, (cardHeight - 28) / 2);
-                            view.BatteryLabel.Location = new Point(batteryColX + 32, (cardHeight - 20) / 2);
-                        }
-
-                        // Update background color based on hover state
-                        Point cursorInCard = view.Card.PointToClient(Cursor.Position);
-                        view.IsHovered = view.Card.ClientRectangle.Contains(cursorInCard);
-                        Color currentBg = view.IsHovered ? hoverBgColor : baseBgColor;
-                        if (view.Card.BackColor != currentBg) view.Card.BackColor = currentBg;
-                        if (view.IconPanel.BackColor != currentBg) view.IconPanel.BackColor = currentBg;
-
-                        // Name label
-                        if (view.NameLabel.Text != device.Name) view.NameLabel.Text = device.Name;
-                        Color nameColor = device.IsConnected ? Color.FromArgb(220, 220, 235) : Color.FromArgb(140, 140, 150);
-                        if (view.NameLabel.ForeColor != nameColor) view.NameLabel.ForeColor = nameColor;
-
-                        // Type & In-flight status
-                        if (_devicePresenter.TryGetInFlightStatus(device.Address, out string inFlightText, out Color inFlightColor) && !string.IsNullOrEmpty(inFlightText))
-                        {
-                            view.TypeLabel.Text = inFlightText;
-                            view.TypeLabel.ForeColor = inFlightColor;
-                        }
-                        else
-                        {
-                            string typeLabelText = GetDeviceTypeLabel(device.DeviceType);
-                            Color typeLabelColor = device.IsConnected
-                                ? Color.FromArgb(120, accentColor.R, accentColor.G, accentColor.B)
-                                : Color.FromArgb(100, 100, 110);
-                            if (view.TypeLabel.Text != typeLabelText) view.TypeLabel.Text = typeLabelText;
-                            if (view.TypeLabel.ForeColor != typeLabelColor) view.TypeLabel.ForeColor = typeLabelColor;
-                        }
-
-                        // Battery
-                        string batteryText = device.BatteryPercent.HasValue ? $"{device.BatteryPercent.Value}%" : "";
-                        string expectedBatteryText = device.IsConnected ? batteryText : "";
-                        if (view.BatteryLabel.Text != expectedBatteryText) view.BatteryLabel.Text = expectedBatteryText;
-                        Color batteryColor = GetBatteryColor(device.BatteryPercent);
-                        if (view.BatteryLabel.ForeColor != batteryColor) view.BatteryLabel.ForeColor = batteryColor;
-
-                        string batteryIcon = GetBatteryIconFileName(device.BatteryPercent);
-                        Image battImg = (device.IsConnected && batteryIcon != null) ? LoadCachedIcon(assetsDir, batteryIcon) : null;
-                        if (view.BatteryBox.Image != battImg) view.BatteryBox.Image = battImg;
-
-                        // Icon
-                        string iconFile = GetDeviceIconFileName(device.DeviceType);
-                        Image iconImg = LoadCachedIcon(assetsDir, iconFile);
-                        if (view.IconBox.Image != iconImg) view.IconBox.Image = iconImg;
-
-                        view.IconPanel.Invalidate();
+                        DeviceCardFactory.UpdateCardView(view, vm, device, targetY, cardWidth, cardHeight, batteryColX, assetsDir, LoadCachedIcon);
                         panelDeviceList.Controls.SetChildIndex(view.Card, i);
                     }
                     else
                     {
-                        // Create brand new card
-                        var newView = CreateDeviceCardView(device, targetY, cardWidth, cardHeight, baseBgColor, hoverBgColor, accentColor, batteryColX, assetsDir);
+                        var newView = DeviceCardFactory.CreateCardView(
+                            vm,
+                            device,
+                            targetY,
+                            cardWidth,
+                            cardHeight,
+                            batteryColX,
+                            assetsDir,
+                            CardNameFont,
+                            CardTypeFont,
+                            CardBatteryFont,
+                            LoadCachedIcon,
+                            OnCardClick);
+
                         _cardViews[device.Address] = newView;
                         panelDeviceList.Controls.Add(newView.Card);
                         panelDeviceList.Controls.SetChildIndex(newView.Card, i);
@@ -1162,186 +1131,6 @@ namespace bluetooth_turnon
             panelDeviceList.HorizontalScroll.Maximum = 0;
             panelDeviceList.HorizontalScroll.Enabled = false;
             panelDeviceList.HorizontalScroll.Visible = false;
-        }
-
-        private DeviceCardView CreateDeviceCardView(
-            DeviceInfo device,
-            int y,
-            int cardWidth,
-            int cardHeight,
-            Color baseBgColor,
-            Color hoverBgColor,
-            Color accentColor,
-            int batteryColX,
-            string assetsDir)
-        {
-            var view = new DeviceCardView
-            {
-                Address = device.Address,
-                BoundDevice = device,
-                BaseBgColor = baseBgColor,
-                HoverBgColor = hoverBgColor,
-                AccentColor = accentColor
-            };
-
-            var card = new Panel
-            {
-                Tag = device.Address,
-                BackColor = baseBgColor,
-                Location = new Point(0, y),
-                Size = new Size(cardWidth, cardHeight),
-                Anchor = AnchorStyles.Left | AnchorStyles.Top,
-                Cursor = Cursors.Hand
-            };
-            SetDoubleBuffered(card);
-            view.Card = card;
-
-            var iconPanel = new Panel
-            {
-                BackColor = baseBgColor,
-                Location = new Point(14, 12),
-                Size = new Size(48, 48),
-                Cursor = Cursors.Hand
-            };
-            SetDoubleBuffered(iconPanel);
-            iconPanel.Paint += (s, pe) =>
-            {
-                pe.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                Color acc = view.AccentColor;
-                using (var fill = new SolidBrush(Color.FromArgb(28, acc)))
-                    pe.Graphics.FillEllipse(fill, 0, 0, 47, 47);
-                using (var border = new Pen(Color.FromArgb(90, acc), 1.5f))
-                    pe.Graphics.DrawEllipse(border, 1, 1, 45, 45);
-            };
-            view.IconPanel = iconPanel;
-
-            var iconBox = new PictureBox
-            {
-                BackColor = Color.Transparent,
-                SizeMode = PictureBoxSizeMode.Zoom,
-                Size = new Size(26, 26),
-                Location = new Point(11, 11),
-                Cursor = Cursors.Hand
-            };
-            string iconFile = GetDeviceIconFileName(device.DeviceType);
-            Image iconImg = LoadCachedIcon(assetsDir, iconFile);
-            if (iconImg != null) iconBox.Image = iconImg;
-            iconPanel.Controls.Add(iconBox);
-            view.IconBox = iconBox;
-
-            var nameLabel = new Label
-            {
-                Text = device.Name,
-                ForeColor = device.IsConnected ? Color.FromArgb(220, 220, 235) : Color.FromArgb(140, 140, 150),
-                Font = CardNameFont,
-                AutoSize = false,
-                AutoEllipsis = true,
-                TextAlign = ContentAlignment.BottomLeft,
-                BackColor = Color.Transparent,
-                Location = new Point(74, 10),
-                Size = new Size(batteryColX - 74 - 6, 26),
-                Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right,
-                Cursor = Cursors.Hand
-            };
-            view.NameLabel = nameLabel;
-
-            string typeText = GetDeviceTypeLabel(device.DeviceType);
-            Color typeColor = device.IsConnected ? Color.FromArgb(120, accentColor.R, accentColor.G, accentColor.B) : Color.FromArgb(100, 100, 110);
-            if (_devicePresenter.TryGetInFlightStatus(device.Address, out string inFlightText, out Color inFlightColor) && !string.IsNullOrEmpty(inFlightText))
-            {
-                typeText = inFlightText;
-                typeColor = inFlightColor;
-            }
-
-            var typeLabel = new Label
-            {
-                Name = "typeLabel",
-                Text = typeText,
-                ForeColor = typeColor,
-                Font = CardTypeFont,
-                AutoSize = false,
-                TextAlign = ContentAlignment.TopLeft,
-                BackColor = Color.Transparent,
-                Location = new Point(74, 38),
-                Size = new Size(batteryColX - 74 - 6, 20),
-                Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right,
-                Cursor = Cursors.Hand
-            };
-            view.TypeLabel = typeLabel;
-
-            string batteryIcon = GetBatteryIconFileName(device.BatteryPercent);
-            Color batteryColor = GetBatteryColor(device.BatteryPercent);
-            string batteryText = device.BatteryPercent.HasValue ? $"{device.BatteryPercent.Value}%" : "";
-
-            var batteryBox = new PictureBox
-            {
-                BackColor = Color.Transparent,
-                SizeMode = PictureBoxSizeMode.Zoom,
-                Size = new Size(28, 28),
-                Location = new Point(batteryColX, (cardHeight - 28) / 2),
-                Anchor = AnchorStyles.Top | AnchorStyles.Right,
-                Cursor = Cursors.Hand
-            };
-            if (device.IsConnected && batteryIcon != null)
-            {
-                Image battImg = LoadCachedIcon(assetsDir, batteryIcon);
-                if (battImg != null) batteryBox.Image = battImg;
-            }
-            view.BatteryBox = batteryBox;
-
-            var batteryLabel = new Label
-            {
-                Text = device.IsConnected ? batteryText : "",
-                ForeColor = batteryColor,
-                Font = CardBatteryFont,
-                AutoSize = false,
-                TextAlign = ContentAlignment.MiddleLeft,
-                BackColor = Color.Transparent,
-                Location = new Point(batteryColX + 32, (cardHeight - 20) / 2),
-                Size = new Size(44, 20),
-                Anchor = AnchorStyles.Top | AnchorStyles.Right,
-                Cursor = Cursors.Hand
-            };
-            view.BatteryLabel = batteryLabel;
-
-            EventHandler onEnter = (s, e) =>
-            {
-                view.IsHovered = true;
-                card.BackColor = view.HoverBgColor;
-                iconPanel.BackColor = view.HoverBgColor;
-            };
-
-            EventHandler onLeave = (s, e) =>
-            {
-                Point pt = card.PointToClient(Cursor.Position);
-                if (!card.ClientRectangle.Contains(pt))
-                {
-                    view.IsHovered = false;
-                    card.BackColor = view.BaseBgColor;
-                    iconPanel.BackColor = view.BaseBgColor;
-                }
-            };
-
-            EventHandler onClick = (s, e) =>
-            {
-                OnCardClick(view);
-            };
-
-            var controls = new Control[] { card, iconPanel, iconBox, nameLabel, typeLabel, batteryBox, batteryLabel };
-            foreach (var ctrl in controls)
-            {
-                ctrl.MouseEnter += onEnter;
-                ctrl.MouseLeave += onLeave;
-                ctrl.Click += onClick;
-            }
-
-            card.Controls.Add(iconPanel);
-            card.Controls.Add(nameLabel);
-            card.Controls.Add(typeLabel);
-            card.Controls.Add(batteryBox);
-            card.Controls.Add(batteryLabel);
-
-            return view;
         }
 
         private async void OnCardClick(DeviceCardView view)
